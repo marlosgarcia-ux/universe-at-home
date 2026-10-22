@@ -45,6 +45,14 @@ Press **G** to hide or show the panels. The heavy cards fill in over a few secon
 
 How it was checked without Studio: the script type-checks with zero errors against Roblox's real API definitions (luau-lsp), `tools/gallery_mock_run.py` runs the real script against a mock of the API and compares every uploaded image with a direct render, and `tests/gallery.test.luau` covers the pixel code in both Luau runtimes. `tools/gallery_preview.luau` and `tools/gallery_preview.py` render the panels to PNG.
 
+**The planets: a planetary stress test.** Fly from orbit down to a coastline.
+
+```
+rojo build planets/default.project.json -o UniversePlanets.rbxlx
+```
+
+A prebuilt copy is in `build/UniversePlanets.rbxlx`. Turn on **Allow Mesh / Image APIs** as above and press **Play**. Hold the right mouse button to look, fly with W A S D, and press 1 to 6 for the views (orbit, approach, coast, mountains, the moon, the ringed giant). Everything on screen is generated at run time and streamed through 14 EditableImages: patch atlases for the planet you are near, raytraced billboards for the far bodies, clouds, stars and the sun. `docs/PLANETS.md` lists every key, what the HUD shows, and the two keys to press if the surface looks scrambled (V) or lit from the wrong side (N). `tools/build_planets.sh` rebuilds it and runs all of its checks.
+
 **The library and the probes** (for measuring the engine):
 
 ```
@@ -53,7 +61,7 @@ rojo build probe.project.json -o UniverseProbe.rbxlx
 
 This puts the library (`src/`) in `ReplicatedStorage.Universe` and the in-engine probes from `studio/` in `StarterPlayerScripts` and `ServerScriptService`. A prebuilt copy is in `build/UniverseProbe.rbxlx`.
 
-The Meadow demo (`docs/DEMO.md`) builds the same way from `demo/default.project.json`, or with `tools/build_demo.sh`, which also generates its assets and runs its checks. Those files appear on this branch when the demo build finishes.
+The Meadow demo (`docs/DEMO.md`) builds the same way from `demo/default.project.json`, or with `tools/build_demo.sh`, which also generates its assets and runs its checks.
 
 ## 4. Run the probes in Studio
 
