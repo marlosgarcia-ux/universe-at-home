@@ -28,6 +28,8 @@ local WorkerPool = require(Planets:WaitForChild("WorkerPool")) :: any
 local MeshPool = require(script.Parent:WaitForChild("MeshPool"))
 local Uploader = require(script.Parent:WaitForChild("Uploader"))
 
+local Config = require(Planets:WaitForChild("Config"))
+
 local PlanetLod = {}
 
 local FADE_SECONDS = 0.35
@@ -128,7 +130,7 @@ function PlanetLod.new(pool: MeshPool.Pool, U: Uploader.Uploader, workers: any):
 		frame = 0,
 		lastSelect = -100,
 		lastCam = Vector3.new(1e9, 0, 0),
-		opts = { fades = true, frozen = false, greenUp = true, tint = false, splitPx = 1.6, capacity = 200 },
+		opts = { fades = true, frozen = false, greenUp = true, tint = false, splitPx = Config.splitPx, capacity = math.min(Config.capacity, Layout.SLOTS) },
 		stats = { generated = 0, failed = 0, lastError = nil, genMs = 0, swaps = 0, evicted = 0, rate = 0, deepest = 0, limited = false },
 	}
 end
@@ -491,7 +493,7 @@ function PlanetLod.update(L: Lod, cam: Camera, dt: number, budget: number)
 			capacity = L.opts.capacity,
 			splitPx = L.opts.splitPx,
 			hysteresis = 1.35,
-			maxLevel = if body.id == "terra" then 11 else 10,
+			maxLevel = if body.id == "terra" then Config.maxLevelTerra else Config.maxLevelOther,
 		}, L.split)
 		L.split = sel.split
 		L.target = sel.leaves

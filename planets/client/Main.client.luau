@@ -36,8 +36,9 @@ local CloudLayer = require(script.Parent:WaitForChild("CloudLayer"))
 local Flight = require(script.Parent:WaitForChild("Flight"))
 local Workers = require(script.Parent:WaitForChild("Workers"))
 
-local MESH_ON = 2.0 -- distance / radius below which a rocky body gets its mesh
-local MESH_OFF = 2.3 -- and above which it goes back to the impostor (hysteresis)
+local Config = require(Planets:WaitForChild("Config"))
+local MESH_ON: number = Config.meshOn -- distance / radius below which a rocky body gets its mesh
+local MESH_OFF: number = Config.meshOff -- and above which it goes back to the impostor (hysteresis)
 
 local player = Players.LocalPlayer
 local cam = Workspace.CurrentCamera
@@ -59,7 +60,7 @@ local cloudsOn = true
 local impostorOnly = false
 local sunCycle = false
 local workersNote: string? = nil
-local workers = Workers.start(6, function(note: string)
+local workers = Workers.start(Config.workers, function(note: string)
 	workersNote = note
 end)
 
@@ -217,9 +218,9 @@ UserInputService.InputBegan:Connect(function(input: InputObject, processed: bool
 	elseif k == Enum.KeyCode.L and L then
 		L.opts.frozen = not L.opts.frozen
 	elseif k == Enum.KeyCode.B and L then
-		local stress = L.opts.splitPx > 1
-		L.opts.splitPx = if stress then 0.8 else 1.6
-		L.opts.capacity = if stress then 240 else 200
+		local stress = L.opts.splitPx > Config.stressSplitPx
+		L.opts.splitPx = if stress then Config.stressSplitPx else Config.splitPx
+		L.opts.capacity = math.min(if stress then Config.stressCapacity else Config.capacity, 256)
 	elseif k == Enum.KeyCode.G then
 		impostorOnly = not impostorOnly
 	elseif k == Enum.KeyCode.N and L then
@@ -322,7 +323,7 @@ RunService.RenderStepped:Connect(function(dt: number)
 					if L.stats.lastError then " (" .. string.sub(L.stats.lastError :: string, 1, 60) .. ")" else ""
 				)
 			)
-			table.insert(lines, string.format("options fades %s   tint %s   frozen %s   stress %s   green %s   UV flip %s", if L.opts.fades then "on" else "off", if L.opts.tint then "on" else "off", if L.opts.frozen then "yes" else "no", if L.opts.splitPx < 1 then "on" else "off", if L.opts.greenUp then "up" else "down", if pool and pool.flipV then "on" else "off"))
+			table.insert(lines, string.format("options fades %s   tint %s   frozen %s   stress %s   green %s   UV flip %s", if L.opts.fades then "on" else "off", if L.opts.tint then "on" else "off", if L.opts.frozen then "yes" else "no", if L.opts.splitPx < Config.splitPx then "on" else "off", if L.opts.greenUp then "up" else "down", if pool and pool.flipV then "on" else "off"))
 		end
 		local ws = workers.stats
 		table.insert(lines, string.format("workers %s, %d ready, %d sent, %d done, %d inline, %d lost, %d in flight", workers.mode, workers.readyCount, ws.sent, ws.done, ws.inline, ws.lost, workers.inflight))

@@ -30,7 +30,7 @@ local Uploader = require(script.Parent:WaitForChild("Uploader"))
 
 local Impostors = {}
 
-local MAX_N = 512
+local MAX_N: number = require(Planets:WaitForChild("Config")).impostorMax
 local BAND = 32
 
 export type Item = {

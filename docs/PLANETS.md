@@ -4,6 +4,10 @@ A stress test of EditableImages at planetary scale. Every surface pixel on scree
 
 The place is `build/UniversePlanets.rbxlx` (and `.rbxl`). Open it in Studio, turn on **Game Settings > Security > Allow Mesh / Image APIs**, and press Play. Nothing else is needed: there is no server script, no character, and no asset upload.
 
+## Changing the resolution
+
+Every tunable is in one module: `ReplicatedStorage > Planets > Config` in Studio, or `planets/shared/Config.luau` in the repository. Each value has a comment with its limit and memory cost. More surface tiles than 256 need new code (extra atlas sets); everything else is a number.
+
 ## Controls
 
 | Keys | Action |

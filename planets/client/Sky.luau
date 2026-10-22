@@ -16,8 +16,8 @@ local Uploader = require(script.Parent:WaitForChild("Uploader"))
 
 local Sky = {}
 
-local FACE = 512
-local SUN = 256
+local FACE: number = require(Planets:WaitForChild("Config")).skyFace
+local SUN: number = require(Planets:WaitForChild("Config")).sunSize
 local SUN_DISTANCE = 3900
 
 export type SkyState = {

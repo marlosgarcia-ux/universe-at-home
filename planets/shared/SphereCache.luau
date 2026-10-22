@@ -22,7 +22,7 @@ local MyMath = require("../Universe/MyMath")
 
 local SphereCache = {}
 
-SphereCache.N = 128
+SphereCache.N = require("./Config").sphereCacheN
 
 export type Cache = {
 	body: string,

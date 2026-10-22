@@ -17,7 +17,7 @@ moduleInstance(Universe, "MyMath", { file = "../src/MyMath" })
 local PlanetsF = makeClass("Folder")
 PlanetsF.Name = "Planets"
 PlanetsF.Parent = ReplicatedStorage
-for _, n in { "Layout", "Noise3", "CubeSphere", "Bodies", "TileGen", "Quadtree", "SphereCache", "Impostor", "SkyGen", "Clouds", "PlanetJobs" } do
+for _, n in { "Config", "Layout", "Noise3", "CubeSphere", "Bodies", "TileGen", "Quadtree", "SphereCache", "Impostor", "SkyGen", "Clouds", "PlanetJobs" } do
 	moduleInstance(PlanetsF, n, { file = "../planets/shared/" .. n })
 end
 moduleInstance(PlanetsF, "WorkerPool", { wrapped = "WorkerPool" })

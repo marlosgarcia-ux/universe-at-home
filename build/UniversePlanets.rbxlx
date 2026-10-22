@@ -779,6 +779,43 @@ return Clouds
       </Item>
       <Item class="ModuleScript" referent="14">
         <Properties>
+          <string name="Name">Config</string>
+          <string name="Source"><![CDATA[--!strict
+-- Universe at Home: Planets :: Config
+--
+-- Every number you are likely to change. In Studio: ReplicatedStorage > Planets > Config.
+-- Raise a value, press Play. Memory figures are RGBA8 EditableImage bytes unless noted;
+-- the client budget is unknown (reports say about 32 MB), so press X in the place to
+-- measure it. EditableImages are at most 1024 x 1024.
+
+return {
+	-- SURFACE (Terra and Selene meshes)
+	splitPx = 1.6, -- split a patch while one texel covers more than this many screen pixels (lower = sharper)
+	capacity = 200, -- most patches shown at once; cannot exceed 256 (the atlas has 256 tiles; 9 MB)
+	stressSplitPx = 0.8, -- the B key
+	stressCapacity = 240,
+	maxLevelTerra = 11, -- deepest quadtree level (level 11 = 0.02 studs per texel on Terra)
+	maxLevelOther = 10,
+	meshOn = 2.0, -- distance / radius under which a rocky body switches from billboard to mesh
+	meshOff = 2.3, -- and over which it switches back (keep above meshOn)
+
+	-- FAR BODIES (billboards)
+	sphereCacheN = 128, -- texels per cube-face edge of the lookup cache; 256 = twice as sharp from orbit,
+	-- but each of the workers keeps ~10 MB (3 bodies); 128 = ~2.4 MB each
+	impostorMax = 512, -- largest billboard image (power of two, 32 to 1024); 1024 = 4 MB per body instead of 1 MB
+
+	-- SPACE
+	skyFace = 512, -- star skybox face size (up to 1024; 1024 = 24 MB instead of 6 MB)
+	sunSize = 256,
+
+	-- WORKERS
+	workers = 6, -- Actors generating tiles and billboards
+}
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="15">
+        <Properties>
           <string name="Name">CubeSphere</string>
           <string name="Source"><![CDATA[--!strict
 --!native
@@ -920,7 +957,7 @@ return CubeSphere
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="15">
+      <Item class="ModuleScript" referent="16">
         <Properties>
           <string name="Name">Impostor</string>
           <string name="Source"><![CDATA[--!strict
@@ -1259,7 +1296,7 @@ return Impostor
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="16">
+      <Item class="ModuleScript" referent="17">
         <Properties>
           <string name="Name">Layout</string>
           <string name="Source"><![CDATA[--!strict
@@ -1353,7 +1390,7 @@ return Layout
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="17">
+      <Item class="ModuleScript" referent="18">
         <Properties>
           <string name="Name">Noise3</string>
           <string name="Source"><![CDATA[--!strict
@@ -1563,7 +1600,7 @@ return Noise3
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="18">
+      <Item class="ModuleScript" referent="19">
         <Properties>
           <string name="Name">PlanetJobs</string>
           <string name="Source"><![CDATA[--!strict
@@ -1650,7 +1687,7 @@ return Jobs
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="19">
+      <Item class="ModuleScript" referent="20">
         <Properties>
           <string name="Name">Quadtree</string>
           <string name="Source"><![CDATA[--!strict
@@ -2059,7 +2096,7 @@ return Quadtree
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="20">
+      <Item class="ModuleScript" referent="21">
         <Properties>
           <string name="Name">SkyGen</string>
           <string name="Source"><![CDATA[--!strict
@@ -2227,7 +2264,7 @@ return SkyGen
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="21">
+      <Item class="ModuleScript" referent="22">
         <Properties>
           <string name="Name">SphereCache</string>
           <string name="Source"><![CDATA[--!strict
@@ -2254,7 +2291,7 @@ local MyMath = require("../Universe/MyMath")
 
 local SphereCache = {}
 
-SphereCache.N = 128
+SphereCache.N = require("./Config").sphereCacheN
 
 export type Cache = {
 	body: string,
@@ -2458,7 +2495,7 @@ return SphereCache
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="22">
+      <Item class="ModuleScript" referent="23">
         <Properties>
           <string name="Name">TileGen</string>
           <string name="Source"><![CDATA[--!strict
@@ -2876,7 +2913,7 @@ return TileGen
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="23">
+      <Item class="ModuleScript" referent="24">
         <Properties>
           <string name="Name">WorkerMain</string>
           <string name="Source"><![CDATA[--!strict
@@ -2930,7 +2967,7 @@ return WorkerMain
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="24">
+      <Item class="ModuleScript" referent="25">
         <Properties>
           <string name="Name">WorkerPool</string>
           <string name="Source"><![CDATA[--!strict
@@ -3276,11 +3313,11 @@ return WorkerPool
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="25">
+    <Item class="Folder" referent="26">
       <Properties>
         <string name="Name">Universe</string>
       </Properties>
-      <Item class="ModuleScript" referent="26">
+      <Item class="ModuleScript" referent="27">
         <Properties>
           <string name="Name">Canvas</string>
           <string name="Source"><![CDATA[--!native
@@ -3528,7 +3565,7 @@ return Canvas
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="27">
+      <Item class="ModuleScript" referent="28">
         <Properties>
           <string name="Name">Liquid</string>
           <string name="Source"><![CDATA[--!native
@@ -7045,7 +7082,7 @@ return Liquid
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="28">
+      <Item class="ModuleScript" referent="29">
         <Properties>
           <string name="Name">LiquidControl</string>
           <string name="Source"><![CDATA[--!native
@@ -7419,7 +7456,7 @@ return LiquidControl
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="29">
+      <Item class="ModuleScript" referent="30">
         <Properties>
           <string name="Name">LiquidLearn</string>
           <string name="Source"><![CDATA[--!native
@@ -9757,7 +9794,7 @@ return LiquidLearn
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="30">
+      <Item class="ModuleScript" referent="31">
         <Properties>
           <string name="Name">LiquidMatte</string>
           <string name="Source"><![CDATA[--!native
@@ -11703,7 +11740,7 @@ return LiquidMatte
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="31">
+      <Item class="ModuleScript" referent="32">
         <Properties>
           <string name="Name">LiquidTime</string>
           <string name="Source"><![CDATA[--!native
@@ -12558,7 +12595,7 @@ return LiquidTime
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="32">
+      <Item class="ModuleScript" referent="33">
         <Properties>
           <string name="Name">MyMath</string>
           <string name="Source"><![CDATA[--!native
@@ -13071,7 +13108,7 @@ return MyMath
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="33">
+      <Item class="ModuleScript" referent="34">
         <Properties>
           <string name="Name">Pixels</string>
           <string name="Source"><![CDATA[--!native
@@ -13360,7 +13397,7 @@ return Pixels
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="34">
+      <Item class="ModuleScript" referent="35">
         <Properties>
           <string name="Name">Saturn</string>
           <string name="Source"><![CDATA[--!native
@@ -13587,11 +13624,11 @@ return Saturn
 ]]></string>
         </Properties>
       </Item>
-      <Item class="Folder" referent="35">
+      <Item class="Folder" referent="36">
         <Properties>
           <string name="Name">compute</string>
         </Properties>
-        <Item class="ModuleScript" referent="36">
+        <Item class="ModuleScript" referent="37">
           <Properties>
             <string name="Name">Coverage</string>
             <string name="Source"><![CDATA[--!native
@@ -14455,7 +14492,7 @@ return Coverage
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="37">
+        <Item class="ModuleScript" referent="38">
           <Properties>
             <string name="Name">Distance</string>
             <string name="Source"><![CDATA[--!native
@@ -14824,7 +14861,7 @@ return Distance
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="38">
+        <Item class="ModuleScript" referent="39">
           <Properties>
             <string name="Name">Expr</string>
             <string name="Source"><![CDATA[--!native
@@ -15402,7 +15439,7 @@ return Expr
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="39">
+        <Item class="ModuleScript" referent="40">
           <Properties>
             <string name="Name">Filter</string>
             <string name="Source"><![CDATA[--!native
@@ -15841,7 +15878,7 @@ return Filter
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="40">
+        <Item class="ModuleScript" referent="41">
           <Properties>
             <string name="Name">Raster</string>
             <string name="Source"><![CDATA[--!native
@@ -17561,7 +17598,7 @@ return Raster
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="41">
+        <Item class="ModuleScript" referent="42">
           <Properties>
             <string name="Name">Rows</string>
             <string name="Source"><![CDATA[--!native
@@ -17685,7 +17722,7 @@ return Rows
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="42">
+        <Item class="ModuleScript" referent="43">
           <Properties>
             <string name="Name">Scanline</string>
             <string name="Source"><![CDATA[--!native
@@ -18653,7 +18690,7 @@ return Scanline
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="43">
+        <Item class="ModuleScript" referent="44">
           <Properties>
             <string name="Name">Tiles</string>
             <string name="Source"><![CDATA[--!native
@@ -18952,7 +18989,7 @@ return Tiles
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="44">
+        <Item class="ModuleScript" referent="45">
           <Properties>
             <string name="Name">Trace</string>
             <string name="Source"><![CDATA[--!native
@@ -19130,7 +19167,7 @@ return Trace
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="45">
+        <Item class="ModuleScript" referent="46">
           <Properties>
             <string name="Name">Visibility</string>
             <string name="Source"><![CDATA[--!native
@@ -19699,19 +19736,19 @@ return Visibility
       </Item>
     </Item>
   </Item>
-  <Item class="StarterPlayer" referent="46">
+  <Item class="StarterPlayer" referent="47">
     <Properties>
       <string name="Name">StarterPlayer</string>
     </Properties>
-    <Item class="StarterPlayerScripts" referent="47">
+    <Item class="StarterPlayerScripts" referent="48">
       <Properties>
         <string name="Name">StarterPlayerScripts</string>
       </Properties>
-      <Item class="Folder" referent="48">
+      <Item class="Folder" referent="49">
         <Properties>
           <string name="Name">Client</string>
         </Properties>
-        <Item class="ModuleScript" referent="49">
+        <Item class="ModuleScript" referent="50">
           <Properties>
             <string name="Name">CloudLayer</string>
             <string name="Source"><![CDATA[--!strict
@@ -19878,7 +19915,7 @@ return CloudLayer
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="50">
+        <Item class="ModuleScript" referent="51">
           <Properties>
             <string name="Name">Flight</string>
             <string name="Source"><![CDATA[--!strict
@@ -20136,7 +20173,7 @@ return Flight
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="51">
+        <Item class="ModuleScript" referent="52">
           <Properties>
             <string name="Name">Hud</string>
             <string name="Source"><![CDATA[--!strict
@@ -20250,7 +20287,7 @@ return Hud
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="52">
+        <Item class="ModuleScript" referent="53">
           <Properties>
             <string name="Name">Impostors</string>
             <string name="Source"><![CDATA[--!strict
@@ -20285,7 +20322,7 @@ local Uploader = require(script.Parent:WaitForChild("Uploader"))
 
 local Impostors = {}
 
-local MAX_N = 512
+local MAX_N: number = require(Planets:WaitForChild("Config")).impostorMax
 local BAND = 32
 
 export type Item = {
@@ -20594,7 +20631,7 @@ return Impostors
 ]]></string>
           </Properties>
         </Item>
-        <Item class="LocalScript" referent="53">
+        <Item class="LocalScript" referent="54">
           <Properties>
             <string name="Name">Main</string>
             <string name="Source"><![CDATA[--!strict
@@ -20635,8 +20672,9 @@ local CloudLayer = require(script.Parent:WaitForChild("CloudLayer"))
 local Flight = require(script.Parent:WaitForChild("Flight"))
 local Workers = require(script.Parent:WaitForChild("Workers"))
 
-local MESH_ON = 2.0 -- distance / radius below which a rocky body gets its mesh
-local MESH_OFF = 2.3 -- and above which it goes back to the impostor (hysteresis)
+local Config = require(Planets:WaitForChild("Config"))
+local MESH_ON: number = Config.meshOn -- distance / radius below which a rocky body gets its mesh
+local MESH_OFF: number = Config.meshOff -- and above which it goes back to the impostor (hysteresis)
 
 local player = Players.LocalPlayer
 local cam = Workspace.CurrentCamera
@@ -20658,7 +20696,7 @@ local cloudsOn = true
 local impostorOnly = false
 local sunCycle = false
 local workersNote: string? = nil
-local workers = Workers.start(6, function(note: string)
+local workers = Workers.start(Config.workers, function(note: string)
 	workersNote = note
 end)
 
@@ -20816,9 +20854,9 @@ UserInputService.InputBegan:Connect(function(input: InputObject, processed: bool
 	elseif k == Enum.KeyCode.L and L then
 		L.opts.frozen = not L.opts.frozen
 	elseif k == Enum.KeyCode.B and L then
-		local stress = L.opts.splitPx > 1
-		L.opts.splitPx = if stress then 0.8 else 1.6
-		L.opts.capacity = if stress then 240 else 200
+		local stress = L.opts.splitPx > Config.stressSplitPx
+		L.opts.splitPx = if stress then Config.stressSplitPx else Config.splitPx
+		L.opts.capacity = math.min(if stress then Config.stressCapacity else Config.capacity, 256)
 	elseif k == Enum.KeyCode.G then
 		impostorOnly = not impostorOnly
 	elseif k == Enum.KeyCode.N and L then
@@ -20921,7 +20959,7 @@ RunService.RenderStepped:Connect(function(dt: number)
 					if L.stats.lastError then " (" .. string.sub(L.stats.lastError :: string, 1, 60) .. ")" else ""
 				)
 			)
-			table.insert(lines, string.format("options fades %s   tint %s   frozen %s   stress %s   green %s   UV flip %s", if L.opts.fades then "on" else "off", if L.opts.tint then "on" else "off", if L.opts.frozen then "yes" else "no", if L.opts.splitPx < 1 then "on" else "off", if L.opts.greenUp then "up" else "down", if pool and pool.flipV then "on" else "off"))
+			table.insert(lines, string.format("options fades %s   tint %s   frozen %s   stress %s   green %s   UV flip %s", if L.opts.fades then "on" else "off", if L.opts.tint then "on" else "off", if L.opts.frozen then "yes" else "no", if L.opts.splitPx < Config.splitPx then "on" else "off", if L.opts.greenUp then "up" else "down", if pool and pool.flipV then "on" else "off"))
 		end
 		local ws = workers.stats
 		table.insert(lines, string.format("workers %s, %d ready, %d sent, %d done, %d inline, %d lost, %d in flight", workers.mode, workers.readyCount, ws.sent, ws.done, ws.inline, ws.lost, workers.inflight))
@@ -20954,7 +20992,7 @@ end)
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="54">
+        <Item class="ModuleScript" referent="55">
           <Properties>
             <string name="Name">MeshPool</string>
             <string name="Source"><![CDATA[--!strict
@@ -21362,7 +21400,7 @@ return MeshPool
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="55">
+        <Item class="ModuleScript" referent="56">
           <Properties>
             <string name="Name">PlanetLod</string>
             <string name="Source"><![CDATA[--!strict
@@ -21394,6 +21432,8 @@ local Layout = require(Planets:WaitForChild("Layout")) :: any
 local WorkerPool = require(Planets:WaitForChild("WorkerPool")) :: any
 local MeshPool = require(script.Parent:WaitForChild("MeshPool"))
 local Uploader = require(script.Parent:WaitForChild("Uploader"))
+
+local Config = require(Planets:WaitForChild("Config"))
 
 local PlanetLod = {}
 
@@ -21495,7 +21535,7 @@ function PlanetLod.new(pool: MeshPool.Pool, U: Uploader.Uploader, workers: any):
 		frame = 0,
 		lastSelect = -100,
 		lastCam = Vector3.new(1e9, 0, 0),
-		opts = { fades = true, frozen = false, greenUp = true, tint = false, splitPx = 1.6, capacity = 200 },
+		opts = { fades = true, frozen = false, greenUp = true, tint = false, splitPx = Config.splitPx, capacity = math.min(Config.capacity, Layout.SLOTS) },
 		stats = { generated = 0, failed = 0, lastError = nil, genMs = 0, swaps = 0, evicted = 0, rate = 0, deepest = 0, limited = false },
 	}
 end
@@ -21858,7 +21898,7 @@ function PlanetLod.update(L: Lod, cam: Camera, dt: number, budget: number)
 			capacity = L.opts.capacity,
 			splitPx = L.opts.splitPx,
 			hysteresis = 1.35,
-			maxLevel = if body.id == "terra" then 11 else 10,
+			maxLevel = if body.id == "terra" then Config.maxLevelTerra else Config.maxLevelOther,
 		}, L.split)
 		L.split = sel.split
 		L.target = sel.leaves
@@ -21926,7 +21966,7 @@ return PlanetLod
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="56">
+        <Item class="ModuleScript" referent="57">
           <Properties>
             <string name="Name">Sky</string>
             <string name="Source"><![CDATA[--!strict
@@ -21947,8 +21987,8 @@ local Uploader = require(script.Parent:WaitForChild("Uploader"))
 
 local Sky = {}
 
-local FACE = 512
-local SUN = 256
+local FACE: number = require(Planets:WaitForChild("Config")).skyFace
+local SUN: number = require(Planets:WaitForChild("Config")).sunSize
 local SUN_DISTANCE = 3900
 
 export type SkyState = {
@@ -22061,7 +22101,7 @@ return Sky
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="57">
+        <Item class="ModuleScript" referent="58">
           <Properties>
             <string name="Name">Uploader</string>
             <string name="Source"><![CDATA[--!strict
@@ -22177,7 +22217,7 @@ return Uploader
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="58">
+        <Item class="ModuleScript" referent="59">
           <Properties>
             <string name="Name">Workers</string>
             <string name="Source"><![CDATA[--!strict
@@ -22248,7 +22288,7 @@ return Workers
       </Item>
     </Item>
   </Item>
-  <Item class="Workspace" referent="59">
+  <Item class="Workspace" referent="60">
     <Properties>
       <string name="Name">Workspace</string>
       <float name="FallenPartsDestroyHeight">-50000</float>
