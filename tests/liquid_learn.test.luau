@@ -463,8 +463,8 @@ do
 		return ticks * 0.001
 	end
 	local saved = LL.pendingLimit
-	for _, opts in { {}, { event = true }, { stride = 4 } } do
-		local o: LL.AccumOptions = opts
+	local modes: { LL.AccumOptions } = { {}, { event = true }, { stride = 4 } }
+	for _, o in modes do
 		LL.pendingLimit = saved
 		local want = LL.newStats(2 * N + 1, M)
 		LL.accumulate(want, LL.newRows(res, tree, 0), target, o)

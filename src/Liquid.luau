@@ -844,6 +844,7 @@ export type Stats = {
 	fills: number, -- fill spans
 	fillPixels: number, -- pixels written by fills
 	searchProbes: number, -- bound evaluations made by the n0 search
+	seam: number, -- endless mode: largest X3 certificate of the rendered block rows
 }
 
 local function newStats(): Stats
@@ -859,6 +860,7 @@ local function newStats(): Stats
 		fills = 0,
 		fillPixels = 0,
 		searchProbes = 0,
+		seam = 0,
 	}
 end
 Liquid.newStats = newStats
@@ -890,6 +892,10 @@ local function getScratch(plan: Plan, minCap: number): Scratch
 		aThr = table.create(K, 0),
 		oOff = table.create(K, 0),
 		oQ = table.create(K * 4, 0),
+		certF = table.create(math.max(plan.nt, 1), 1),
+		certB = table.create(math.max(plan.nt, 1), 1),
+		rangeTree = nil,
+		ranges = nil,
 	}
 	local base: Scratch = {
 		cap = cap,
@@ -2990,7 +2996,14 @@ function Liquid.render(plan: Plan, tree: Tree, out: buffer, outWidth: number, op
 			local cx1 = if (beta + 1) * colW < rx + rw then (beta + 1) * colW else rx + rw
 			local wa, wb = (beta - horizon) * Sr, (beta + 1 + horizon) * Sr
 			column(cx0, cx1, function(y: number): (number, number)
-				return segmentEndless(plan, tree, sc, y, wa, wb, seed)
+				local n, bandEnd = segmentEndless(plan, tree, sc, y, wa, wb, seed)
+				if fast then
+					local cert = windowCert(plan, tree, sc, n, beta * Sr, (beta + 1) * Sr)
+					if cert > stats.seam then
+						stats.seam = cert
+					end
+				end
+				return n, bandEnd
 			end, math.huge, math.huge)
 		end
 	else

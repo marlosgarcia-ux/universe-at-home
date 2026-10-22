@@ -346,7 +346,7 @@ do
 	local plan = Liquid.prepare(model, tree)
 	local seed = 1234567
 	local horizon = 2
-	local endless = { seed = seed, horizon = horizon }
+	local endless: Liquid.Endless = { seed = seed, horizon = horizon }
 	-- every virtual leaf carries the content of a stored leaf
 	for _ = 1, 200 do
 		local xs = math.floor(rnd(valuesChecked, 1, 3) * 2000) - 1000
@@ -414,6 +414,29 @@ do
 		end
 	end
 	assert(worst <= bound, `X3 seam bound violated: {worst} > {bound}`)
+	-- a-posteriori certificates: two windows overlapping at a pixel disagree there by at most
+	-- the sum of their certificates (each bounds its distance to the infinite-row model)
+	local tight = 0
+	for Y = -20, 70, 3 do
+		for _, X in { 0, 31, 64, 100, 127 } do
+			local wa1 = Liquid.referenceEndless(plan, tree, Y, 0, horizon, seed, z1) -- [-128, 192)
+			local wa2 = Liquid.referenceEndless(plan, tree, Y, 1, horizon, seed, z2) -- [-64, 256)
+			local c1 = Liquid.windowCertificate(plan, tree, Y, wa1, wa1 + 5 * plan.Sr, X, X + 1, seed)
+			local c2 = Liquid.windowCertificate(plan, tree, Y, wa2, wa2 + 5 * plan.Sr, X, X + 1, seed)
+			for m = 0, 2 do
+				local d = math.abs(z1[(X - wa1) * 3 + m + 1] - z2[(X - wa2) * 3 + m + 1])
+				assert(d <= c1 + c2 + FP, `X3 certificate violated: {d} > {c1 + c2}`)
+				if d > 0 and (c1 + c2) > 0 and d / (c1 + c2) > tight then
+					tight = d / (c1 + c2)
+				end
+			end
+		end
+	end
+	assert(tight > 0, "certificate test must be non-trivial")
+	local st = Liquid.newStats()
+	local tile = buffer.create(64 * 64 * 4)
+	Liquid.render(plan, tree, tile, 64, { epsilon = 0.5, x = 64, y = 0, w = 64, h = 64, endless = endless, stats = st })
+	assert(st.seam > 0 and st.seam < math.huge, "render reports its X3 certificate")
 end
 
 print("liquid tests ok", valuesChecked)
