@@ -1,8 +1,9 @@
 --!strict
 -- Tests for ALLAN's applications (docs/LIQUID.md "Applications results"): LiquidMatte
--- (background removal), LiquidControl (X5) and LiquidTime (X1). Run by tests/run.sh in the
--- interpreter and with native code generation; every check asserts. Golden hashes are the
--- same constants in both runtimes (T7-style lockstep).
+-- (background removal) and LiquidControl (X5). LiquidTime (X1) has its own file,
+-- tests/liquid_time.test.luau. Run by tests/run.sh in the interpreter and with native code
+-- generation; every check asserts. Golden hashes are the same constants in both runtimes
+-- (T7-style lockstep).
 
 local LiquidMatte = require("../src/LiquidMatte")
 local LiquidControl = require("../src/LiquidControl")

@@ -271,3 +271,48 @@ Measured: largest certificates `3e-10` to `6e-8` output units on the benchmark m
 6. M > 4 runs on the generic path: measured 2.4 times (M = 5) and 3.6 times (M = 8) the time of M = 4 on a logo-like scene (native). Extending the fast path to 8 channels is mechanical.
 7. Memory: the per-content cache holds `8G + 10` numbers per distinct leaf content (up to 32768 contents, about 6.5 MB as Luau tables for the noise scene's 15760). A client should cap it lower or store it in buffers.
 8. T7 on ARM is argued, not tested.
+
+## 12. Applications results
+
+Labels as in section 11. **[tested]** means asserted in both runtimes (interpreter and native code) by `tests/liquid_apps.test.luau` (matte and control, 34,507 checks) or `tests/liquid_time.test.luau` (time, 3,604 checks). Nothing in this section has been timed on a benchmark, and none of it has run inside Roblox Studio. The gallery place does not carry the three modules, and the Meadow place carries them in its Universe folder without any script calling them.
+
+### 12.1 Liquid matte, `src/LiquidMatte.luau`: [tested]
+
+The test scene is a green screen with a red disc that has a green hole. The checks, by the test's own section names:
+
+- M1 the key is found from the image border.
+- M2 flood fill keeps the green hole inside the disc, global keying removes it.
+- M3 anti-aliased edges are preserved on a clean image.
+- M4 a noisy key background.
+- M5 despill: unmixing and the spill limiter remove the key hue.
+- M6 alpha bleeding: transparent pixels carry visible colours, never the key.
+- M7 the three refinement paths agree bit for bit, and the raw matte matches its definition.
+- M8 the liquid pass is a normalised recursive bilateral filter with hard cuts.
+- M9 three golden hashes are the same constants in both runtimes.
+
+### 12.2 Liquid control, `src/LiquidControl.luau` (X5): [tested]
+
+- C1 constant load: exact prediction, monotone knobs, bounded settling.
+- C2 steps: one-frame re-anchoring, settling bounds, no oscillation afterwards.
+- C3 ramps: extrapolation keeps every frame at or under `hi * budget`; a reactive controller with the same thresholds does not.
+- C4 noisy load: hysteresis keeps the knobs still.
+- C5 wrong cost model: failed probes are bounded by `1 + floor(log_{1/rho}(l_q / l_{q-1}))`.
+- C6 residency follows exogenous memory with the same guarantees.
+- C7 a scripted session gives the same bits in both runtimes.
+
+### 12.3 Liquid time, `src/LiquidTime.luau` (X1, texture dead reckoning): [tested]
+
+Each property is checked against an independent computation, not against the module itself.
+
+- **Closed form equals the dynamics.** The jump from one commit point to the next equals the same cells stepped tick by tick (`stepReference`) to a relative gap below 1e-9. The test covers order 1 and 2, hash and flow drive, epochs of 1 to 64 ticks, gain exponents up to 30, and up to 14 query ticks each.
+- **The bits depend only on the set of events.** The state checksum is identical under shuffled delivery, every message delivered twice, and late arrival after the cursors have moved on, with and without a horizon. Late events at or above the horizon roll back to a checkpoint and never replay from tick zero.
+- **Asking more often changes nothing.** Querying at every tick, once, or at random ticks and leaves gives the same bits.
+- **Messages are small and exact.** A kick or offset is 18 bytes, a splash 20, a horizon 5. Values are fixed point in steps of 1/256. A world fed through the wire equals one fed directly.
+- **Splash is its definition.** It equals a kick of `v (1 - d^2 / r^2)` into every leaf centre closer than `r`; a centre exactly `r` away is not kicked.
+- **The wake-up calendar is exact.** `dirty` returns the same leaves and row ranges as checking every leaf (`dirtyBrute`), for `epsilon` 0.5 and 2, both orders, 70 steps each, with late events in the stream.
+- **`driftBound` is the response.** The measured change a single late kick or offset makes, `lat` ticks after its time stamp, equals `driftBound` to 1e-9, for 96 random cases.
+- **The checksum covers both states.** With `k = 0` the first state forgets a kick one tick later and the second does not; worlds that differ only there have different checksums.
+
+Contract found while writing the test: for each leaf, queries must come in non-decreasing tick order, because the cursor only moves forward (late events are the one thing that moves it back). A client that wants to look at an earlier tick again must `reset` the world.
+
+To check that the test can fail, fourteen deliberate breakages of the module were each caught: a wrong gain exponent, a shifted tick count, a dropped rollback, ignored duplicates, ignoring `seq` in the event order, a wrong splash falloff, a splash radius off by one, a wrong checkpoint rule, a wrong wake bound, a wrong drift formula, a scaled offset, and a checksum that skips either state. One further change (not mirroring a kick into the unused second state at order 1) cannot be observed and is not caught.
