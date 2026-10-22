@@ -9,14 +9,35 @@
 -- to the perimeter (cells crossed), not the area: between touched cells the running
 -- sum is constant, so those spans are filled with buffer.copy (RUNTIME_AUDIT 6.7.3).
 --
--- Fill rule: non-zero, coverage = min(1, |winding area|). Curves are flattened to
--- line segments with a sagitta tolerance (flattenEllipse), whose area error per
--- pixel is at most the tolerance.
+-- Fill rule: non-zero, coverage = min(1, |winding area|), which is the exact area
+-- for paths whose winding number is 0 or +-1 everywhere (simple, non-overlapping
+-- contours; holes wound the other way). Curves are flattened to line segments with
+-- a sagitta tolerance (flattenEllipse), whose area error per pixel is at most about
+-- 1.5 times the tolerance (that is the polygon's distance from the curve; the
+-- polygon itself is rendered exactly).
 --
--- Deterministic: + - * / floor ceil min max abs only.
+-- Single path versus scenes (docs/COMPUTE.md F2, C11):
+--   resolve, composite   one path. Exact (F1): the byte is the correctly rounded
+--                        coverage, composited once over the destination.
+--                        Painting a multi-path scene by calling composite per path
+--                        is NOT exact: shared edges conflate (a 64/255 seam) and
+--                        translucent layers round to 8 bits after every path.
+--   renderScene          many paths, exact (F2): rows are processed top to bottom;
+--                        each path's coverage comes from a one-row accumulator, is
+--                        composited in floating point where the byte would be
+--                        inexact (edges, translucent paths) and with span fills
+--                        where it is exact (opaque interiors), and every pixel
+--                        where two or more paths' edges enter is recomputed with
+--                        exact visibility (compute/Visibility.luau) from the
+--                        paths' geometry. Each output byte is rounded once.
+--
+-- Deterministic: + - * / floor ceil min max abs only (plus Coverage.dasin inside
+-- Visibility's disc areas, unused for polygons).
 
 local Pixels = require("../Pixels")
 local MyMath = require("../MyMath")
+local Coverage = require("./Coverage")
+local Visibility = require("./Visibility")
 
 local Scanline = {}
 

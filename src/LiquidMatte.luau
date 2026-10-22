@@ -708,8 +708,21 @@ end
 
 local STRIP = 64
 
--- Event-driven refinement: the same bits as refineReference. Returns A and the number of
--- transient steps (pixels whose state differed from their input after the step).
+-- Makes a byte plane clip-closed in place (every value 0, 255 or inside (clip, 255 - clip)).
+-- rawMatte output already is; refine and refineReference agree bit for bit on such inputs.
+function LiquidMatte.clipPlane(u: buffer, n: number, clip: number)
+	for i = 0, n - 1 do
+		local v = buffer.readu8(u, i)
+		if v > 0 and v <= clip then
+			buffer.writeu8(u, i, 0)
+		elseif v < 255 and v >= 255 - clip then
+			buffer.writeu8(u, i, 255)
+		end
+	end
+end
+
+-- Event-driven refinement: the same bits as refineReference for a clip-closed u. Returns A
+-- and the number of transient steps (states left off their input after the step).
 function LiquidMatte.refine(u: buffer, dq: buffer, w: number, h: number, tau: number, kMax: number, clip: number, out: buffer?): (buffer, number)
 	local GT = LiquidMatte.gainTable(tau, kMax)
 	local readu8, readu16, readu32 = buffer.readu8, buffer.readu16, buffer.readu32

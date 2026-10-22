@@ -145,7 +145,7 @@ do
 			Raster.render(sc, Raster.bin(sc, size, size), b, size, size, leaf)
 			assert(Pixels.diff(a, b, size * size) == 0, string.format("render != brute (size %d n %d leaf %d mode %d)", size, n, leaf, mode))
 			if size == 256 and leaf == 8 then
-				checkHash("raster mode " .. mode, hashWords(b, size * size), if mode == 0 then 657927456 else 2126128460)
+				checkHash("raster mode " .. mode, hashWords(b, size * size), if mode == 0 then 657927456 else 2550832146)
 			end
 		end
 	end
@@ -250,7 +250,7 @@ do
 		end, function(x, y)
 			return Coverage.polygonArea(pts, x, y)
 		end, 32, 42, 128, 108, EXACT)
-		assert(e <= 1.0, "exact capsule err " .. e) -- caps use the curvature term: 0.74 measured
+		assert(e <= F1, "exact capsule err " .. e) -- exact cap decomposition (was 0.74 with the curvature term)
 	end
 end
 
