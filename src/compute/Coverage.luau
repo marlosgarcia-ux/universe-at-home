@@ -337,22 +337,28 @@ local function quadrantArea(a: number, b: number, c: number, d: number, r: numbe
 	if b * b + d * d <= r2 then
 		return (b - a) * (d - c)
 	end
-	local p, sp
+	-- (single assignments: a call in the last position of a multiple assignment
+	-- types as optional in strict mode)
+	local p, sp = 0, r
 	if d < r then
-		p, sp = sqrt(r2 - d * d), d
-	else
-		p, sp = 0, r
+		p = sqrt(r2 - d * d)
+		sp = d
 	end
 	if p < a then
-		p, sp = a, sqrt(r2 - a * a)
+		p = a
+		sp = sqrt(r2 - a * a)
 	elseif p > b then
-		p, sp = b, sqrt(r2 - b * b)
+		p = b
+		sp = sqrt(r2 - b * b)
 	end
-	local q, sq = sqrt(r2 - c * c), c
+	local q = sqrt(r2 - c * c)
+	local sq = c
 	if q > b then
-		q, sq = b, sqrt(r2 - b * b)
+		q = b
+		sq = sqrt(r2 - b * b)
 	elseif q < a then
-		q, sq = a, sqrt(r2 - a * a)
+		q = a
+		sq = sqrt(r2 - a * a)
 	end
 	local area = (d - c) * (p - a)
 	if q > p then

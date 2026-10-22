@@ -3,8 +3,9 @@
 -- universe-at-home :: compute/Raster
 --
 -- Scene rasterizer for hundreds of anti-aliased 2D shapes (circles, rounded boxes,
--- capsules, rings, polygons) composited bottom to top with straight-alpha
--- source-over. Three renderers share one per-pixel shading routine:
+-- capsules, rings, polygons, cut discs: half-discs and pie slices) composited
+-- bottom to top with straight-alpha source-over. Three renderers share one
+-- per-pixel shading routine:
 --
 --   renderBrute    every shape at every pixel (the reference)
 --   renderPainter  every shape over its own bounding box, 8-bit read-modify-write
@@ -19,34 +20,43 @@
 -- render is pixel-identical to renderBrute by construction (docs/COMPUTE.md, C2):
 -- a dropped shape has coverage exactly 0 at every pixel of the node, a base shape
 -- has coverage exactly 1 and alpha 255, and the per-pixel arithmetic is the same
--- function with the same operand order.
+-- function with the same operand order (including the exact-visibility path below,
+-- whose inputs are the same per-pixel stack in both renderers).
 --
--- Two coverage modes (docs/COMPUTE.md 3.3):
---   MODE_LINEAR  clamp(0.5 - d / aa, 0, 1), MyMath.coverage. Exact only on
---                axis-aligned edges: up to 10.94/255 on a 45 degree edge (C3),
---                38/255 at sharp box corners, 26 to 83/255 at star tips.
---   MODE_EXACT   pixel-area coverage: half-plane area from the distance and the
---                gradient minus the first-order curvature term (curves of radius
---                >= 8 px, ring edges, capsule caps), exact disc areas from a
---                deterministic arcsine (small circles, rounded box corners), the
---                product of two 1D overlaps (sharp boxes), and exact clipping by
---                the two nearest edges (polygon vertices, slivers, gaps). Measured
---                within 0.50/255 of the exact area, i.e. correctly rounded bytes,
---                for every tested primitive except capsule caps (0.74/255). Costs
---                1.2x MODE_LINEAR. Culling reach is sqrt(2)/2 AA widths (C4).
+-- Coverage modes (docs/COMPUTE.md 3.3 and "Flawless pipeline"):
+--   MODE_EXACT   (the DEFAULT) flawless. F1: every coverage is the exact area of
+--                the pixel inside the shape: disc areas by quadrant integration
+--                (circles, ring edges, rounded-box corners), products of 1D
+--                overlaps (boxes), the exact capsule decomposition (body = pixel
+--                clipped by the end lines and the strip sides; caps = disc and
+--                pixel clipped by the end line), disc and clipped pixel (cut discs),
+--                per-edge Green integrals (polygons, any number of edges per pixel).
+--                F2: where two or more shapes' edges enter a pixel ("conflict
+--                pixels") the composite is computed with exact visibility
+--                (compute/Visibility.luau) instead of chaining coverage as alpha,
+--                so abutting shapes leave no seam (C11). Elsewhere coverage as alpha
+--                is exact. Culling reach is sqrt(2)/2 AA widths (C4).
+--   MODE_LAYERED exact coverage (F1) composited as alpha everywhere: shows the
+--                conflation seam at shared edges (kept for comparison and cost).
+--   MODE_LINEAR  clamp(0.5 - d / aa, 0, 1), MyMath.coverage: the PREVIEW ramp.
+--                Exact only on axis-aligned edges: up to 10.94/255 on a 45 degree
+--                edge (C3), 38/255 at sharp box corners, 26 to 83/255 at star tips.
 --
--- Deterministic ops only: + - * / sqrt abs floor, comparisons (RUNTIME_AUDIT 6.5).
+-- Deterministic ops only: + - * / sqrt abs floor, comparisons and the
+-- deterministic arcsine Coverage.dasin (RUNTIME_AUDIT 6.5).
 
 local Pixels = require("../Pixels")
 local MyMath = require("../MyMath")
 local Coverage = require("./Coverage")
+local Visibility = require("./Visibility")
 
 local Raster = {}
 
-local CIRCLE, BOX, SEGMENT, RING, POLYGON = 1, 2, 3, 4, 5
+local CIRCLE, BOX, SEGMENT, RING, POLYGON, CUTDISC = 1, 2, 3, 4, 5, 6
 Raster.CIRCLE, Raster.BOX, Raster.SEGMENT, Raster.RING, Raster.POLYGON = CIRCLE, BOX, SEGMENT, RING, POLYGON
-local MODE_LINEAR, MODE_EXACT = 0, 1
-Raster.MODE_LINEAR, Raster.MODE_EXACT = MODE_LINEAR, MODE_EXACT
+Raster.CUTDISC = CUTDISC
+local MODE_LINEAR, MODE_EXACT, MODE_LAYERED = 0, 1, 2
+Raster.MODE_LINEAR, Raster.MODE_EXACT, Raster.MODE_LAYERED = MODE_LINEAR, MODE_EXACT, MODE_LAYERED
 
 export type Scene = {
 	n: number,
@@ -65,9 +75,9 @@ export type Scene = {
 	by0: { number },
 	bx1: { number },
 	by1: { number },
-	verts: { number },
+	verts: { number }, -- polygon vertices; cut-disc half-planes (n1x, n1y, o1, n2x, n2y, o2)
 	aa: number, -- anti-aliasing (box filter) width in pixels
-	mode: number, -- MODE_LINEAR or MODE_EXACT
+	mode: number, -- MODE_EXACT (default), MODE_LAYERED or MODE_LINEAR
 	bgR: number,
 	bgG: number,
 	bgB: number,
@@ -81,13 +91,13 @@ export type Bins = {
 	lists: { { number } },
 }
 
-export type Stats = { nodes: number, uniform: number, leaves: number, shaded: number, evals: number }
+export type Stats = { nodes: number, uniform: number, leaves: number, shaded: number, evals: number, conflicts: number }
 
-local stats: Stats = { nodes = 0, uniform = 0, leaves = 0, shaded = 0, evals = 0 }
+local stats: Stats = { nodes = 0, uniform = 0, leaves = 0, shaded = 0, evals = 0, conflicts = 0 }
 Raster.stats = stats
 
 function Raster.resetStats()
-	stats.nodes, stats.uniform, stats.leaves, stats.shaded, stats.evals = 0, 0, 0, 0, 0
+	stats.nodes, stats.uniform, stats.leaves, stats.shaded, stats.evals, stats.conflicts = 0, 0, 0, 0, 0, 0
 end
 
 ----------------------------------------------------------------------------------
@@ -115,7 +125,7 @@ function Raster.newScene(background: number, aa: number?, mode: number?): Scene
 		by1 = {},
 		verts = {},
 		aa = aa or 1,
-		mode = mode or MODE_LINEAR,
+		mode = mode or MODE_EXACT,
 		bgR = r,
 		bgG = g,
 		bgB = b,
@@ -138,9 +148,9 @@ end
 local function updateBounds(sc: Scene, s: number)
 	local k = sc.kind[s]
 	-- coverage can be nonzero up to half an AA width (linear) or sqrt(2)/2 (exact)
-	local h = sc.aa * (if sc.mode == MODE_EXACT then 0.70710678118654757 else 0.5)
+	local h = sc.aa * (if sc.mode ~= MODE_LINEAR then 0.70710678118654757 else 0.5)
 	local x0, y0, x1, y1 = 0, 0, 0, 0
-	if k == CIRCLE then
+	if k == CIRCLE or k == CUTDISC then
 		local r = sc.p3[s] + h
 		x0, y0, x1, y1 = sc.p1[s] - r, sc.p2[s] - r, sc.p1[s] + r, sc.p2[s] + r
 	elseif k == BOX then
@@ -190,8 +200,15 @@ function Raster.circle(sc: Scene, color: number, cx: number, cy: number, r: numb
 	return s
 end
 
--- Box centred at (cx, cy), half extents (hx, hy), corner radius rad.
+-- Axis-aligned box centred at (cx, cy), half extents (hx, hy), corner radius rad
+-- (clamped to [0, min(hx, hy)], where the rounded-box SDF is exact).
 function Raster.box(sc: Scene, color: number, cx: number, cy: number, hx: number, hy: number, rad: number): number
+	local m = if hx < hy then hx else hy
+	if rad > m then
+		rad = m
+	elseif rad < 0 then
+		rad = 0
+	end
 	local s = push(sc, BOX, color, cx, cy, hx, hy, rad, 0)
 	updateBounds(sc, s)
 	return s
@@ -213,8 +230,9 @@ function Raster.ring(sc: Scene, color: number, cx: number, cy: number, r: number
 	return s
 end
 
--- Polygon from flat {x1, y1, x2, y2, ...}; even-odd fill, exact distance. p3 holds
--- the orientation (sign of the shoelace area), which exact coverage needs at vertices.
+-- Polygon from flat {x1, y1, x2, y2, ...}; exact distance with the even-odd sign.
+-- p3 holds the orientation (sign of the shoelace area). Exact coverage (F1, F2)
+-- assumes a simple (non-self-intersecting) polygon.
 function Raster.polygon(sc: Scene, color: number, pts: { number }): number
 	local v = sc.verts
 	local first = #v + 1
@@ -234,6 +252,52 @@ function Raster.polygon(sc: Scene, color: number, pts: { number }): number
 	return s
 end
 
+-- Cut disc: the disc (cx, cy, r) intersected with up to two half-planes
+-- {q : n . (q - c) <= o}, normals (n1x, n1y) and (n2x, n2y) of unit length. With
+-- one half-plane it is a circular segment (o = 0: a half-disc); with two through
+-- the centre it is a pie slice. A convex primitive whose pieces abut exactly when
+-- neighbours pass bit-identical normals with opposite signs (negation is exact).
+function Raster.cutDisc(
+	sc: Scene,
+	color: number,
+	cx: number,
+	cy: number,
+	r: number,
+	n1x: number,
+	n1y: number,
+	o1: number,
+	n2x: number?,
+	n2y: number?,
+	o2: number?
+): number
+	local v = sc.verts
+	local first = #v + 1
+	v[first], v[first + 1], v[first + 2] = n1x, n1y, o1
+	if n2x and n2y then
+		v[first + 3], v[first + 4], v[first + 5] = n2x, n2y, o2 or 0
+	else
+		-- no second half-plane: zero normal, always satisfied (its distance is -1e300)
+		v[first + 3], v[first + 4], v[first + 5] = 0, 0, 1e300
+	end
+	local s = push(sc, CUTDISC, color, cx, cy, r, first, if n2x and n2y then 2 else 1, 0)
+	updateBounds(sc, s)
+	return s
+end
+
+-- Half-disc: the half of the disc on the side opposite to the unit vector (nx, ny),
+-- {q : n . (q - c) <= 0}. Its partner is halfDisc with (-nx, -ny).
+function Raster.halfDisc(sc: Scene, color: number, cx: number, cy: number, r: number, nx: number, ny: number): number
+	return Raster.cutDisc(sc, color, cx, cy, r, nx, ny, 0)
+end
+
+-- Pie slice from the unit direction (ax, ay) to the unit direction (bx, by), turning
+-- the way that takes x towards y (counter-clockwise in a y-up frame), at most half
+-- a turn: {cross(a, q - c) >= 0} and {cross(q - c, b) >= 0}. Slices that share a
+-- boundary direction (the same numbers) abut exactly.
+function Raster.pie(sc: Scene, color: number, cx: number, cy: number, r: number, ax: number, ay: number, bx: number, by: number): number
+	return Raster.cutDisc(sc, color, cx, cy, r, ay, -ax, 0, -by, bx, 0)
+end
+
 -- Moves shape s by (dx, dy) pixels.
 function Raster.move(sc: Scene, s: number, dx: number, dy: number)
 	local k = sc.kind[s]
@@ -250,13 +314,15 @@ function Raster.move(sc: Scene, s: number, dx: number, dy: number)
 	updateBounds(sc, s)
 end
 
--- A copy of the scene with every length multiplied by f (for rendering a mip
--- level directly at its own resolution; the AA width stays one output pixel).
+-- A copy of the scene with every length multiplied by f, for rendering a level of
+-- detail directly at its own resolution: the AA width stays one output pixel, so
+-- every level is the exact box filter of the vector source at that level (F1/F2
+-- hold per level; docs/COMPUTE.md "Flawless pipeline", LOD).
 function Raster.scaled(sc: Scene, f: number): Scene
 	local out = Raster.newScene(0, sc.aa, sc.mode)
 	out.bgR, out.bgG, out.bgB, out.bgA = sc.bgR, sc.bgG, sc.bgB, sc.bgA
 	for i = 1, #sc.verts do
-		out.verts[i] = sc.verts[i] * f
+		out.verts[i] = sc.verts[i]
 	end
 	for s = 1, sc.n do
 		local k = sc.kind[s]
@@ -265,6 +331,18 @@ function Raster.scaled(sc: Scene, f: number): Scene
 		out.cr[s], out.cg[s], out.cb[s], out.ca[s] = sc.cr[s], sc.cg[s], sc.cb[s], sc.ca[s]
 		if k == POLYGON then
 			out.p1[s], out.p2[s], out.p3[s], out.p4[s], out.p5[s], out.p6[s] = sc.p1[s], sc.p2[s], sc.p3[s], 0, 0, 0
+			local first = sc.p1[s]
+			for i = first, first + 2 * sc.p2[s] - 1 do
+				out.verts[i] = sc.verts[i] * f
+			end
+		elseif k == CUTDISC then
+			out.p1[s], out.p2[s], out.p3[s], out.p4[s], out.p5[s], out.p6[s] = sc.p1[s] * f, sc.p2[s] * f, sc.p3[s] * f, sc.p4[s], sc.p5[s], 0
+			local i = sc.p4[s]
+			-- normals stay, offsets scale (the always-true second plane stays 1)
+			out.verts[i + 2] = sc.verts[i + 2] * f
+			if sc.p5[s] == 2 then
+				out.verts[i + 5] = sc.verts[i + 5] * f
+			end
 		elseif k == SEGMENT then
 			out.p1[s], out.p2[s], out.p3[s], out.p4[s], out.p5[s] = sc.p1[s] * f, sc.p2[s] * f, sc.p3[s] * f, sc.p4[s] * f, sc.p5[s] * f
 			local len2 = out.p3[s] * out.p3[s] + out.p4[s] * out.p4[s]
@@ -326,7 +404,9 @@ end
 
 ----------------------------------------------------------------------------------
 -- Signed distance of shape s at (px, py); used for node classification.
--- The per-pixel path in shadeRect inlines the same formulas.
+-- The per-pixel paths in shadeRect and shadeExact inline the same formulas.
+-- Every distance here is exact or a 1-Lipschitz bound that is exact inside (the
+-- cut disc uses the max of its constraints), which classification relies on.
 ----------------------------------------------------------------------------------
 
 local sqrt = math.sqrt
@@ -358,6 +438,20 @@ local function sdf(sc: Scene, s: number, px: number, py: number): number
 	elseif k == RING then
 		local dx, dy = px - sc.p1[s], py - sc.p2[s]
 		return abs(sqrt(dx * dx + dy * dy) - sc.p3[s]) - sc.p4[s]
+	elseif k == CUTDISC then
+		local v = sc.verts
+		local i = sc.p4[s]
+		local dx, dy = px - sc.p1[s], py - sc.p2[s]
+		local d = sqrt(dx * dx + dy * dy) - sc.p3[s]
+		local h1 = v[i] * dx + v[i + 1] * dy - v[i + 2]
+		local h2 = v[i + 3] * dx + v[i + 4] * dy - v[i + 5]
+		if h1 > d then
+			d = h1
+		end
+		if h2 > d then
+			d = h2
+		end
+		return d
 	else
 		local v = sc.verts
 		local first, count = sc.p1[s], sc.p2[s]
@@ -391,7 +485,7 @@ end
 Raster.sdf = sdf
 
 ----------------------------------------------------------------------------------
--- The shared per-pixel shading routine.
+-- The shared per-pixel shading routine (MODE_LINEAR).
 -- Shades pixels [x0, x1] x [y0, y1] with shapes list[lo..hi] (bottom to top),
 -- starting from shape `base` (fully covering and opaque) or the background.
 ----------------------------------------------------------------------------------
@@ -453,6 +547,18 @@ local function shadeRect(
 				elseif k == RING then
 					local dx, dy = px - P1[s], py - P2[s]
 					d = abs(sqrt(dx * dx + dy * dy) - P3[s]) - P4[s]
+				elseif k == CUTDISC then
+					local i = P4[s]
+					local dx, dy = px - P1[s], py - P2[s]
+					d = sqrt(dx * dx + dy * dy) - P3[s]
+					local h1 = V[i] * dx + V[i + 1] * dy - V[i + 2]
+					local h2 = V[i + 3] * dx + V[i + 4] * dy - V[i + 5]
+					if h1 > d then
+						d = h1
+					end
+					if h2 > d then
+						d = h2
+					end
 				else
 					local first = P1[s]
 					local last = first + 2 * P2[s] - 2
@@ -507,84 +613,406 @@ local function shadeRect(
 end
 
 ----------------------------------------------------------------------------------
--- Exact-area shading (MODE_EXACT). Same structure and compositing as shadeRect;
--- only the coverage estimate differs. Coverage is exactly 0 for d >= REACH and
--- exactly 1 for d <= -REACH (REACH = sqrt(2) / 2 AA widths), which classify uses.
+-- Exact-area coverage (MODE_EXACT, MODE_LAYERED): F1 for every primitive.
+-- Coverage is exactly 0 for d >= REACH and exactly 1 for d <= -REACH (REACH =
+-- sqrt(2) / 2 AA widths), which classify uses; in between it is the exact area of
+-- the w x w pixel inside the shape, divided by w^2.
 ----------------------------------------------------------------------------------
 
-local REACH = 0.70710678118654757
+local REACH = MyMath.COVERAGE_REACH
 
--- Half-plane area (unit gradient components nx, ny; only magnitudes matter) minus
--- the first-order curvature term k (t1^3 - t0^3) / 6 over the chord the tangent
--- line cuts from the pixel. Inputs in AA-width units. See Coverage.halfPlaneCurved.
-local function covCurved(d: number, nx: number, ny: number, k: number): number
-	if d >= REACH then
-		return 0
-	elseif d <= -REACH then
-		return 1
-	end
-	local a, b = abs(nx), abs(ny)
-	if a < b then
-		a, b = b, a
-	end
-	local u = (a + b) * 0.5 - d
-	local base
-	if u <= 0 then
-		base = 0
-	elseif u >= a + b then
-		base = 1
-	elseif u < b then
-		base = u * u / (2 * a * b)
-	elseif u <= a then
-		base = (2 * u - b) / (2 * a)
-	else
-		local v = a + b - u
-		base = 1 - v * v / (2 * a * b)
-	end
-	if k == 0 then
-		return base
-	end
-	-- chord of the tangent line inside the pixel, parametrised by t along (-ny, nx)
-	-- (signs of nx, ny do not change the chord length or its offset magnitude)
-	local t0, t1 = -1e300, 1e300
-	local ox, oy = -d * a, -d * b
-	-- direction along the line is (-b, a); |coordinate| <= 1/2 on both axes
-	if b ~= 0 then
-		local p0 = (ox - 0.5) / b
-		local p1 = (ox + 0.5) / b
-		if p0 > p1 then
-			p0, p1 = p1, p0
-		end
-		t0 = p0
-		t1 = p1
-	elseif ox < -0.5 or ox > 0.5 then
-		return base
-	end
-	local q0 = (-0.5 - oy) / a
-	local q1 = (0.5 - oy) / a
-	if q0 > q1 then
-		q0, q1 = q1, q0
-	end
-	if q0 > t0 then
-		t0 = q0
-	end
-	if q1 < t1 then
-		t1 = q1
-	end
-	if t1 <= t0 then
-		return base
-	end
-	local c = base - k * (t1 * t1 * t1 - t0 * t0 * t0) / 6
-	return if c < 0 then 0 elseif c > 1 then 1 else c
-end
+-- The curvature-corrected estimator (C5) is MyMath's axiom; kept as Raster.covCurved
+-- for compute/Rows.luau. MODE_EXACT does not use it (its residual is O(1/R)).
+local covCurved = MyMath.coverageCurved
 Raster.covCurved = covCurved
 
-local corner = Coverage.corner
-local edgePair = Coverage.edgePair
-local roundCorner = Coverage.roundCorner
-local discRectArea = Coverage.discRectArea
-local REACH2 = 0.5 * (1 + 1e-9) -- REACH^2 with margin: a second edge this close may enter the pixel
-local SMALL_RADIUS = 8 -- below this radius (AA widths) circles use the exact disc area
+local halfPlane = MyMath.coverageHalfPlane
+local discBoxArea = Coverage.discBoxArea
+local discPolyArea = Coverage.discPolyArea
+local polyArea = Coverage.polyArea
+local clipInto = Coverage.clipInto
+local polygonBoxCoverage = Coverage.polygonBoxCoverage
+
+-- scratch polygons (pixel-local coordinates, pixel = [-1/2, 1/2]^2)
+local QX: { number } = table.create(64, 0)
+local QY: { number } = table.create(64, 0)
+local RX: { number } = table.create(64, 0)
+local RY: { number } = table.create(64, 0)
+
+local function squareQ()
+	QX[1], QY[1] = -0.5, -0.5
+	QX[2], QY[2] = 0.5, -0.5
+	QX[3], QY[3] = 0.5, 0.5
+	QX[4], QY[4] = -0.5, 0.5
+end
+
+-- Length of [a0, a1] intersected with [b0, b1].
+local function overlap(a0: number, a1: number, b0: number, b1: number): number
+	local lo = if a0 > b0 then a0 else b0
+	local hi = if a1 < b1 then a1 else b1
+	return if hi > lo then hi - lo else 0
+end
+
+-- Exact area of the pixel box [X0, X1] x [Y0, Y1] (relative to the box centre)
+-- inside the rounded box with half extents (hx, hy) and corner radius rad. The
+-- rounded box is the disjoint union of the vertical band |x| <= hx - rad, the two
+-- side rectangles hx - rad <= |x| <= hx, |y| <= hy - rad, and four corner pieces
+-- (corner disc and corner quadrant), each measured exactly.
+local function boxArea(X0: number, X1: number, Y0: number, Y1: number, hx: number, hy: number, rad: number): number
+	if rad <= 0 then
+		return overlap(X0, X1, -hx, hx) * overlap(Y0, Y1, -hy, hy)
+	end
+	local ix, iy = hx - rad, hy - rad
+	if Y0 >= -iy and Y1 <= iy then
+		return overlap(X0, X1, -hx, hx) * (Y1 - Y0)
+	end
+	if X0 >= -ix and X1 <= ix then
+		return (X1 - X0) * overlap(Y0, Y1, -hy, hy)
+	end
+	local area = overlap(X0, X1, -ix, ix) * overlap(Y0, Y1, -hy, hy)
+		+ (overlap(X0, X1, ix, hx) + overlap(X0, X1, -hx, -ix)) * overlap(Y0, Y1, -iy, iy)
+	local xr0 = if X0 > ix then X0 else ix
+	local xr1 = if X1 < hx then X1 else hx
+	local xl0 = if X0 > -hx then X0 else -hx
+	local xl1 = if X1 < -ix then X1 else -ix
+	local yp0 = if Y0 > iy then Y0 else iy
+	local yp1 = if Y1 < hy then Y1 else hy
+	local yn0 = if Y0 > -hy then Y0 else -hy
+	local yn1 = if Y1 < -iy then Y1 else -iy
+	if xr1 > xr0 then
+		if yp1 > yp0 then
+			area += discBoxArea(ix, iy, rad, xr0, yp0, xr1, yp1)
+		end
+		if yn1 > yn0 then
+			area += discBoxArea(ix, -iy, rad, xr0, yn0, xr1, yn1)
+		end
+	end
+	if xl1 > xl0 then
+		if yp1 > yp0 then
+			area += discBoxArea(-ix, iy, rad, xl0, yp0, xl1, yp1)
+		end
+		if yn1 > yn0 then
+			area += discBoxArea(-ix, -iy, rad, xl0, yn0, xl1, yn1)
+		end
+	end
+	return area
+end
+
+-- Exact coverage of the w x w pixel centred at (px, py) by the capsule from A to
+-- A + D with radius r. The capsule is the disjoint union of the body (points whose
+-- projection on the axis lies in [0, L], within r of the axis) and the two caps
+-- (points beyond an end line, within r of that end point), so its area in the
+-- pixel is |pixel ^ body| + |pixel ^ {h <= 0} ^ disc(A)| + |pixel ^ {h >= L} ^
+-- disc(B)|: a clipped square, and two discs with a clipped square. A pixel whose
+-- projection lies inside [0, L] sees only the two straight sides (C4, exact).
+local function capsuleCoverage(px: number, py: number, w: number, ax: number, ay: number, ddx: number, ddy: number, r: number): number
+	local iw = 1 / w
+	local Ax, Ay = (ax - px) * iw, (ay - py) * iw
+	local rw = r * iw
+	local L2 = ddx * ddx + ddy * ddy
+	if L2 == 0 then
+		return discBoxArea(Ax, Ay, rw, -0.5, -0.5, 0.5, 0.5)
+	end
+	local L = sqrt(L2)
+	local ex, ey = ddx / L, ddy / L
+	local nx, ny = -ey, ex
+	local Lw = L * iw
+	local eA = Ax * ex + Ay * ey
+	local nA = Ax * nx + Ay * ny
+	local h = -eA -- pixel centre along the axis, from A
+	local sN = -nA -- pixel centre across the axis
+	local hr = 0.5 * (abs(ex) + abs(ey)) -- half extent of the pixel along the axis
+	if h - hr >= 0 and h + hr <= Lw then
+		local c = halfPlane(sN - rw, nx, ny) + halfPlane(-sN - rw, nx, ny) - 1
+		return if c < 0 then 0 else c
+	end
+	local area = 0
+	if h + hr > 0 and h - hr < Lw then
+		squareQ()
+		local m = clipInto(QX, QY, 4, RX, RY, -ex, -ey, -eA)
+		m = clipInto(RX, RY, m, QX, QY, ex, ey, eA + Lw)
+		m = clipInto(QX, QY, m, RX, RY, nx, ny, nA + rw)
+		m = clipInto(RX, RY, m, QX, QY, -nx, -ny, rw - nA)
+		area += polyArea(QX, QY, m)
+	end
+	if h - hr < 0 then
+		if h + hr <= 0 then
+			area += discBoxArea(Ax, Ay, rw, -0.5, -0.5, 0.5, 0.5)
+		else
+			squareQ()
+			local m = clipInto(QX, QY, 4, RX, RY, ex, ey, eA)
+			area += discPolyArea(RX, RY, m, Ax, Ay, rw)
+		end
+	end
+	if h + hr > Lw then
+		local Bx, By = Ax + ddx * iw, Ay + ddy * iw
+		if h - hr >= Lw then
+			area += discBoxArea(Bx, By, rw, -0.5, -0.5, 0.5, 0.5)
+		else
+			squareQ()
+			local m = clipInto(QX, QY, 4, RX, RY, -ex, -ey, -(eA + Lw))
+			area += discPolyArea(RX, RY, m, Bx, By, rw)
+		end
+	end
+	return if area < 0 then 0 elseif area > 1 then 1 else area
+end
+
+-- Exact coverage of the pixel by a cut disc: the square clipped by the half-planes
+-- that cross it, intersected with the disc (or the plain clipped square / the plain
+-- disc where the other part covers the pixel). d1, d2, dd are the pixel centre's
+-- signed distances (AA widths) to the two lines and the circle.
+local function cutDiscCoverage(
+	px: number,
+	py: number,
+	w: number,
+	cx: number,
+	cy: number,
+	r: number,
+	n1x: number,
+	n1y: number,
+	o1: number,
+	n2x: number,
+	n2y: number,
+	o2: number,
+	d1: number,
+	d2: number,
+	dd: number
+): number
+	local iw = 1 / w
+	local Cx, Cy, rw = (cx - px) * iw, (cy - py) * iw, r * iw
+	local need1 = d1 > -REACH
+	local need2 = d2 > -REACH and (n2x ~= 0 or n2y ~= 0)
+	local c
+	if not need1 and not need2 then
+		c = discBoxArea(Cx, Cy, rw, -0.5, -0.5, 0.5, 0.5)
+	else
+		squareQ()
+		local X, Y, m = QX, QY, 4
+		if need1 then
+			m = clipInto(X, Y, m, RX, RY, n1x, n1y, o1 * iw + n1x * Cx + n1y * Cy)
+			X, Y = RX, RY
+		end
+		if need2 then
+			if X == QX then
+				m = clipInto(QX, QY, m, RX, RY, n2x, n2y, o2 * iw + n2x * Cx + n2y * Cy)
+				X, Y = RX, RY
+			else
+				m = clipInto(RX, RY, m, QX, QY, n2x, n2y, o2 * iw + n2x * Cx + n2y * Cy)
+				X, Y = QX, QY
+			end
+		end
+		if dd <= -REACH then
+			c = polyArea(X, Y, m)
+		else
+			c = discPolyArea(X, Y, m, Cx, Cy, rw)
+		end
+	end
+	return if c < 0 then 0 elseif c > 1 then 1 else c
+end
+
+----------------------------------------------------------------------------------
+-- Pieces for exact visibility (F2): each shape's indicator inside the pixel as a
+-- signed sum of convex pieces (pixel-local coordinates, pixel = [-1/2, 1/2]^2).
+----------------------------------------------------------------------------------
+
+local GX: { number } = table.create(64, 0)
+local GY: { number } = table.create(64, 0)
+local HX: { number } = table.create(64, 0)
+local HY: { number } = table.create(64, 0)
+local TRX: { number } = table.create(3, 0)
+local TRY: { number } = table.create(3, 0)
+
+local function addPieces(sc: Scene, s: number, px: number, py: number, w: number)
+	local k = sc.kind[s]
+	local iw = 1 / w
+	local P1, P2, P3, P4, P5 = sc.p1, sc.p2, sc.p3, sc.p4, sc.p5
+	if k == CIRCLE then
+		Visibility.square(1)
+		Visibility.disc((P1[s] - px) * iw, (P2[s] - py) * iw, P3[s] * iw)
+		Visibility.piece()
+	elseif k == RING then
+		local Cx, Cy = (P1[s] - px) * iw, (P2[s] - py) * iw
+		local r, t = P3[s], P4[s]
+		Visibility.square(1)
+		Visibility.disc(Cx, Cy, (r + t) * iw)
+		Visibility.piece()
+		if r - t > 0 then
+			Visibility.square(-1)
+			Visibility.disc(Cx, Cy, (r - t) * iw)
+			Visibility.piece()
+		end
+	elseif k == BOX then
+		local bx, by = (P1[s] - px) * iw, (P2[s] - py) * iw
+		local hx, hy, rad = P3[s] * iw, P4[s] * iw, P5[s] * iw
+		if rad <= 0 then
+			Visibility.rect(1, bx - hx, by - hy, bx + hx, by + hy)
+			Visibility.piece()
+		else
+			local ix, iy = hx - rad, hy - rad
+			if ix > 0 then
+				Visibility.rect(1, bx - ix, by - hy, bx + ix, by + hy)
+				Visibility.piece()
+			end
+			if iy > 0 then
+				Visibility.rect(1, bx - hx, by - iy, bx - ix, by + iy)
+				Visibility.piece()
+				Visibility.rect(1, bx + ix, by - iy, bx + hx, by + iy)
+				Visibility.piece()
+			end
+			Visibility.rect(1, bx + ix, by + iy, bx + hx, by + hy)
+			Visibility.disc(bx + ix, by + iy, rad)
+			Visibility.piece()
+			Visibility.rect(1, bx - hx, by + iy, bx - ix, by + hy)
+			Visibility.disc(bx - ix, by + iy, rad)
+			Visibility.piece()
+			Visibility.rect(1, bx + ix, by - hy, bx + hx, by - iy)
+			Visibility.disc(bx + ix, by - iy, rad)
+			Visibility.piece()
+			Visibility.rect(1, bx - hx, by - hy, bx - ix, by - iy)
+			Visibility.disc(bx - ix, by - iy, rad)
+			Visibility.piece()
+		end
+	elseif k == SEGMENT then
+		local Ax, Ay = (P1[s] - px) * iw, (P2[s] - py) * iw
+		local ddx, ddy, rw = P3[s] * iw, P4[s] * iw, P5[s] * iw
+		local L2 = ddx * ddx + ddy * ddy
+		if L2 == 0 then
+			Visibility.square(1)
+			Visibility.disc(Ax, Ay, rw)
+			Visibility.piece()
+		else
+			local L = sqrt(L2)
+			local ex, ey = ddx / L, ddy / L
+			local nx, ny = -ey, ex
+			local eA = Ax * ex + Ay * ey
+			local nA = Ax * nx + Ay * ny
+			Visibility.square(1)
+			Visibility.clip(-ex, -ey, -eA)
+			Visibility.clip(ex, ey, eA + L)
+			Visibility.clip(nx, ny, nA + rw)
+			Visibility.clip(-nx, -ny, rw - nA)
+			Visibility.piece()
+			Visibility.square(1)
+			Visibility.clip(ex, ey, eA)
+			Visibility.disc(Ax, Ay, rw)
+			Visibility.piece()
+			Visibility.square(1)
+			Visibility.clip(-ex, -ey, -(eA + L))
+			Visibility.disc(Ax + ddx, Ay + ddy, rw)
+			Visibility.piece()
+		end
+	elseif k == CUTDISC then
+		local V = sc.verts
+		local i = P4[s]
+		local Cx, Cy = (P1[s] - px) * iw, (P2[s] - py) * iw
+		Visibility.square(1)
+		Visibility.clip(V[i], V[i + 1], V[i + 2] * iw + V[i] * Cx + V[i + 1] * Cy)
+		if P5[s] == 2 then
+			Visibility.clip(V[i + 3], V[i + 4], V[i + 5] * iw + V[i + 3] * Cx + V[i + 4] * Cy)
+		end
+		Visibility.disc(Cx, Cy, P3[s] * iw)
+		Visibility.piece()
+	else
+		-- polygon: clip to the pixel, then one convex piece or a signed fan
+		local V = sc.verts
+		local first, count = P1[s], P2[s]
+		for i = 1, count do
+			GX[i] = (V[first + 2 * i - 2] - px) * iw
+			GY[i] = (V[first + 2 * i - 1] - py) * iw
+		end
+		local m = clipInto(GX, GY, count, HX, HY, 1, 0, 0.5)
+		m = clipInto(HX, HY, m, GX, GY, -1, 0, 0.5)
+		m = clipInto(GX, GY, m, HX, HY, 0, 1, 0.5)
+		m = clipInto(HX, HY, m, GX, GY, 0, -1, 0.5)
+		if m < 3 then
+			return
+		end
+		local A = polyArea(GX, GY, m)
+		if A == 0 then
+			return
+		end
+		if A < 0 then
+			-- make the orientation positive (interior on the left of every edge)
+			local i, j = 1, m
+			while i < j do
+				GX[i], GX[j] = GX[j], GX[i]
+				GY[i], GY[j] = GY[j], GY[i]
+				i += 1
+				j -= 1
+			end
+		end
+		local convex = true
+		local ax, ay = GX[m - 1], GY[m - 1]
+		local bx, by = GX[m], GY[m]
+		for i = 1, m do
+			local cx, cy = GX[i], GY[i]
+			if (bx - ax) * (cy - by) - (by - ay) * (cx - bx) < -1e-12 then
+				convex = false
+				break
+			end
+			ax, ay, bx, by = bx, by, cx, cy
+		end
+		if convex then
+			Visibility.poly(1, GX, GY, m)
+			Visibility.piece()
+		else
+			-- winding number of the closed clip = sum of signed fan triangles
+			local x0, y0 = GX[1], GY[1]
+			for i = 2, m - 1 do
+				local x1, y1, x2, y2 = GX[i], GY[i], GX[i + 1], GY[i + 1]
+				local t = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)
+				if t > 0 then
+					TRX[1], TRY[1], TRX[2], TRY[2], TRX[3], TRY[3] = x0, y0, x1, y1, x2, y2
+					Visibility.poly(1, TRX, TRY, 3)
+					Visibility.piece()
+				elseif t < 0 then
+					TRX[1], TRY[1], TRX[2], TRY[2], TRX[3], TRY[3] = x0, y0, x2, y2, x1, y1
+					Visibility.poly(-1, TRX, TRY, 3)
+					Visibility.piece()
+				end
+			end
+		end
+	end
+end
+Raster.addPieces = addPieces
+
+-- Per-pixel coverage of list[lo..hi], kept for the exact-visibility path.
+local COV: { number } = table.create(512, 0)
+
+-- Exact composite of the pixel (F2): shapes list[from..hi] above the base colour
+-- (straight r, g, b, alpha a), with coverages COV[j - lo + 1]. Top-down.
+local function resolve(
+	sc: Scene,
+	list: { number },
+	lo: number,
+	from: number,
+	hi: number,
+	px: number,
+	py: number,
+	w: number,
+	br: number,
+	bg: number,
+	bb: number,
+	ba: number
+): (number, number, number, number)
+	Visibility.reset()
+	local CR, CG, CB, CA = sc.cr, sc.cg, sc.cb, sc.ca
+	for j = hi, from, -1 do
+		local cov = COV[j - lo + 1]
+		if cov > 0 then
+			local s = list[j]
+			local a = CA[s] / 255
+			if cov >= 1 then
+				Visibility.full(CR[s], CG[s], CB[s], a)
+			else
+				Visibility.begin(CR[s], CG[s], CB[s], a)
+				addPieces(sc, s, px, py, w)
+				Visibility.commit()
+			end
+		end
+	end
+	return Visibility.finish(br, bg, bb, ba)
+end
 
 local function shadeExact(
 	sc: Scene,
@@ -604,7 +1032,9 @@ local function shadeExact(
 	local V = sc.verts
 	local w = sc.aa
 	local iw = 1 / w
+	local iw2 = iw * iw
 	local hw = w * 0.5
+	local exactComposite = sc.mode == MODE_EXACT
 	local r0, g0, b0, a0
 	if base > 0 then
 		r0, g0, b0, a0 = CR[base], CG[base], CB[base], 1
@@ -617,6 +1047,8 @@ local function shadeExact(
 		for x = x0, x1 do
 			local px = x + 0.5
 			local ar, ag, ab, aa = r0, g0, b0, a0
+			local nf = 0 -- shapes with fractional coverage above the last opaque full one
+			local reset = lo - 1 -- list index of the last opaque full shape (lo - 1: the base)
 			for j = lo, hi do
 				local s = list[j]
 				local k = K[s]
@@ -624,91 +1056,116 @@ local function shadeExact(
 				if k == CIRCLE then
 					local cx, cy = P1[s], P2[s]
 					local dx, dy = px - cx, py - cy
-					local len = sqrt(dx * dx + dy * dy)
 					local r = P3[s]
-					local d = (len - r) * iw
+					local d = (sqrt(dx * dx + dy * dy) - r) * iw
 					if d >= REACH then
 						cov = 0
 					elseif d <= -REACH then
 						cov = 1
-					elseif r * iw < SMALL_RADIUS then
-						-- small circle: exact disc area (curvature term not accurate enough)
-						cov = discRectArea(cx, cy, r, px - hw, py - hw, px + hw, py + hw) * iw * iw
-					elseif len > 0 then
-						cov = covCurved(d, dx / len, dy / len, w / r)
 					else
-						cov = covCurved(-r * iw, 1, 0, 0)
+						cov = discBoxArea(cx, cy, r, px - hw, py - hw, px + hw, py + hw) * iw2
+						cov = if cov > 1 then 1 else cov
 					end
 				elseif k == BOX then
 					local rad = P5[s]
-					local qx = abs(px - P1[s]) - P3[s] + rad
-					local qy = abs(py - P2[s]) - P4[s] + rad
-					if rad == 0 then
-						-- axis-aligned sharp box: exact product of the 1D overlaps
-						local cx = 0.5 - qx * iw
-						local cy = 0.5 - qy * iw
-						cx = if cx < 0 then 0 elseif cx > 1 then 1 else cx
-						cy = if cy < 0 then 0 elseif cy > 1 then 1 else cy
-						cov = cx * cy
-					elseif qx > -hw and qy > -hw then
-						-- the pixel reaches the corner quadrant: exact corner composition
-						local ox = if qx > 0 then qx else 0
-						local oy = if qy > 0 then qy else 0
-						local inside = if qx > qy then qx else qy
-						if inside > 0 then
-							inside = 0
-						end
-						local d = (sqrt(ox * ox + oy * oy) + inside - rad) * iw
-						if d >= REACH then
-							cov = 0
-						elseif d <= -REACH then
-							cov = 1
-						else
-							cov = roundCorner(qx, qy, rad, w)
-						end
+					local cx, cy, hx, hy = P1[s], P2[s], P3[s], P4[s]
+					local qx = abs(px - cx) - hx + rad
+					local qy = abs(py - cy) - hy + rad
+					local ox = if qx > 0 then qx else 0
+					local oy = if qy > 0 then qy else 0
+					local inside = if qx > qy then qx else qy
+					if inside > 0 then
+						inside = 0
+					end
+					local d = (sqrt(ox * ox + oy * oy) + inside - rad) * iw
+					if d >= REACH then
+						cov = 0
+					elseif d <= -REACH then
+						cov = 1
 					else
-						local m = if qx > qy then qx else qy
-						local c = 0.5 - (m - rad) * iw
-						cov = if c < 0 then 0 elseif c > 1 then 1 else c
+						cov = boxArea(px - hw - cx, px + hw - cx, py - hw - cy, py + hw - cy, hx, hy, rad) * iw2
+						cov = if cov > 1 then 1 else cov
 					end
 				elseif k == SEGMENT then
-					local pax, pay = px - P1[s], py - P2[s]
+					local ax, ay = P1[s], P2[s]
+					local pax, pay = px - ax, py - ay
 					local bax, bay = P3[s], P4[s]
 					local hh = (pax * bax + pay * bay) * P6[s]
-					local kk = 0
-					if hh <= 0 then
-						hh = 0
-						kk = w / P5[s]
-					elseif hh >= 1 then
-						hh = 1
-						kk = w / P5[s]
-					end
+					hh = if hh < 0 then 0 elseif hh > 1 then 1 else hh
 					local dx, dy = pax - bax * hh, pay - bay * hh
-					local len = sqrt(dx * dx + dy * dy)
-					if len > 0 then
-						cov = covCurved((len - P5[s]) * iw, dx / len, dy / len, kk)
+					local d = (sqrt(dx * dx + dy * dy) - P5[s]) * iw
+					if d >= REACH then
+						cov = 0
+					elseif d <= -REACH then
+						cov = 1
 					else
-						cov = covCurved(-P5[s] * iw, 1, 0, 0)
+						cov = capsuleCoverage(px, py, w, ax, ay, bax, bay, P5[s])
 					end
 				elseif k == RING then
-					local dx, dy = px - P1[s], py - P2[s]
+					local cx, cy = P1[s], P2[s]
+					local dx, dy = px - cx, py - cy
 					local len = sqrt(dx * dx + dy * dy)
 					local r, t = P3[s], P4[s]
-					local m = len - r
-					if len > 0 then
-						if m >= 0 then
-							cov = covCurved((m - t) * iw, dx / len, dy / len, w / (r + t))
-						else
-							cov = covCurved((-m - t) * iw, dx / len, dy / len, if r > t then -w / (r - t) else 0)
-						end
+					local d = (abs(len - r) - t) * iw
+					if d >= REACH then
+						cov = 0
+					elseif d <= -REACH then
+						cov = 1
 					else
-						cov = covCurved((r - t) * iw, 1, 0, 0)
+						-- annulus = outer disc minus inner disc, each exact
+						local ro = r + t
+						local dOut = (len - ro) * iw
+						local cOut
+						if dOut >= REACH then
+							cOut = 0
+						elseif dOut <= -REACH then
+							cOut = 1
+						else
+							cOut = discBoxArea(cx, cy, ro, px - hw, py - hw, px + hw, py + hw) * iw2
+						end
+						local ri = r - t
+						local cIn = 0
+						if ri > 0 then
+							local dIn = (len - ri) * iw
+							if dIn >= REACH then
+								cIn = 0
+							elseif dIn <= -REACH then
+								cIn = 1
+							else
+								cIn = discBoxArea(cx, cy, ri, px - hw, py - hw, px + hw, py + hw) * iw2
+							end
+						end
+						cov = cOut - cIn
+						cov = if cov < 0 then 0 elseif cov > 1 then 1 else cov
+					end
+				elseif k == CUTDISC then
+					local i = P4[s]
+					local cx, cy, r = P1[s], P2[s], P3[s]
+					local dx, dy = px - cx, py - cy
+					local dd = (sqrt(dx * dx + dy * dy) - r) * iw
+					local n1x, n1y, o1 = V[i], V[i + 1], V[i + 2]
+					local n2x, n2y, o2 = V[i + 3], V[i + 4], V[i + 5]
+					local d1 = (n1x * dx + n1y * dy - o1) * iw
+					local d2 = (n2x * dx + n2y * dy - o2) * iw
+					local d = dd
+					if d1 > d then
+						d = d1
+					end
+					if d2 > d then
+						d = d2
+					end
+					if d >= REACH then
+						cov = 0
+					elseif d <= -REACH then
+						cov = 1
+					else
+						cov = cutDiscCoverage(px, py, w, cx, cy, r, n1x, n1y, o1, n2x, n2y, o2, d1, d2, dd)
 					end
 				else
 					local first = P1[s]
-					local last = first + 2 * P2[s] - 2
-					local d1, d2 = math.huge, math.huge
-					local i1, i2, t1 = first, first, 0
+					local count = P2[s]
+					local last = first + 2 * count - 2
+					local dmin = math.huge
 					local sign = 1
 					local jx, jy = V[last], V[last + 1]
 					for i = first, last, 2 do
@@ -720,11 +1177,8 @@ local function shadeExact(
 						t = if t < 0 then 0 elseif t > 1 then 1 else t
 						local bx, by = wx - ex * t, wy - ey * t
 						local dd = bx * bx + by * by
-						if dd < d1 then
-							d2, i2 = d1, i1
-							d1, i1, t1 = dd, i, t
-						elseif dd < d2 then
-							d2, i2 = dd, i
+						if dd < dmin then
+							dmin = dd
 						end
 						local c1 = py >= vy
 						local c2 = py < jy
@@ -734,47 +1188,24 @@ local function shadeExact(
 						end
 						jx, jy = vx, vy
 					end
-					local d = sign * sqrt(d1) * iw
-					local sigma = P3[s]
-					-- edge i runs from vertex prev(i) to vertex i in polygon order
-					local p1 = if i1 == first then last else i1 - 2
+					local d = sign * sqrt(dmin) * iw
 					if d >= REACH then
 						cov = 0
 					elseif d <= -REACH then
 						cov = 1
-					elseif d2 * iw * iw >= REACH2 then
-						-- only the nearest edge can enter the pixel
-						local ex, ey = V[i1] - V[p1], V[i1 + 1] - V[p1 + 1]
-						local len = sqrt(ex * ex + ey * ey)
-						if len > 0 and t1 > 0 and t1 < 1 then
-							cov = covCurved(d, ey / len, ex / len, 0)
-						else
-							-- nearest point is a vertex (t1 = 0: vertex i1, t1 = 1: vertex p1)
-							-- whose other edge lies just beyond reach: wedge at that vertex
-							local sv = if t1 >= 1 then p1 else i1
-							local su = if sv == first then last else sv - 2
-							local sw = if sv == last then first else sv + 2
-							cov = corner(px * iw, py * iw, V[su] * iw, V[su + 1] * iw, V[sv] * iw, V[sv + 1] * iw, V[sw] * iw, V[sw + 1] * iw, sigma)
-						end
 					else
-						local n1 = if i1 == last then first else i1 + 2
-						if i2 == n1 or i2 == p1 then
-							-- adjacent edges: exact wedge at their shared vertex
-							local sv = if i2 == n1 then i1 else i2
-							local su = if sv == first then last else sv - 2
-							local sw = if sv == last then first else sv + 2
-							cov = corner(px * iw, py * iw, V[su] * iw, V[su + 1] * iw, V[sv] * iw, V[sv + 1] * iw, V[sw] * iw, V[sw + 1] * iw, sigma)
-						else
-							local p2 = if i2 == first then last else i2 - 2
-							cov = edgePair(px * iw, py * iw, V[p1] * iw, V[p1 + 1] * iw, V[i1] * iw, V[i1 + 1] * iw,
-								V[p2] * iw, V[p2 + 1] * iw, V[i2] * iw, V[i2 + 1] * iw, sigma)
-						end
+						-- exact area by per-edge Green integrals (any number of edges)
+						cov = -P3[s] * polygonBoxCoverage(V, first, count, px - hw, py - hw, w)
+						cov = if cov < 0 then 0 elseif cov > 1 then 1 else cov
 					end
 				end
+				COV[j - lo + 1] = cov
 				if cov > 0 then
 					local sa = cov * CA[s] / 255
 					if sa >= 1 then
 						ar, ag, ab, aa = CR[s], CG[s], CB[s], 1
+						nf = 0
+						reset = j
 					else
 						local da = aa * (1 - sa)
 						local oa = sa + da
@@ -782,8 +1213,23 @@ local function shadeExact(
 						ag = (CG[s] * sa + ag * da) / oa
 						ab = (CB[s] * sa + ab * da) / oa
 						aa = oa
+						if cov < 1 then
+							nf += 1
+						end
 					end
 				end
+			end
+			if nf >= 2 and exactComposite then
+				-- two or more edges in this pixel: exact visibility (F2)
+				stats.conflicts += 1
+				local br, bgc, bb, ba
+				if reset >= lo then
+					local s = list[reset]
+					br, bgc, bb, ba = CR[s], CG[s], CB[s], 1
+				else
+					br, bgc, bb, ba = r0, g0, b0, a0
+				end
+				ar, ag, ab, aa = resolve(sc, list, lo, reset + 1, hi, px, py, w, br, bgc, bb, ba)
 			end
 			buffer.writeu32(
 				out,
@@ -808,10 +1254,10 @@ local function shade(
 	lo: number,
 	hi: number
 )
-	if sc.mode == MODE_EXACT then
-		shadeExact(sc, out, width, x0, y0, x1, y1, base, list, lo, hi)
-	else
+	if sc.mode == MODE_LINEAR then
 		shadeRect(sc, out, width, x0, y0, x1, y1, base, list, lo, hi)
+	else
+		shadeExact(sc, out, width, x0, y0, x1, y1, base, list, lo, hi)
 	end
 end
 
@@ -842,9 +1288,7 @@ end
 function Raster.renderPainter(sc: Scene, out: buffer, width: number, height: number)
 	local bg = (sc.bgR // 1) + (sc.bgG // 1) * 256 + (sc.bgB // 1) * 65536 + ((sc.bgA * 255 + 0.5) // 1) * 16777216
 	Pixels.fill(out, bg)
-	local one = { 0 }
 	for s = 1, sc.n do
-		one[1] = s
 		local x0, y0 = math.max(0, sc.bx0[s]), math.max(0, sc.by0[s])
 		local x1, y1 = math.min(width - 1, sc.bx1[s]), math.min(height - 1, sc.by1[s])
 		local cr, cg, cb, ca = sc.cr[s], sc.cg[s], sc.cb[s], sc.ca[s]
@@ -912,7 +1356,7 @@ local function classify(sc: Scene, x: number, y: number, size: number, lo: numbe
 	local cx, cy = x + size * 0.5, y + size * 0.5
 	local reach = (size - 1) * SQRT_HALF * (1 + 1e-12) -- half-diagonal to the farthest pixel centre
 	-- coverage is exactly 0 / 1 beyond half an AA width (linear) or sqrt(2)/2 (exact)
-	local half = sc.aa * (if sc.mode == MODE_EXACT then SQRT_HALF else 0.5)
+	local half = sc.aa * (if sc.mode ~= MODE_LINEAR then SQRT_HALF else 0.5)
 	local CA = sc.ca
 	local top = hi
 	local allFull = true
