@@ -1,0 +1,93 @@
+{
+  "name": "UniversePlanets",
+  "tree": {
+    "$className": "DataModel",
+
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "Universe": {
+        "$path": "../src"
+      },
+      "Planets": {
+        "$path": "shared",
+        "WorkerPool": {
+          "$path": "../demo/shared/WorkerPool.luau"
+        },
+        "WorkerMain": {
+          "$path": "../demo/shared/WorkerMain.luau"
+        }
+      },
+      "PlanetWorkers": {
+        "$path": "workers/client"
+      }
+    },
+
+    "StarterPlayer": {
+      "$className": "StarterPlayer",
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+        "Client": {
+          "$path": "client"
+        }
+      }
+    },
+
+    "Players": {
+      "$className": "Players",
+      "$properties": {
+        "CharacterAutoLoads": false
+      }
+    },
+
+    "Workspace": {
+      "$className": "Workspace",
+      "$properties": {
+        "StreamingEnabled": false,
+        "Gravity": 0,
+        "FallenPartsDestroyHeight": -50000
+      }
+    },
+
+    "Lighting": {
+      "$className": "Lighting",
+      "$properties": {
+        "Technology": "Future",
+        "TimeOfDay": "14:12:00",
+        "GeographicLatitude": 23,
+        "Brightness": 3,
+        "ExposureCompensation": 0.15,
+        "Ambient": [0.02, 0.02, 0.03],
+        "OutdoorAmbient": [0.05, 0.05, 0.07],
+        "EnvironmentDiffuseScale": 0.25,
+        "EnvironmentSpecularScale": 1,
+        "GlobalShadows": true,
+        "FogStart": 0,
+        "FogEnd": 1000000
+      },
+      "Sky": {
+        "$className": "Sky",
+        "$properties": {
+          "CelestialBodiesShown": false,
+          "StarCount": 0
+        }
+      },
+      "Bloom": {
+        "$className": "BloomEffect",
+        "$properties": {
+          "Enabled": true,
+          "Intensity": 0.8,
+          "Size": 30,
+          "Threshold": 1.25
+        }
+      },
+      "ColorCorrection": {
+        "$className": "ColorCorrectionEffect",
+        "$properties": {
+          "Enabled": true,
+          "Contrast": 0.08,
+          "Saturation": 0.06
+        }
+      }
+    }
+  }
+}

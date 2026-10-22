@@ -248,11 +248,8 @@ do
 		if not ok then
 			check(false, "frame " .. frame .. ": " .. msg)
 		end
-		-- evict generated tiles that are neither displayed nor wanted
-		local wanted: { [number]: boolean } = {}
-		for _, k in plan.generate do
-			wanted[k] = true
-		end
+		-- evict generated tiles that are neither displayed nor needed by a pending step
+		local wanted = plan.needed
 		for k in ready do
 			if not displayed[k] and not wanted[k] then
 				ready[k] = nil

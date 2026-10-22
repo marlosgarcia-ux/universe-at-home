@@ -19,7 +19,7 @@ local function check(cond: boolean, msg: string)
 	end
 end
 
-local GOLDEN = { tiles = 3061049182 }
+local GOLDEN = { tiles = 3483636496 }
 local PRINT_GOLDEN = false
 
 local abs, sqrt = math.abs, math.sqrt
@@ -378,14 +378,14 @@ do
 				inwardSkirt += 1
 			end
 		else
-			if nl < 1e-3 then
+			if nl > 0 and nl < 1e-3 then
 				flatPins += 1
 			end
 		end
 	end
 	check(outward == Layout.GRID_TRIS, "every grid triangle faces outward (" .. outward .. ")")
 	check(inwardSkirt == Layout.SKIRT_TRIS, "every skirt triangle faces away from the patch (" .. inwardSkirt .. ")")
-	check(flatPins == Layout.PIN_TRIS, "pin triangles have zero area")
+	check(flatPins == Layout.PIN_TRIS, "pin triangles are tiny but not degenerate")
 	-- every vertex inside the pinned box, pins on its corners
 	local P = Layout.PIN_EXTENT
 	local inside = true

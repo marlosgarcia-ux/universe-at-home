@@ -67,6 +67,9 @@ export type Swap = { show: { number }, hide: { number } }
 export type Plan = {
 	generate: { number }, -- patches to generate, in the order to generate them
 	merges: { [number]: boolean }, -- those that coarsen (each frees three or more tiles)
+	-- every patch a pending step needs, generated or not: a child that is ready while its
+	-- siblings are still generating must not be evicted (it would be regenerated forever)
+	needed: { [number]: boolean },
 	swaps: { Swap },
 }
 
@@ -295,6 +298,7 @@ function Quadtree.plan(displayed: { [number]: boolean }, ready: { [number]: bool
 	local generate: { number } = {}
 	local wanted: { [number]: number } = {}
 	local merges: { [number]: boolean } = {}
+	local needed: { [number]: boolean } = {}
 	local swaps: { Swap } = {}
 	local splitDone: { [number]: boolean } = {}
 	local mergeDone: { [number]: boolean } = {}
@@ -341,6 +345,7 @@ function Quadtree.plan(displayed: { [number]: boolean }, ready: { [number]: bool
 					local kids = Quadtree.children(a)
 					local all = true
 					for _, c in kids do
+						needed[c] = true
 						if not ready[c] then
 							all = false
 							want(c, p)
@@ -356,6 +361,7 @@ function Quadtree.plan(displayed: { [number]: boolean }, ready: { [number]: bool
 			else
 				-- displayed descendants: coarsen to t
 				if not mergeDone[t] then
+					needed[t] = true
 					if ready[t] then
 						mergeDone[t] = true
 						table.insert(swaps, { show = { t }, hide = descendantsOf(t) })
@@ -381,7 +387,7 @@ function Quadtree.plan(displayed: { [number]: boolean }, ready: { [number]: bool
 		end
 		return x < y
 	end)
-	return { generate = generate, merges = merges, swaps = swaps }
+	return { generate = generate, merges = merges, needed = needed, swaps = swaps }
 end
 
 -- Applies a swap to a displayed set (helper for the client and the tests).

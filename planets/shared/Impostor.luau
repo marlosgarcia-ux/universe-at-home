@@ -78,8 +78,11 @@ function Impostor.halfSize(radius: number, extra: number, D: number, n: number?)
 	return r * D / sqrt(D * D - r * r) * margin
 end
 
--- Renders rows [y0, y1) of the n x n image into `out` (RGBA8, straight alpha).
-function Impostor.render(out: buffer, p: Params, cache: SphereCache.Cache?, y0: number, y1: number)
+-- Renders rows [y0, y1) of the n x n image into `out` (RGBA8, straight alpha). With
+-- `bandStart`, `out` holds only a band of rows starting at that row (worker jobs return
+-- bands); otherwise it is the whole image.
+function Impostor.render(out: buffer, p: Params, cache: SphereCache.Cache?, y0: number, y1: number, bandStart: number?)
+	local base = bandStart or 0
 	local B = Bodies.get(p.body)
 	local R = B.radius
 	local n = p.n
@@ -316,7 +319,7 @@ function Impostor.render(out: buffer, p: Params, cache: SphereCache.Cache?, y0: 
 				ab = ringB * ringA + ab * (1 - ringA)
 				aa = ringA + aa * (1 - ringA)
 			end
-			local o = (y * n + x) * 4
+			local o = ((y - base) * n + x) * 4
 			if aa <= 0 then
 				buffer.writeu32(out, o, 0)
 			else

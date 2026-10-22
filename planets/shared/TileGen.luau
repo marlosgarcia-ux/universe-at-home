@@ -290,9 +290,11 @@ function TileGen.generate(spec: Spec): Result
 	for vj = 0, G do
 		skirtVertex(Layout.gridVertex(0, vj))
 	end
-	-- pins: two zero-area triangles at opposite corners of the shared bounding box
+	-- pins: two tiny triangles (0.01 studs, far below a pixel at 1900 studs) at opposite
+	-- corners of the shared bounding box. Not zero-area, in case the engine drops
+	-- degenerate faces from the bounds.
 	local P = Layout.PIN_EXTENT
-	local pins = { P, P, P, P, P, P - 0.01, P, P, P - 0.02, -P, -P, -P, -P, -P, -P + 0.01, -P, -P, -P + 0.02 }
+	local pins = { P, P, P, P - 0.01, P, P, P, P - 0.01, P, -P, -P, -P, -P + 0.01, -P, -P, -P, -P + 0.01, -P }
 	for p = 0, 5 do
 		buffer.writef32(positions, v * 12, pins[p * 3 + 1])
 		buffer.writef32(positions, v * 12 + 4, pins[p * 3 + 2])

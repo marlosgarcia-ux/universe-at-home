@@ -9,3 +9,6 @@ trace.json
 __pycache__/
 tools/.gallery_mock_combined.luau
 .gallery-sourcemap.json
+tools/.planets_mock_combined.luau
+build/planets-*.json
+build/planets-lsp.txt
