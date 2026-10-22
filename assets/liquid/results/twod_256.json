@@ -1,0 +1,83 @@
+{
+"note": "proposal, not in ALN v1: separable 2D liquid states, D = 4N + 1",
+"rows": [
+{
+"target": "ui_flat",
+"size": 256,
+"theta": 8,
+"N": 8,
+"leaves": 14341,
+"psnr_quadtree": 53.627,
+"psnr_1d": 53.627,
+"psnr_2d": 53.635,
+"x4_psnr_1d": 22.425,
+"x4_psnr_2d": 22.466,
+"x4_psnr_bilinear": 22.518
+},
+{
+"target": "sdf_logo",
+"size": 256,
+"theta": 8,
+"N": 8,
+"leaves": 4900,
+"psnr_quadtree": 42.443,
+"psnr_1d": 43.021,
+"psnr_2d": 45.117,
+"x4_psnr_1d": 29.076,
+"x4_psnr_2d": 29.247,
+"x4_psnr_bilinear": 30.436
+},
+{
+"target": "marble",
+"size": 256,
+"theta": 8,
+"N": 8,
+"leaves": 22645,
+"psnr_quadtree": 40.668,
+"psnr_1d": 41.256,
+"psnr_2d": 41.621,
+"x4_psnr_1d": 33.907,
+"x4_psnr_2d": 34.342,
+"x4_psnr_bilinear": 39.414
+},
+{
+"target": "wood",
+"size": 256,
+"theta": 8,
+"N": 8,
+"leaves": 23110,
+"psnr_quadtree": 38.702,
+"psnr_1d": 39.196,
+"psnr_2d": 40.461,
+"x4_psnr_1d": 32.954,
+"x4_psnr_2d": 33.631,
+"x4_psnr_bilinear": 36.041
+},
+{
+"target": "caustics",
+"size": 256,
+"theta": 8,
+"N": 8,
+"leaves": 17839,
+"psnr_quadtree": 38.991,
+"psnr_1d": 39.598,
+"psnr_2d": 39.98,
+"x4_psnr_1d": 35.402,
+"x4_psnr_2d": 35.704,
+"x4_psnr_bilinear": 39.357
+},
+{
+"target": "pbr_stones",
+"size": 256,
+"theta": 8,
+"N": 16,
+"leaves": 28372,
+"psnr_quadtree": 45.368,
+"psnr_1d": 45.553,
+"psnr_2d": 45.772,
+"x4_psnr_1d": 26.084,
+"x4_psnr_2d": 27.573,
+"x4_psnr_bilinear": 25.942
+}
+]
+}
