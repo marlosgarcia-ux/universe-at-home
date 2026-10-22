@@ -24,6 +24,29 @@ Check with `rojo --version`. This repository was built with 7.7.1. You do not ne
 
 ## 3. Build a place file
 
+**The gallery: EditableImages you can see.** Start here.
+
+```
+rojo build gallery.project.json -o UniverseGallery.rbxlx
+```
+
+A prebuilt copy is in `build/UniverseGallery.rbxlx`. Open it in Studio, turn on **Allow Mesh / Image APIs** (Home, Game Settings, Security), and press **Play**. You get a panel of nine live EditableImages and a spinning cube in the world wearing the same images as Decals:
+
+| Card | What it shows |
+|---|---|
+| Vector badge 512 x 512 | Exact-area anti-aliased shapes; tiles no edge touches are copy-filled |
+| Live plasma 192 x 192 | Rewritten every frame; the compute and upload time per frame is measured and shown |
+| Procedural marble 256 x 256 | Deterministic fractal noise, drawn progressively |
+| Beyond 1024: 1152 x 1152 canvas | Nine 384 x 384 EditableImages as one canvas |
+| LOD: hard switch, and two-phase fade | The same zoom twice: the sharpness jump versus the artifact-free fade |
+| Green screen, matte, cut-out | Background removal with the green fringe removed and a glass bubble kept semi-transparent |
+
+Press **G** to hide or show the panels. The heavy cards fill in over a few seconds because a frame-time scheduler spreads the work across frames. The HUD at top right shows FPS, how many EditableImages are alive and how much memory they take. If an image cannot be created, a red banner says what to enable.
+
+How it was checked without Studio: the script type-checks with zero errors against Roblox's real API definitions (luau-lsp), `tools/gallery_mock_run.py` runs the real script against a mock of the API and compares every uploaded image with a direct render, and `tests/gallery.test.luau` covers the pixel code in both Luau runtimes. `tools/gallery_preview.luau` and `tools/gallery_preview.py` render the panels to PNG.
+
+**The library and the probes** (for measuring the engine):
+
 ```
 rojo build probe.project.json -o UniverseProbe.rbxlx
 ```

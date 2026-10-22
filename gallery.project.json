@@ -1,0 +1,37 @@
+{
+  "name": "UniverseGallery",
+  "tree": {
+    "$className": "DataModel",
+
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "Universe": {
+        "$className": "Folder",
+        "MyMath": { "$path": "src/MyMath.luau" }
+      },
+      "Gallery": { "$path": "gallery/shared" }
+    },
+
+    "StarterPlayer": {
+      "$className": "StarterPlayer",
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+        "GalleryClient": { "$path": "gallery/Gallery.client.luau" }
+      }
+    },
+
+    "Workspace": {
+      "$className": "Workspace",
+      "Baseplate": {
+        "$className": "Part",
+        "$properties": {
+          "Anchored": true,
+          "Size": [512, 4, 512],
+          "Position": [0, -2, 0],
+          "Material": "Grass",
+          "Color": [0.20, 0.34, 0.20]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,1765 @@
+<roblox version="4">
+  <Item class="ReplicatedStorage" referent="0">
+    <Properties>
+      <string name="Name">ReplicatedStorage</string>
+    </Properties>
+    <Item class="Folder" referent="1">
+      <Properties>
+        <string name="Name">Gallery</string>
+      </Properties>
+      <Item class="ModuleScript" referent="2">
+        <Properties>
+          <string name="Name">Panels</string>
+          <string name="Source"><![CDATA[--!strict
+--!native
+--!optimize 2
+-- universe-at-home :: gallery/shared/Panels
+--
+-- Pixel generators for the EditableImage gallery. Pure Luau: no Roblox globals, buffers in and
+-- out, so the same code runs in the Luau CLI (tests, PNG previews) and in a Roblox LocalScript.
+-- MyMath is injected:  local Panels = require(path.to.Panels)(MyMath)
+--
+-- Buffers are row-major RGBA8, the EditableImage layout: a pixel read with readu32 is
+-- r + g * 256 + b * 65536 + a * 16777216.
+--
+-- Every generator takes an optional progress(y0, y1) callback that fires after each batch of
+-- finished rows [y0, y1). The gallery uses it to upload those rows to an EditableImage and to
+-- yield to its frame-time scheduler, so heavy panels fill in over several frames.
+
+return function(MyMath: any)
+	local pack = MyMath.pack
+	local hash32 = MyMath.hash32
+	local dsinTurns = MyMath.dsinTurns
+	local dcosTurns = MyMath.dcosTurns
+
+	local sqrt, abs, floor, min, max = math.sqrt, math.abs, math.floor, math.min, math.max
+
+	local M = {}
+	M.noCull = false -- tests set this to render every pixel of every shape, without tile culling
+
+	export type Progress = ((number, number) -> ())?
+	type Shape = {
+		sd: (number, number) -> number, -- signed distance in design units, negative inside, 1-Lipschitz
+		r: number,
+		g: number,
+		b: number,
+		a: number,
+		blur: number, -- 0 = hard anti-aliased edge; > 0 = soft edge of that half-width (design units)
+	}
+
+	----------------------------------------------------------------------------------------
+	-- Exact pixel coverage of a straight edge
+	----------------------------------------------------------------------------------------
+
+	-- Exact area of the unit pixel square inside the half-plane whose boundary passes at signed
+	-- distance d from the pixel centre with unit normal (nx, ny) (docs/COMPUTE.md, C4). The
+	-- pixel's projection onto the normal is a trapezoid; integrating it gives these four cases.
+	-- Exactly 0 for d >= (|nx| + |ny|) / 2 and exactly 1 for d <= -(|nx| + |ny|) / 2.
+	local function halfPlane(d: number, nx: number, ny: number): number
+		local a, b = abs(nx), abs(ny)
+		if a < b then
+			a, b = b, a
+		end
+		local u = (a + b) * 0.5 - d
+		if u <= 0 then
+			return 0
+		end
+		if u >= a + b then
+			return 1
+		end
+		if u < b then
+			return u * u / (2 * a * b)
+		end
+		if u <= a then
+			return (2 * u - b) / (2 * a)
+		end
+		local v = a + b - u
+		return 1 - v * v / (2 * a * b)
+	end
+	M.halfPlane = halfPlane
+
+	local REACH = 0.7071067811865476 -- largest |d| with 0 < coverage < 1 for any edge angle
+
+	----------------------------------------------------------------------------------------
+	-- Signed distance constructors (design units)
+	----------------------------------------------------------------------------------------
+
+	local function circle(cx: number, cy: number, r: number): (number, number) -> number
+		return function(x, y)
+			local dx, dy = x - cx, y - cy
+			return sqrt(dx * dx + dy * dy) - r
+		end
+	end
+
+	local function ring(cx: number, cy: number, r0: number, r1: number): (number, number) -> number
+		local mid, half = (r0 + r1) * 0.5, (r1 - r0) * 0.5
+		return function(x, y)
+			local dx, dy = x - cx, y - cy
+			return abs(sqrt(dx * dx + dy * dy) - mid) - half
+		end
+	end
+
+	-- Rounded box with half extents (hx, hy), corner radius rad, rotated by rot turns.
+	local function roundBox(cx: number, cy: number, hx: number, hy: number, rad: number, rot: number): (number, number) -> number
+		local c, s = dcosTurns(rot), dsinTurns(rot)
+		return function(x, y)
+			local px, py = x - cx, y - cy
+			local qx0 = c * px + s * py
+			local qy0 = -s * px + c * py
+			local qx = abs(qx0) - hx + rad
+			local qy = abs(qy0) - hy + rad
+			local ox = if qx > 0 then qx else 0
+			local oy = if qy > 0 then qy else 0
+			local inner = min(max(qx, qy), 0)
+			return sqrt(ox * ox + oy * oy) + inner - rad
+		end
+	end
+
+	local function capsule(ax: number, ay: number, bx: number, by: number, r: number): (number, number) -> number
+		return function(x, y)
+			return MyMath.sdSegment(x, y, ax, ay, bx, by, r)
+		end
+	end
+
+	local function polygon(pts: { number }): (number, number) -> number
+		return function(x, y)
+			return MyMath.sdPolygon(x, y, pts)
+		end
+	end
+
+	local function starPoints(cx: number, cy: number, outer: number, inner: number, points: number, rot: number): { number }
+		local pts = {}
+		for i = 0, points * 2 - 1 do
+			local ang = i / (points * 2) + rot
+			local rad = if i % 2 == 0 then outer else inner
+			table.insert(pts, cx + rad * dcosTurns(ang))
+			table.insert(pts, cy + rad * dsinTurns(ang))
+		end
+		return pts
+	end
+
+	local function shape(sd: (number, number) -> number, r: number, g: number, b: number, a: number?, blur: number?): Shape
+		return { sd = sd, r = r, g = g, b = b, a = a or 1, blur = blur or 0 }
+	end
+
+	----------------------------------------------------------------------------------------
+	-- Vector renderer: tile culling by the Lipschitz bound, per-pixel work only at edges
+	----------------------------------------------------------------------------------------
+
+	local function fillRect(buf: buffer, width: number, x0: number, y0: number, w: number, h: number, color: number)
+		local row = width * 4
+		local first = y0 * row + x0 * 4
+		for i = 0, w - 1 do
+			buffer.writeu32(buf, first + i * 4, color)
+		end
+		for r = 1, h - 1 do
+			buffer.copy(buf, first + r * row, buf, first, w * 4)
+		end
+	end
+
+	-- Renders opaque shapes (drawn in list order) over a flat background into an w x h buffer.
+	-- Shapes live in a design space of `design` units; the image scales it to w pixels.
+	-- A tile of T x T pixels whose centre is farther from a shape's boundary than the tile's
+	-- half-diagonal plus the edge reach lies entirely inside or outside that shape (a 1-Lipschitz
+	-- distance cannot change faster), so tiles no edge crosses are filled with buffer.copy and
+	-- only edge tiles run per-pixel math.
+	local function renderShapes(
+		buf: buffer,
+		w: number,
+		h: number,
+		shapes: { Shape },
+		bgR: number,
+		bgG: number,
+		bgB: number,
+		design: number,
+		progress: Progress
+	): (number, number)
+		local s = w / design
+		local T = if w >= 256 then 16 else 8
+		local n = #shapes
+		local state = table.create(n, 0) -- 0 outside, 1 inside, 2 edge (per tile)
+		local active = table.create(n, 0)
+		local rho = T * REACH
+		local edgeTiles, tiles = 0, 0
+		local GH = 0.25 -- gradient step in design units
+		for ty = 0, (h + T - 1) // T - 1 do
+			local y0 = ty * T
+			local th = min(T, h - y0)
+			for tx = 0, (w + T - 1) // T - 1 do
+				local x0 = tx * T
+				local tw = min(T, w - x0)
+				tiles += 1
+				local cxd, cyd = (x0 + tw * 0.5) / s, (y0 + th * 0.5) / s
+				local nActive, anyEdge = 0, false
+				for i = 1, n do
+					local sh = shapes[i]
+					local dc = sh.sd(cxd, cyd) * s
+					local reach = if sh.blur > 0 then sh.blur * s else REACH
+					local st
+					if M.noCull then
+						st = 2
+						anyEdge = true
+					elseif dc - rho >= reach + 1e-6 then
+						st = 0
+					elseif dc + rho <= -reach - 1e-6 then
+						st = 1
+					else
+						st = 2
+						anyEdge = true
+					end
+					state[i] = st
+					if st ~= 0 then
+						nActive += 1
+						active[nActive] = i
+					end
+				end
+				if not anyEdge then
+					local r, g, b = bgR, bgG, bgB
+					for k = 1, nActive do
+						local sh = shapes[active[k]]
+						r += (sh.r - r) * sh.a
+						g += (sh.g - g) * sh.a
+						b += (sh.b - b) * sh.a
+					end
+					fillRect(buf, w, x0, y0, tw, th, pack((r + 0.5) // 1, (g + 0.5) // 1, (b + 0.5) // 1, 255))
+				else
+					edgeTiles += 1
+					for py = y0, y0 + th - 1 do
+						local yd = (py + 0.5) / s
+						for px = x0, x0 + tw - 1 do
+							local xd = (px + 0.5) / s
+							local r, g, b = bgR, bgG, bgB
+							for k = 1, nActive do
+								local i = active[k]
+								local sh = shapes[i]
+								local cov = 1
+								if state[i] == 2 then
+									local d = sh.sd(xd, yd) * s
+									if sh.blur > 0 then
+										local bl = sh.blur * s
+										local t = 0.5 - d / (2 * bl)
+										t = if t < 0 then 0 elseif t > 1 then 1 else t
+										cov = t * t * (3 - 2 * t)
+									elseif d >= REACH then
+										cov = 0
+									elseif d <= -REACH then
+										cov = 1
+									else
+										local gx = sh.sd(xd + GH, yd) - sh.sd(xd - GH, yd)
+										local gy = sh.sd(xd, yd + GH) - sh.sd(xd, yd - GH)
+										local len = sqrt(gx * gx + gy * gy)
+										if len > 0 then
+											cov = halfPlane(d, gx / len, gy / len)
+										else
+											cov = if d < -0.5 then 1 elseif d > 0.5 then 0 else 0.5 - d
+										end
+									end
+								end
+								if cov > 0 then
+									cov *= sh.a
+									r += (sh.r - r) * cov
+									g += (sh.g - g) * cov
+									b += (sh.b - b) * cov
+								end
+							end
+							buffer.writeu32(buf, (py * w + px) * 4, pack((r + 0.5) // 1, (g + 0.5) // 1, (b + 0.5) // 1, 255))
+						end
+					end
+				end
+			end
+			if progress then
+				progress(y0, y0 + th)
+			end
+		end
+		return edgeTiles, tiles
+	end
+
+	----------------------------------------------------------------------------------------
+	-- Panel 1: the badge scene (also the LOD source at any resolution)
+	----------------------------------------------------------------------------------------
+
+	local badge: { Shape }? = nil
+	local function badgeShapes(): { Shape }
+		if badge then
+			return badge
+		end
+		local star = starPoints(256, 256, 70, 29, 5, -0.25)
+		local list: { Shape } = {
+			shape(circle(256, 256, 252), 26, 34, 74),
+			shape(circle(256, 284, 172), 0, 0, 0, 0.5, 26),
+			shape(circle(256, 256, 172), 255, 198, 72),
+			shape(ring(256, 256, 126, 142), 34, 44, 100),
+			shape(roundBox(256, 256, 86, 86, 30, 0.125), 236, 84, 96),
+			shape(roundBox(256, 256, 60, 60, 20, 0.125), 255, 128, 118),
+			shape(polygon(star), 255, 246, 220),
+			shape(circle(256 + 205 * dcosTurns(0.06), 256 + 205 * dsinTurns(0.06), 20), 64, 214, 196),
+			shape(circle(256 + 205 * dcosTurns(0.4), 256 + 205 * dsinTurns(0.4), 14), 255, 140, 200),
+			shape(circle(256 + 205 * dcosTurns(0.72), 256 + 205 * dsinTurns(0.72), 24), 250, 250, 255),
+			shape(capsule(196, 456, 316, 456, 9), 255, 255, 255, 0.75),
+			shape(ring(256, 256, 238, 244), 255, 255, 255, 0.85),
+		}
+		badge = list
+		return list
+	end
+
+	-- Renders the badge at any size; coordinates scale, so every resolution is its own exact
+	-- sample of the vector source and levels agree. Returns (edge tiles, tiles).
+	function M.renderScene(buf: buffer, w: number, h: number, progress: Progress): (number, number)
+		return renderShapes(buf, w, h, badgeShapes(), 10, 12, 28, 512, progress)
+	end
+
+	----------------------------------------------------------------------------------------
+	-- Panel 2: animated plasma (table-driven, a few ops per pixel)
+	----------------------------------------------------------------------------------------
+
+	local SIN = table.create(1024, 0)
+	for i = 0, 1023 do
+		SIN[i + 1] = dsinTurns(i / 1024)
+	end
+	-- indigo to magenta to amber to cream, interpolated linearly between four stops
+	local PLASMA_STOPS = { { 18, 10, 64 }, { 200, 36, 140 }, { 255, 150, 48 }, { 255, 238, 205 } }
+	local PALETTE = table.create(256, 0)
+	for i = 0, 255 do
+		local f = i / 255 * 3
+		local k = min(floor(f), 2)
+		local u = f - k
+		local c0, c1 = PLASMA_STOPS[k + 1], PLASMA_STOPS[k + 2]
+		PALETTE[i + 1] = pack(
+			(c0[1] + (c1[1] - c0[1]) * u + 0.5) // 1,
+			(c0[2] + (c1[2] - c0[2]) * u + 0.5) // 1,
+			(c0[3] + (c1[3] - c0[3]) * u + 0.5) // 1,
+			255
+		)
+	end
+
+	export type PlasmaState = { w: number, h: number, rad: buffer, col: { number }, row: { number } }
+
+	function M.plasmaInit(w: number, h: number): PlasmaState
+		local rad = buffer.create(w * h * 4)
+		for y = 0, h - 1 do
+			for x = 0, w - 1 do
+				local dx, dy = (x + 0.5) / w - 0.5, (y + 0.5) / h - 0.5
+				buffer.writef32(rad, (y * w + x) * 4, sqrt(dx * dx + dy * dy))
+			end
+		end
+		return { w = w, h = h, rad = rad, col = table.create(w, 0), row = table.create(h, 0) }
+	end
+
+	-- Fills buf with the plasma at time t (seconds).
+	function M.plasmaFrame(st: PlasmaState, buf: buffer, t: number)
+		local w, h = st.w, st.h
+		local col, row, rad = st.col, st.row, st.rad
+		local ta, tb, tc, td = t * 0.13, t * -0.17, t * 0.11, t * 0.23
+		for x = 0, w - 1 do
+			col[x + 1] = SIN[floor((x / w * 3.0 + ta) * 1024) % 1024 + 1]
+		end
+		for y = 0, h - 1 do
+			row[y + 1] = SIN[floor((y / h * 4.0 + tb) * 1024) % 1024 + 1]
+		end
+		local o = 0
+		for y = 0, h - 1 do
+			local ry = row[y + 1]
+			local dy = y / h * 2.0 + tc
+			for x = 0, w - 1 do
+				local diag = SIN[floor((x / w * 2.0 + dy) * 1024) % 1024 + 1]
+				local rr = SIN[floor((buffer.readf32(rad, o) * 9.0 + td) * 1024) % 1024 + 1]
+				local v = col[x + 1] + ry + diag + rr
+				buffer.writeu32(buf, o, PALETTE[floor((v + 4) * 31.99) + 1])
+				o += 4
+			end
+		end
+	end
+
+	----------------------------------------------------------------------------------------
+	-- Panel 3: marble from deterministic fractal noise
+	----------------------------------------------------------------------------------------
+
+	function M.renderMarble(buf: buffer, w: number, h: number, seed: number, progress: Progress)
+		local BATCH = 4
+		for y0 = 0, h - 1, BATCH do
+			local y1 = min(y0 + BATCH, h)
+			for y = y0, y1 - 1 do
+				for x = 0, w - 1 do
+					local f = (MyMath.fbm2(x * 0.011, y * 0.011, seed, 5))
+					-- two families of veins cut through the same warped noise field
+					local t = 1 - abs(dsinTurns(x * 0.0045 + y * 0.0021 + 1.25 * f))
+					local t2 = t * t
+					local t4 = t2 * t2
+					local t8 = t4 * t4
+					local u = 1 - abs(dsinTurns(x * 0.0031 - y * 0.0038 + 2.1 * f + 0.37))
+					local u2 = u * u
+					local u8 = u2 * u2 * u2 * u2
+					local wv = t8 + 0.22 * t2 * t + 0.55 * u8
+					wv = if wv > 1 then 1 else wv
+					-- ivory stone to blue-grey veins, with cloudy tone drift from the noise
+					local warm = (f - 0.5) * 46
+					local r = 238 + warm - (238 - 40) * wv
+					local g = 232 + warm * 0.8 - (232 - 52) * wv
+					local b = 220 + warm * 0.5 - (220 - 66) * wv
+					buffer.writeu32(buf, (y * w + x) * 4, pack((r + 0.5) // 1, (g + 0.5) // 1, (b + 0.5) // 1, 255))
+				end
+			end
+			if progress then
+				progress(y0, y1)
+			end
+		end
+	end
+
+	----------------------------------------------------------------------------------------
+	-- Panel 4: one tile of a canvas larger than the 1024 EditableImage limit
+	----------------------------------------------------------------------------------------
+
+	local MANDEL_PALETTE = table.create(512, 0)
+	for i = 0, 511 do
+		local t = i / 512
+		local function ch(phase: number): number
+			local v = 0.5 + 0.5 * dcosTurns(t * 2.0 + phase)
+			return (v * v * 255 * 0.7 + v * 255 * 0.3 + 0.5) // 1
+		end
+		MANDEL_PALETTE[i + 1] = pack(ch(0.0), ch(0.1), ch(0.25), 255)
+	end
+
+	-- Tile (tx, ty) of a grid x grid canvas of size x size tiles: a Mandelbrot set zoomed to
+	-- the seahorse valley. This one is for looking at, not for the determinism hash: it uses
+	-- math.log for smooth colouring.
+	function M.renderMandelbrotTile(buf: buffer, size: number, tx: number, ty: number, grid: number, progress: Progress)
+		local cx, cy, span = -0.7436438870371587, 0.13182590420531197, 0.0036
+		local total = size * grid
+		local maxIter = 300
+		local ln2 = math.log(2)
+		for py = 0, size - 1 do
+			local ci = cy + ((ty * size + py + 0.5) / total - 0.5) * span
+			for px = 0, size - 1 do
+				local cr = cx + ((tx * size + px + 0.5) / total - 0.5) * span
+				local zr, zi, zr2, zi2 = 0, 0, 0, 0
+				local n = 0
+				while n < maxIter and zr2 + zi2 <= 256 do
+					zi = 2 * zr * zi + ci
+					zr = zr2 - zi2 + cr
+					zr2 = zr * zr
+					zi2 = zi * zi
+					n += 1
+				end
+				local color
+				if n >= maxIter then
+					color = 0xFF000000
+				else
+					local mu = n + 1 - math.log(math.log(zr2 + zi2) * 0.5 / ln2) / ln2
+					color = MANDEL_PALETTE[floor(mu * 6) % 512 + 1]
+				end
+				buffer.writeu32(buf, (py * size + px) * 4, color)
+			end
+			if progress and (py % 4 == 3 or py == size - 1) then
+				progress(py - (py % 4), py + 1)
+			end
+		end
+	end
+
+	----------------------------------------------------------------------------------------
+	-- Panels 5 to 7: green screen, matte, cut-out
+	----------------------------------------------------------------------------------------
+
+	local KEY_R, KEY_G, KEY_B = 0, 177, 64
+
+	local function greenScreenShapes(): { Shape }
+		local hair = {}
+		for i = 0, 13 do
+			local ang = -0.5 + 0.5 * (i + 0.5) / 14 -- fan over the top of the head
+			local x0, y0 = 128 + 44 * dcosTurns(ang), 100 + 44 * dsinTurns(ang)
+			local len = 12 + (i * 7 % 5) * 3
+			local x1, y1 = 128 + (44 + len) * dcosTurns(ang), 100 + (44 + len) * dsinTurns(ang)
+			table.insert(hair, shape(capsule(x0, y0, x1, y1, 0.9), 70, 44, 30))
+		end
+		local list: { Shape } = {
+			shape(capsule(62, 196, 38, 238, 15), 58, 96, 196),
+			shape(capsule(194, 196, 218, 238, 15), 58, 96, 196),
+			shape(roundBox(128, 222, 66, 56, 30, 0), 58, 96, 196),
+			shape(capsule(128, 138, 128, 160, 13), 214, 168, 140),
+			shape(circle(128, 80, 47), 70, 44, 30),
+			shape(circle(128, 104, 41), 232, 190, 160),
+			shape(capsule(98, 164, 158, 164, 11), 204, 44, 56),
+			shape(circle(114, 98, 4), 40, 30, 28),
+			shape(circle(142, 98, 4), 40, 30, 28),
+			shape(circle(198, 86, 26), 190, 225, 255, 0.45),
+			shape(circle(189, 76, 7), 255, 255, 255, 0.7),
+		}
+		for _, hs in hair do
+			table.insert(list, hs)
+		end
+		return list
+	end
+
+	-- A green-screen portrait with fine hair strands, a semi-transparent glass bubble and a
+	-- little deterministic sensor noise.
+	function M.renderGreenScreen(buf: buffer, w: number, h: number, progress: Progress)
+		renderShapes(buf, w, h, greenScreenShapes(), KEY_R, KEY_G, KEY_B, 256, nil)
+		for y0 = 0, h - 1, 16 do
+			local y1 = min(y0 + 16, h)
+			for y = y0, y1 - 1 do
+				for x = 0, w - 1 do
+					local o = (y * w + x) * 4
+					local p = buffer.readu32(buf, o)
+					local nz = hash32(x + y * w + 977) % 9 - 4
+					local r = p % 256 + nz
+					local g = (p // 256) % 256 + nz
+					local b = (p // 65536) % 256 + nz
+					r = if r < 0 then 0 elseif r > 255 then 255 else r
+					g = if g < 0 then 0 elseif g > 255 then 255 else g
+					b = if b < 0 then 0 elseif b > 255 then 255 else b
+					buffer.writeu32(buf, o, pack(r, g, b, 255))
+				end
+			end
+			if progress then
+				progress(y0, y1)
+			end
+		end
+	end
+
+	-- Chroma key with soft alpha and colour decontamination. For a pixel C that is the key K
+	-- mixed with foreground F at coverage alpha, C = alpha F + (1 - alpha) K, so
+	-- F = (C - (1 - alpha) K) / alpha removes the green fringe at soft edges.
+	-- matteOut gets alpha as grey; cutOut gets the foreground over a sunset backdrop.
+	function M.keyMatte(src: buffer, w: number, h: number, matteOut: buffer, cutOut: buffer, progress: Progress)
+		local LO, HI = 18, 100
+		for y0 = 0, h - 1, 16 do
+			local y1 = min(y0 + 16, h)
+			for y = y0, y1 - 1 do
+				-- backdrop: vertical sunset gradient with a sun disc
+				local ty = y / h
+				local br = 255 - 150 * ty
+				local bg = 150 - 90 * ty
+				local bb = 90 + 80 * ty
+				for x = 0, w - 1 do
+					local o = (y * w + x) * 4
+					local p = buffer.readu32(src, o)
+					local r, g, b = p % 256, (p // 256) % 256, (p // 65536) % 256
+					local gd = g - (if r > b then r else b) -- how much greener than the other channels
+					local a = 1 - (gd - LO) / (HI - LO)
+					a = if a < 0 then 0 elseif a > 1 then 1 else a
+					a = a * a * (3 - 2 * a)
+					local fr, fg, fb = r, g, b
+					if a > 0.02 then
+						local ia = 1 - a
+						fr = (r - ia * KEY_R) / a
+						fg = (g - ia * KEY_G) / a
+						fb = (b - ia * KEY_B) / a
+						fr = if fr < 0 then 0 elseif fr > 255 then 255 else fr
+						fg = if fg < 0 then 0 elseif fg > 255 then 255 else fg
+						fb = if fb < 0 then 0 elseif fb > 255 then 255 else fb
+					end
+					local gray = (a * 255 + 0.5) // 1
+					buffer.writeu32(matteOut, o, pack(gray, gray, gray, 255))
+					-- sun disc, centred behind the glass bubble so its transparency is visible
+					local dx, dy = x / w - 0.77, y / h - 0.34
+					local sun = if dx * dx + dy * dy < 0.0144 then 1 else 0
+					local bgr = br + (255 - br) * sun
+					local bgg = bg + (236 - bg) * sun
+					local bgb = bb + (180 - bb) * sun
+					buffer.writeu32(
+						cutOut,
+						o,
+						pack((fr * a + bgr * (1 - a) + 0.5) // 1, (fg * a + bgg * (1 - a) + 0.5) // 1, (fb * a + bgb * (1 - a) + 0.5) // 1, 255)
+					)
+				end
+			end
+			if progress then
+				progress(y0, y1)
+			end
+		end
+	end
+
+	----------------------------------------------------------------------------------------
+	-- LOD: continuous level blending without pops
+	----------------------------------------------------------------------------------------
+
+	local LOD_LO, LOD_HI = 80, 150 -- displayed size band (pixels) over which levels hand over
+
+	-- Blend parameter f in [0, 1] for a displayed size in pixels: 0 = coarse level only,
+	-- 1 = fine level only. Smoothstep over log size, so f is C1 in the size.
+	function M.lodBlend(size: number): number
+		local u = (math.log(size) - math.log(LOD_LO)) / (math.log(LOD_HI) - math.log(LOD_LO))
+		u = if u < 0 then 0 elseif u > 1 then 1 else u
+		return u * u * (3 - 2 * u)
+	end
+
+	-- Two-phase fade (docs/DESIGN.md, Saturn). Returns the transparencies (0 = opaque) of the
+	-- coarse layer (below) and the fine layer (on top). Phase 1: the fine layer fades in over
+	-- a fully opaque coarse layer. Phase 2: the fine layer is opaque and the coarse layer
+	-- fades out beneath it. Never both layers half transparent at once, so a pixel that is
+	-- covered in both levels never dips.
+	function M.twoPhase(f: number): (number, number)
+		if f < 0.5 then
+			return 0, 1 - f * 2
+		end
+		return (f - 0.5) * 2, 0
+	end
+
+	-- The naive alternative for comparison: switch levels at the midpoint.
+	function M.hardSwitch(f: number): (number, number)
+		if f < 0.5 then
+			return 0, 1
+		end
+		return 1, 0
+	end
+
+	-- Displayed size in pixels at time t: a slow zoom in and out between 36 and 288.
+	function M.zoomSize(t: number): number
+		local u = 0.5 - 0.5 * dcosTurns(t / 10)
+		return 36 * (288 / 36) ^ u
+	end
+
+	----------------------------------------------------------------------------------------
+	-- Helpers
+	----------------------------------------------------------------------------------------
+
+	-- Order-sensitive hash of a whole buffer (32-bit words), for determinism checks.
+	function M.hashBuffer(buf: buffer): number
+		local hsh = 0x9E3779B9
+		for o = 0, buffer.len(buf) - 4, 4 do
+			hsh = hash32(bit32.bxor(hsh, buffer.readu32(buf, o)))
+		end
+		return hsh
+	end
+
+	return M
+end
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="Folder" referent="3">
+      <Properties>
+        <string name="Name">Universe</string>
+      </Properties>
+      <Item class="ModuleScript" referent="4">
+        <Properties>
+          <string name="Name">MyMath</string>
+          <string name="Source"><![CDATA[--!native
+--!optimize 2
+-- universe-at-home :: MyMath
+--
+-- The project's numeric axioms, written as code. Every function here uses only
+-- operations that round identically on every platform and in both Luau runtimes
+-- (interpreter and native): + - * / and sqrt (IEEE 754 correctly rounded), floor,
+-- abs, min, max, // and % on integers, and bit32. No libm transcendental functions,
+-- no math.lerp (native code fuses it into an FMA), no math.noise or math.random.
+-- See docs/RUNTIME_AUDIT.md section 6.5 and docs/DESIGN.md axioms M1 to M9.
+--
+-- Pixel axioms (docs/COMPUTE.md sections 1, 3.3 and "Flawless pipeline"):
+--
+--   F1  A pixel is a box filter. The coverage of a shape at a pixel is the EXACT
+--       area of the pixel square inside the shape; a byte is flawless when
+--       |byte - 255 A| <= 0.5 + 0.01 (the correctly rounded exact area). Exact
+--       area, never supersampling, is the reference (n x n point samples err by up
+--       to about 1/(2n) per edge crossing).
+--   F2  A scene is a box filter of its source-over composite: each pixel is the sum
+--       over visible regions of colour times area. Coverage used as alpha is exact
+--       only where at most one shape's edge enters the pixel; elsewhere visibility
+--       must be computed exactly (compute/Visibility.luau).
+--   F3  Content bytes depend only on the deterministic ops listed above (plus the
+--       deterministic arcsine Coverage.dasin); interpreter and native code agree.
+--
+--   C3  Linear ramp error. coverage(d, w) = clamp(1/2 - d/w) is exact only for
+--       axis-aligned edges. On a straight 45 degree edge its worst error is
+--       (sqrt(2)/2 - 1/2)^2 = 0.04289, i.e. 10.94/255 (closed form). Measured on
+--       shapes: 11/255 on circles of any radius, 38/255 at sharp box corners, 26 to
+--       57/255 at polygon corners. It is the PREVIEW ramp (Raster MODE_LINEAR).
+--   C4  Half-plane exactness. For a straight edge with unit normal (nx, ny) and
+--       signed distance d from the pixel centre, coverageHalfPlane is the exact
+--       area: the pixel's projection on n has a trapezoid density with ramps of
+--       width b = min(|nx|, |ny|) and a plateau of width a - b, a = max(|nx|, |ny|).
+--       It is exactly 0 for d >= (a + b)/2 and exactly 1 for d <= -(a + b)/2.
+--   C5  Curvature. A boundary of curvature k tangent to the half-plane line lies
+--       k t^2 / 2 inside it at tangential offset t, so the half-plane overestimates
+--       by at most k (sqrt(2)/2)^3 / 3 = 0.1179 k (30/R in 1/255 units).
+--       coverageCurved subtracts the exact first-order term k (t1^3 - t0^3) / 6
+--       over the chord [t0, t1] the tangent line cuts from the pixel. Where the
+--       line leaves the pixel at a shallow angle, the pixel side cuts the sliver
+--       between line and curve obliquely, so the residual is O(k), not O(k^2):
+--       measured worst 0.36/255 at R = 8, 0.09 at R = 16, 0.036 at R = 48, 0.004
+--       at R = 128, 0.002 at R = 300 (1/255 units, random placements). That is
+--       far better than the ramp but NOT flawless (F1 needs < 0.01) below about
+--       R = 300, so flawless rendering uses exact disc areas instead
+--       (Coverage.discBoxArea, Coverage.discPolyArea).
+--   Reach. The reach R_cov of a coverage function is the largest |d| at which it
+--       can be strictly between 0 and 1: w/2 for the ramp, COVERAGE_REACH * w =
+--       w sqrt(2)/2 for any exact area coverage (every point of a w x w pixel lies
+--       within w sqrt(2)/2 of its centre). Culling must drop a shape only when
+--       d - L rho >= R_cov (L the Lipschitz constant, rho the node radius) and
+--       bounding boxes must grow by R_cov; culling at w/2 silently cuts real
+--       coverage on diagonal edges.
+
+local MyMath = {}
+
+local TWO16 = 65536
+local TWO32 = 4294967296
+
+MyMath.TWO32 = TWO32
+
+----------------------------------------------------------------------------------
+-- M1. Exact 32-bit integer arithmetic inside doubles
+----------------------------------------------------------------------------------
+
+-- Low 32 bits of a * b for integers a, b in [0, 2^32).
+-- Splitting b into 16-bit halves keeps every partial product below 2^48, so all
+-- intermediate values are exact doubles and the result is bit-identical everywhere.
+local function mul32(a: number, b: number): number
+	local bl = b % TWO16
+	local bh = (b - bl) / TWO16
+	return (a * bl + (a * bh) % TWO16 * TWO16) % TWO32
+end
+MyMath.mul32 = mul32
+
+-- Folds any integer-valued number (negative too) into [0, 2^32).
+function MyMath.u32(x: number): number
+	return (x // 1) % TWO32
+end
+
+----------------------------------------------------------------------------------
+-- M2. Deterministic hashing and noise
+----------------------------------------------------------------------------------
+
+-- lowbias32 (Chris Wellons, public domain): a full-avalanche 32-bit integer hash.
+local function hash32(x: number): number
+	x = bit32.bxor(x, bit32.rshift(x, 16))
+	x = mul32(x, 0x7FEB352D)
+	x = bit32.bxor(x, bit32.rshift(x, 15))
+	x = mul32(x, 0x846CA68B)
+	return bit32.bxor(x, bit32.rshift(x, 16))
+end
+MyMath.hash32 = hash32
+
+-- Hash of an integer lattice point and a seed. Inputs may be negative.
+local function hash2(ix: number, iy: number, seed: number): number
+	local h = hash32(bit32.bxor(seed % TWO32, mul32(ix % TWO32, 0x9E3779B1)))
+	return hash32(bit32.bxor(h, mul32(iy % TWO32, 0x85EBCA77)))
+end
+MyMath.hash2 = hash2
+
+-- Uniform number in [0, 1) from a lattice point.
+function MyMath.rand2(ix: number, iy: number, seed: number): number
+	return hash2(ix, iy, seed) / TWO32
+end
+
+-- Quintic fade 6t^5 - 15t^4 + 10t^3. Its derivative peaks at 1.875 (t = 0.5).
+local function fade(t: number): number
+	return t * t * t * (t * (t * 6 - 15) + 10)
+end
+MyMath.fade = fade
+
+-- Value noise in [0, 1). Lipschitz constant <= 1.875 * sqrt(2) per unit of input.
+MyMath.VALUE_NOISE_LIPSCHITZ = 2.6517
+
+function MyMath.valueNoise2(x: number, y: number, seed: number): number
+	local ix = x // 1
+	local iy = y // 1
+	local ux = fade(x - ix)
+	local uy = fade(y - iy)
+	local a = hash2(ix, iy, seed) / TWO32
+	local b = hash2(ix + 1, iy, seed) / TWO32
+	local c = hash2(ix, iy + 1, seed) / TWO32
+	local d = hash2(ix + 1, iy + 1, seed) / TWO32
+	local ab = a + (b - a) * ux
+	local cd = c + (d - c) * ux
+	return ab + (cd - ab) * uy
+end
+
+-- Fractal sum of value noise. Returns value in [0, 1) and its Lipschitz bound.
+function MyMath.fbm2(x: number, y: number, seed: number, octaves: number): (number, number)
+	local sum, amp, freq, norm, lip = 0, 1, 1, 0, 0
+	for o = 1, octaves do
+		sum += amp * MyMath.valueNoise2(x * freq, y * freq, seed + o * 1013)
+		norm += amp
+		lip += amp * freq * 2.6517
+		amp *= 0.5
+		freq *= 2
+	end
+	return sum / norm, lip / norm
+end
+
+----------------------------------------------------------------------------------
+-- M3. Deterministic trigonometry (angles in turns: 1 turn = 360 degrees)
+----------------------------------------------------------------------------------
+
+local TAU = 6.283185307179586
+
+-- sin(2 pi t) from an odd Taylor polynomial up to x^15 on [-pi/2, pi/2].
+-- Truncation error is below 1e-10; only + and * are used, so it is bit-identical
+-- on every platform (unlike math.sin).
+local function dsinTurns(t: number): number
+	t = t - t // 1 -- [0, 1)
+	local s
+	if t < 0.25 then
+		s = t
+	elseif t < 0.75 then
+		s = 0.5 - t
+	else
+		s = t - 1
+	end
+	local x = s * TAU
+	local x2 = x * x
+	return x
+		* (1 + x2 * (-1 / 6 + x2 * (1 / 120 + x2 * (-1 / 5040 + x2 * (1 / 362880 + x2 * (-1 / 39916800 + x2 * (1 / 6227020800 + x2 * (-1 / 1307674368000))))))))
+end
+MyMath.dsinTurns = dsinTurns
+
+function MyMath.dcosTurns(t: number): number
+	return dsinTurns(t + 0.25)
+end
+
+----------------------------------------------------------------------------------
+-- M4. Shaping functions
+----------------------------------------------------------------------------------
+
+function MyMath.clamp01(x: number): number
+	return if x < 0 then 0 elseif x > 1 then 1 else x
+end
+
+function MyMath.smoothstep(e0: number, e1: number, x: number): number
+	local t = (x - e0) / (e1 - e0)
+	t = if t < 0 then 0 elseif t > 1 then 1 else t
+	return t * t * (3 - 2 * t)
+end
+
+-- Linear interpolation written out so native code never fuses it into an FMA.
+function MyMath.mix(a: number, b: number, t: number): number
+	return a + (b - a) * t
+end
+
+----------------------------------------------------------------------------------
+-- M5. Signed distance primitives (negative inside). All are exact or bounded
+-- distances with Lipschitz constant 1, which the rasterizer relies on.
+----------------------------------------------------------------------------------
+
+function MyMath.sdCircle(px: number, py: number, cx: number, cy: number, r: number): number
+	local dx, dy = px - cx, py - cy
+	return math.sqrt(dx * dx + dy * dy) - r
+end
+
+-- Box centred at (cx, cy) with half extents (hx, hy) and corner radius rad.
+function MyMath.sdRoundBox(px: number, py: number, cx: number, cy: number, hx: number, hy: number, rad: number): number
+	local qx = math.abs(px - cx) - hx + rad
+	local qy = math.abs(py - cy) - hy + rad
+	local ox = if qx > 0 then qx else 0
+	local oy = if qy > 0 then qy else 0
+	local inside = if qx > qy then qx else qy
+	if inside > 0 then
+		inside = 0
+	end
+	return math.sqrt(ox * ox + oy * oy) + inside - rad
+end
+
+-- Capsule: segment a-b thickened by radius r.
+function MyMath.sdSegment(px: number, py: number, ax: number, ay: number, bx: number, by: number, r: number): number
+	local pax, pay = px - ax, py - ay
+	local bax, bay = bx - ax, by - ay
+	local len2 = bax * bax + bay * bay
+	local h = if len2 > 0 then (pax * bax + pay * bay) / len2 else 0
+	h = if h < 0 then 0 elseif h > 1 then 1 else h
+	local dx, dy = pax - bax * h, pay - bay * h
+	return math.sqrt(dx * dx + dy * dy) - r
+end
+
+-- Polygon given as flat {x1, y1, x2, y2, ...}; exact signed distance with the
+-- even-odd winding sign (Inigo Quilez's sdPolygon).
+function MyMath.sdPolygon(px: number, py: number, pts: { number }): number
+	local n = #pts // 2
+	local d = math.huge
+	local s = 1
+	local jx, jy = pts[2 * n - 1], pts[2 * n]
+	for i = 1, n do
+		local vx, vy = pts[2 * i - 1], pts[2 * i]
+		local ex, ey = jx - vx, jy - vy
+		local wx, wy = px - vx, py - vy
+		local ee = ex * ex + ey * ey
+		local h = if ee > 0 then (wx * ex + wy * ey) / ee else 0
+		h = if h < 0 then 0 elseif h > 1 then 1 else h
+		local bx, by = wx - ex * h, wy - ey * h
+		local dd = bx * bx + by * by
+		if dd < d then
+			d = dd
+		end
+		local c1 = py >= vy
+		local c2 = py < jy
+		local c3 = ex * wy > ey * wx
+		if (c1 and c2 and c3) or (not c1 and not c2 and not c3) then
+			s = -s
+		end
+		jx, jy = vx, vy
+	end
+	return s * math.sqrt(d)
+end
+
+-- Polynomial smooth minimum. Its partial derivatives are h and 1 - h, so it keeps
+-- the Lipschitz bound of its inputs (proof in docs/DESIGN.md).
+function MyMath.smin(a: number, b: number, k: number): number
+	if k <= 0 then
+		return if a < b then a else b
+	end
+	local h = 0.5 + 0.5 * (b - a) / k
+	h = if h < 0 then 0 elseif h > 1 then 1 else h
+	return b + (a - b) * h - k * h * (1 - h)
+end
+
+-- The LINEAR PREVIEW RAMP: clamp(0.5 - d / w, 0, 1) from the signed distance d in
+-- pixels and an anti-aliasing width w (1 = one pixel). Exactly 0 when d >= w/2 and
+-- exactly 1 when d <= -w/2 (its reach is w/2), which ramp-based culling relies on.
+-- As an estimate of pixel area it is exact only for axis-aligned edges: up to
+-- 10.94/255 on a straight 45 degree edge (C3, closed form), 11/255 on circles of
+-- any radius, 38/255 at sharp box corners and 26 to 57/255 at polygon corners
+-- (measured, docs/COMPUTE.md 3.3). Use it for previews (Raster MODE_LINEAR); use
+-- coverageHalfPlane, coverageCurved or exact areas for content (F1).
+function MyMath.coverage(d: number, w: number): number
+	local a = 0.5 - d / w
+	return if a < 0 then 0 elseif a > 1 then 1 else a
+end
+
+----------------------------------------------------------------------------------
+-- M8. Exact-area coverage axioms (C4, C5; header). Moved verbatim from
+-- compute/Coverage.luau (halfPlane, halfPlaneCurved), so results are bit-identical;
+-- the optional w scales the box filter (a w x w pixel, default 1): d is divided by
+-- w and the curvature k multiplied by w, which is exact when w is 1 or omitted.
+----------------------------------------------------------------------------------
+
+local abs = math.abs
+
+-- sqrt(2)/2: the reach of every exact-area coverage function in pixel widths.
+MyMath.COVERAGE_REACH = 0.70710678118654757
+
+-- C4. Exact area of {q in pixel : d + n . (q - centre) <= 0} for |n| = 1, i.e. the
+-- part of the pixel on the inner side of a straight edge at signed distance d
+-- (negative inside) with unit normal (nx, ny). Only |nx| and |ny| matter.
+local function coverageHalfPlane(d: number, nx: number, ny: number, w: number?): number
+	if w then
+		d = d / w
+	end
+	local a, b = abs(nx), abs(ny)
+	if a < b then
+		a, b = b, a
+	end
+	local u = (a + b) * 0.5 - d
+	if u <= 0 then
+		return 0
+	end
+	if u >= a + b then
+		return 1
+	end
+	if u < b then
+		return u * u / (2 * a * b)
+	end
+	if u <= a then
+		return (2 * u - b) / (2 * a)
+	end
+	local v = a + b - u
+	return 1 - v * v / (2 * a * b)
+end
+MyMath.coverageHalfPlane = coverageHalfPlane
+
+-- C5. Half-plane area minus the first-order curvature term k (t1^3 - t0^3) / 6
+-- over the chord the tangent line cuts from the pixel. k > 0 where the shape is
+-- convex (1 / R for a disc of radius R), k < 0 where it is concave. Error O(k) at
+-- shallow chord exits (header), so it is an estimator, not an exact area.
+local function coverageCurved(d: number, nx: number, ny: number, k: number, w: number?): number
+	if w then
+		d = d / w
+		k = k * w
+	end
+	local base = coverageHalfPlane(d, nx, ny)
+	if k == 0 then
+		return base
+	end
+	-- the line is {q : n . (q - c) = -d}; parametrise q = c - d n + t (-ny, nx)
+	-- and clip t to the unit square |qx - cx| <= 1/2, |qy - cy| <= 1/2
+	local t0, t1 = -1e300, 1e300
+	local tx, ty = -ny, nx
+	local ox, oy = -d * nx, -d * ny
+	if tx ~= 0 then
+		local a0 = (-0.5 - ox) / tx
+		local a1 = (0.5 - ox) / tx
+		if a0 > a1 then
+			a0, a1 = a1, a0
+		end
+		if a0 > t0 then
+			t0 = a0
+		end
+		if a1 < t1 then
+			t1 = a1
+		end
+	elseif ox < -0.5 or ox > 0.5 then
+		t1 = t0
+	end
+	if ty ~= 0 then
+		local a0 = (-0.5 - oy) / ty
+		local a1 = (0.5 - oy) / ty
+		if a0 > a1 then
+			a0, a1 = a1, a0
+		end
+		if a0 > t0 then
+			t0 = a0
+		end
+		if a1 < t1 then
+			t1 = a1
+		end
+	elseif oy < -0.5 or oy > 0.5 then
+		t1 = t0
+	end
+	local c = base
+	if t1 > t0 then
+		c = base - k * (t1 * t1 * t1 - t0 * t0 * t0) / 6
+	end
+	return if c < 0 then 0 elseif c > 1 then 1 else c
+end
+MyMath.coverageCurved = coverageCurved
+
+----------------------------------------------------------------------------------
+-- M6. Exact 8-bit colour arithmetic
+----------------------------------------------------------------------------------
+
+-- round(t / 255) for integer t in [0, 65025], with no division. Verified for every
+-- input by brute force. Each 16-bit lane of a SWAR word stays below 2^16.
+function MyMath.div255(t: number): number
+	local x = t + 128
+	return (x + x // 256) // 256
+end
+
+function MyMath.pack(r: number, g: number, b: number, a: number): number
+	return r + g * 256 + b * 65536 + a * 16777216
+end
+
+function MyMath.unpack(c: number): (number, number, number, number)
+	return c % 256, (c // 256) % 256, (c // 65536) % 256, c // 16777216
+end
+
+-- Parses "#RRGGBB" or "#RRGGBBAA" into a packed straight-alpha RGBA8 value.
+function MyMath.hex(s: string): number
+	local h = string.gsub(s, "^#", "")
+	local r = tonumber(string.sub(h, 1, 2), 16) or 0
+	local g = tonumber(string.sub(h, 3, 4), 16) or 0
+	local b = tonumber(string.sub(h, 5, 6), 16) or 0
+	local a = if #h >= 8 then tonumber(string.sub(h, 7, 8), 16) or 255 else 255
+	return r + g * 256 + b * 65536 + a * 16777216
+end
+
+-- sRGB to linear light in 16-bit fixed point, generated offline (tools/gen_vectors.py)
+-- so every client uses the same integers. Strictly increasing.
+local SRGB_TO_LINEAR16 = {
+	0, 20, 40, 60, 80, 99, 119, 139, 159, 179, 199, 219, 241, 264, 288, 313,
+	340, 367, 396, 427, 458, 491, 526, 562, 599, 637, 677, 718, 761, 805, 851, 898,
+	947, 997, 1048, 1101, 1156, 1212, 1270, 1330, 1391, 1453, 1517, 1583, 1651, 1720, 1790, 1863,
+	1937, 2013, 2090, 2170, 2250, 2333, 2418, 2504, 2592, 2681, 2773, 2866, 2961, 3058, 3157, 3258,
+	3360, 3464, 3570, 3678, 3788, 3900, 4014, 4129, 4247, 4366, 4488, 4611, 4736, 4864, 4993, 5124,
+	5257, 5392, 5530, 5669, 5810, 5953, 6099, 6246, 6395, 6547, 6700, 6856, 7014, 7174, 7335, 7500,
+	7666, 7834, 8004, 8177, 8352, 8528, 8708, 8889, 9072, 9258, 9445, 9635, 9828, 10022, 10219, 10417,
+	10619, 10822, 11028, 11235, 11446, 11658, 11873, 12090, 12309, 12530, 12754, 12980, 13209, 13440, 13673, 13909,
+	14146, 14387, 14629, 14874, 15122, 15371, 15623, 15878, 16135, 16394, 16656, 16920, 17187, 17456, 17727, 18001,
+	18277, 18556, 18837, 19121, 19407, 19696, 19987, 20281, 20577, 20876, 21177, 21481, 21787, 22096, 22407, 22721,
+	23038, 23357, 23678, 24002, 24329, 24658, 24990, 25325, 25662, 26001, 26344, 26688, 27036, 27386, 27739, 28094,
+	28452, 28813, 29176, 29542, 29911, 30282, 30656, 31033, 31412, 31794, 32179, 32567, 32957, 33350, 33745, 34143,
+	34544, 34948, 35355, 35764, 36176, 36591, 37008, 37429, 37852, 38278, 38706, 39138, 39572, 40009, 40449, 40891,
+	41337, 41785, 42236, 42690, 43147, 43606, 44069, 44534, 45002, 45473, 45947, 46423, 46903, 47385, 47871, 48359,
+	48850, 49344, 49841, 50341, 50844, 51349, 51858, 52369, 52884, 53401, 53921, 54445, 54971, 55500, 56032, 56567,
+	57105, 57646, 58190, 58737, 59287, 59840, 60396, 60955, 61517, 62082, 62650, 63221, 63795, 64372, 64952, 65535,
+}
+MyMath.SRGB_TO_LINEAR16 = SRGB_TO_LINEAR16
+
+function MyMath.srgbToLinear16(c8: number): number
+	return SRGB_TO_LINEAR16[c8 + 1]
+end
+
+-- Inverse by binary search: the sRGB byte whose linear value is nearest to v.
+function MyMath.linear16ToSrgb(v: number): number
+	local lo, hi = 0, 255
+	while lo < hi do
+		local mid = (lo + hi) // 2
+		if SRGB_TO_LINEAR16[mid + 1] < v then
+			lo = mid + 1
+		else
+			hi = mid
+		end
+	end
+	if lo > 0 and v - SRGB_TO_LINEAR16[lo] <= SRGB_TO_LINEAR16[lo + 1] - v then
+		return lo - 1
+	end
+	return lo
+end
+
+----------------------------------------------------------------------------------
+-- M7. Resolution allocation under a pixel-area budget ("water filling")
+----------------------------------------------------------------------------------
+
+-- Chooses a square texture size for each surface so the total pixel area fits the
+-- budget. A surface gains detail only up to the pixels it covers on screen, so the
+-- benefit of each size step is min(area, demand) * weight and has diminishing
+-- returns. Greedy by benefit per added pixel is optimal for the continuous
+-- relaxation and within one size step of optimal here.
+--
+-- demands[i]: on-screen pixel area of surface i (its useful texel count)
+-- weights[i]: importance multiplier, default 1
+-- budget:     total texel area allowed
+-- sizes:      ascending allowed edge lengths, e.g. {64, 128, 256, 512, 1024}
+-- returns { edge length or 0 } per surface (0 = no editable image)
+function MyMath.allocate(demands: { number }, weights: { number }?, budget: number, sizes: { number }): { number }
+	local n = #demands
+	local level = table.create(n, 0) -- index into sizes; 0 = none
+	local result = table.create(n, 0)
+	local remaining = budget
+	local function area(l: number): number
+		if l == 0 then
+			return 0
+		end
+		local s = sizes[l]
+		return s * s
+	end
+	while true do
+		local best, bestRatio = 0, 0
+		for i = 1, n do
+			local l = level[i]
+			if l < #sizes then
+				local cur, nxt = area(l), area(l + 1)
+				local cost = nxt - cur
+				if cost <= remaining then
+					local d = demands[i]
+					local w = if weights then weights[i] or 1 else 1
+					local gain = ((if nxt < d then nxt else d) - (if cur < d then cur else d)) * w
+					local ratio = gain / cost
+					if ratio > bestRatio then
+						best, bestRatio = i, ratio
+					end
+				end
+			end
+		end
+		if best == 0 then
+			break
+		end
+		remaining -= area(level[best] + 1) - area(level[best])
+		level[best] += 1
+	end
+	for i = 1, n do
+		result[i] = if level[i] == 0 then 0 else sizes[level[i]]
+	end
+	return result
+end
+
+return MyMath
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="StarterPlayer" referent="5">
+    <Properties>
+      <string name="Name">StarterPlayer</string>
+    </Properties>
+    <Item class="StarterPlayerScripts" referent="6">
+      <Properties>
+        <string name="Name">StarterPlayerScripts</string>
+      </Properties>
+      <Item class="LocalScript" referent="7">
+        <Properties>
+          <string name="Name">GalleryClient</string>
+          <string name="Source"><![CDATA[--!strict
+-- universe-at-home :: gallery/Gallery.client.luau  (LocalScript, StarterPlayerScripts)
+--
+-- A visual gallery of EditableImages, every one drawn in Luau on this machine:
+--   * a vector badge rendered with exact-area edges and copy-filled tiles
+--   * a live plasma rewritten every frame (compute and upload time shown)
+--   * procedural marble from deterministic fractal noise
+--   * a 1152 x 1152 canvas made of nine 384 x 384 tiles (larger than any one image may be)
+--   * level-of-detail switching: a hard switch next to the two-phase fade
+--   * a green-screen portrait, its matte, and the cut-out over a new backdrop
+-- plus a spinning cube in the world that wears the same EditableImages as Decals.
+--
+-- Heavy panels are drawn by a frame-time scheduler (coroutines that yield when the frame's
+-- budget is spent), so the gallery fills in over a few seconds without freezing the game.
+-- Every stage runs under pcall: if one fails, the others still come up and the error is shown.
+-- Press G to hide or show the panels.
+--
+-- Requires: Game Settings, Security, "Allow Mesh / Image APIs" turned ON.
+
+local AssetService = game:GetService("AssetService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Stats = game:GetService("Stats")
+local UserInputService = game:GetService("UserInputService")
+
+-- wait for replication, then require by static path
+ReplicatedStorage:WaitForChild("Universe"):WaitForChild("MyMath")
+ReplicatedStorage:WaitForChild("Gallery"):WaitForChild("Panels")
+local MyMath: any = require(ReplicatedStorage.Universe.MyMath)
+local Panels: any = (require(ReplicatedStorage.Gallery.Panels) :: any)(MyMath)
+
+local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui") :: PlayerGui
+
+----------------------------------------------------------------------------------------
+-- Error reporting and EditableImage helpers
+----------------------------------------------------------------------------------------
+
+-- pcall for functions that return nothing: typed as (boolean, any) so the error can be read
+local function try(fn: () -> ()): (boolean, any)
+	local ok, err = (pcall :: any)(fn)
+	return ok, err
+end
+
+local errors: { string } = {}
+local banner: TextLabel? = nil
+
+local function reportError(where: string, message: string)
+	local line = where .. ": " .. message
+	table.insert(errors, line)
+	warn("[Gallery] " .. line)
+	if banner then
+		banner.Visible = true
+		banner.Text = "Something did not come up. " .. line
+			.. "\nIf this says EditableImage is not enabled: Home > Game Settings > Security > Allow Mesh / Image APIs, then press Play again."
+	end
+end
+
+local liveImages = 0
+local livePixels = 0
+
+local function createImage(w: number, h: number, where: string): EditableImage?
+	local ok, result = pcall(function()
+		return AssetService:CreateEditableImage({ Size = Vector2.new(w, h) })
+	end)
+	if ok and result then
+		liveImages += 1
+		livePixels += w * h
+		return result :: EditableImage
+	end
+	reportError(where, if ok then "CreateEditableImage returned nil (out of editable memory budget)" else tostring(result))
+	return nil
+end
+
+local scratch: { [number]: buffer } = {}
+
+-- Uploads rows [y0, y1) of a row-major RGBA8 buffer.
+local function uploadRows(img: EditableImage, buf: buffer, width: number, y0: number, y1: number)
+	local rows = y1 - y0
+	if rows <= 0 then
+		return
+	end
+	local bytes = rows * width * 4
+	if y0 == 0 and bytes == buffer.len(buf) then
+		img:WritePixelsBuffer(Vector2.zero, Vector2.new(width, rows), buf)
+		return
+	end
+	local tmp = scratch[bytes]
+	if not tmp then
+		tmp = buffer.create(bytes)
+		scratch[bytes] = tmp
+	end
+	buffer.copy(tmp, 0, buf, y0 * width * 4, bytes)
+	img:WritePixelsBuffer(Vector2.new(0, y0), Vector2.new(width, rows), tmp)
+end
+
+----------------------------------------------------------------------------------------
+-- Frame-time scheduler: jobs are coroutines that yield when the frame's budget is spent
+----------------------------------------------------------------------------------------
+
+type Job = { co: thread, cpu: number, sliceStart: number, name: string }
+
+local jobs: { Job } = {}
+local deadline = 0
+
+local function checkpoint()
+	if os.clock() >= deadline then
+		coroutine.yield()
+	end
+end
+
+local function spawnJob(name: string, fn: (job: Job) -> ()): Job
+	local job: Job = { co = coroutine.create(function() end), cpu = 0, sliceStart = 0, name = name }
+	job.co = coroutine.create(function()
+		fn(job)
+	end)
+	table.insert(jobs, job)
+	return job
+end
+
+local function cpuMs(job: Job): number
+	return (job.cpu + (os.clock() - job.sliceStart)) * 1000
+end
+
+local function runJobs(budget: number)
+	if #jobs == 0 then
+		return
+	end
+	deadline = os.clock() + budget
+	local i = 1
+	while i <= #jobs and os.clock() < deadline do
+		local job = jobs[i]
+		job.sliceStart = os.clock()
+		local ok, err = coroutine.resume(job.co)
+		job.cpu += os.clock() - job.sliceStart
+		if not ok then
+			reportError(job.name, tostring(err))
+			table.remove(jobs, i)
+		elseif coroutine.status(job.co) == "dead" then
+			table.remove(jobs, i)
+		else
+			i += 1
+		end
+	end
+end
+
+----------------------------------------------------------------------------------------
+-- UI
+----------------------------------------------------------------------------------------
+
+local FONT = Font.fromEnum(Enum.Font.GothamMedium)
+local FONT_BOLD = Font.fromEnum(Enum.Font.GothamBold)
+
+local function text(parent: Instance, content: string, size: number, pos: UDim2, dim: UDim2, bold: boolean?, color: Color3?): TextLabel
+	local l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.BorderSizePixel = 0
+	l.FontFace = if bold then FONT_BOLD else FONT
+	l.TextSize = size
+	l.TextColor3 = color or Color3.fromRGB(226, 230, 245)
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.TextYAlignment = Enum.TextYAlignment.Top
+	l.TextWrapped = true
+	l.Text = content
+	l.Position = pos
+	l.Size = dim
+	l.Parent = parent
+	return l
+end
+
+local function round(inst: Instance, radius: number)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, radius)
+	c.Parent = inst
+end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "EditableImageGallery"
+screenGui.ResetOnSpawn = false
+screenGui.IgnoreGuiInset = true
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent = playerGui
+
+local root = Instance.new("Frame")
+root.Name = "Panels"
+root.BackgroundColor3 = Color3.fromRGB(10, 12, 22)
+root.BackgroundTransparency = 0.12
+root.BorderSizePixel = 0
+root.Position = UDim2.fromOffset(8, 8)
+root.Size = UDim2.new(0, 650, 1, -16)
+root.Parent = screenGui
+round(root, 10)
+
+text(root, "EditableImage Gallery", 24, UDim2.fromOffset(14, 8), UDim2.new(1, -28, 0, 30), true)
+text(
+	root,
+	"Every picture here is an EditableImage drawn by Luau on this machine, no uploaded assets. Press G to hide.",
+	13,
+	UDim2.fromOffset(14, 38),
+	UDim2.new(1, -28, 0, 30),
+	false,
+	Color3.fromRGB(150, 158, 190)
+)
+
+local scroller = Instance.new("ScrollingFrame")
+scroller.BackgroundTransparency = 1
+scroller.BorderSizePixel = 0
+scroller.Position = UDim2.fromOffset(0, 72)
+scroller.Size = UDim2.new(1, 0, 1, -72)
+scroller.CanvasSize = UDim2.new()
+scroller.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scroller.ScrollBarThickness = 8
+scroller.Parent = root
+
+local pad = Instance.new("UIPadding")
+pad.PaddingLeft = UDim.new(0, 8)
+pad.PaddingTop = UDim.new(0, 4)
+pad.PaddingBottom = UDim.new(0, 12)
+pad.Parent = scroller
+
+local grid = Instance.new("UIGridLayout")
+grid.CellSize = UDim2.fromOffset(300, 366)
+grid.CellPadding = UDim2.fromOffset(10, 10)
+grid.SortOrder = Enum.SortOrder.LayoutOrder
+grid.Parent = scroller
+
+local bannerLabel = text(
+	screenGui,
+	"",
+	15,
+	UDim2.new(0.5, -300, 0, 8),
+	UDim2.fromOffset(600, 70),
+	true,
+	Color3.fromRGB(255, 200, 200)
+)
+bannerLabel.BackgroundTransparency = 0.1
+bannerLabel.BackgroundColor3 = Color3.fromRGB(110, 20, 28)
+bannerLabel.Visible = false
+bannerLabel.ZIndex = 10
+round(bannerLabel, 8)
+banner = bannerLabel
+
+local hud = text(screenGui, "", 13, UDim2.new(1, -348, 0, 8), UDim2.fromOffset(340, 112), false)
+hud.BackgroundTransparency = 0.25
+hud.BackgroundColor3 = Color3.fromRGB(8, 10, 18)
+round(hud, 8)
+
+UserInputService.InputBegan:Connect(function(input: InputObject, processed: boolean)
+	if not processed and input.KeyCode == Enum.KeyCode.G then
+		root.Visible = not root.Visible
+	end
+end)
+
+type Card = { frame: Frame, body: Frame, info: TextLabel }
+
+local function makeCard(order: number, title: string, subtitle: string): Card
+	local frame = Instance.new("Frame")
+	frame.Name = title
+	frame.LayoutOrder = order
+	frame.BackgroundColor3 = Color3.fromRGB(24, 28, 46)
+	frame.BorderSizePixel = 0
+	frame.Parent = scroller
+	round(frame, 8)
+	text(frame, title, 14, UDim2.fromOffset(8, 6), UDim2.new(1, -16, 0, 20), true)
+	local body = Instance.new("Frame")
+	body.BackgroundColor3 = Color3.fromRGB(12, 14, 24)
+	body.BorderSizePixel = 0
+	body.ClipsDescendants = true
+	body.Position = UDim2.fromOffset(6, 28)
+	body.Size = UDim2.fromOffset(288, 288)
+	body.Parent = frame
+	local sub = text(frame, subtitle, 11, UDim2.fromOffset(8, 319), UDim2.new(1, -16, 0, 24), false, Color3.fromRGB(150, 158, 190))
+	sub.TextYAlignment = Enum.TextYAlignment.Top
+	local info = text(frame, "queued...", 12, UDim2.fromOffset(8, 346), UDim2.new(1, -16, 0, 16), true, Color3.fromRGB(130, 220, 170))
+	return { frame = frame, body = body, info = info }
+end
+
+local function imageLabel(parent: Instance, img: EditableImage?, size: UDim2, pos: UDim2?): ImageLabel
+	local l = Instance.new("ImageLabel")
+	l.BackgroundTransparency = 1
+	l.BorderSizePixel = 0
+	l.Size = size
+	l.Position = pos or UDim2.new()
+	if img then
+		l.ImageContent = Content.fromObject(img)
+	end
+	l.Parent = parent
+	return l
+end
+
+----------------------------------------------------------------------------------------
+-- 3D: a cube that wears the same EditableImages as Decals
+----------------------------------------------------------------------------------------
+
+local cube = Instance.new("Part")
+cube.Name = "GalleryCube"
+cube.Size = Vector3.new(9, 9, 9)
+cube.Anchored = true
+cube.CanCollide = false
+cube.Material = Enum.Material.SmoothPlastic
+cube.Color = Color3.fromRGB(245, 245, 250)
+cube.CFrame = CFrame.new(0, 9, -24)
+cube.Parent = workspace
+
+local function wear(face: Enum.NormalId, img: EditableImage?)
+	if not img then
+		return
+	end
+	local ok, err = try(function()
+		local d = Instance.new("Decal")
+		d.Face = face
+		d.TextureContent = Content.fromObject(img)
+		d.Parent = cube
+	end)
+	if not ok then
+		reportError("cube decal " .. face.Name, tostring(err))
+	end
+end
+
+----------------------------------------------------------------------------------------
+-- Cards
+----------------------------------------------------------------------------------------
+
+local sceneCard = makeCard(1, "Vector badge  512 x 512", "Exact-area anti-aliased shapes. Tiles that no edge touches are copy-filled; only edge tiles run per-pixel math.")
+local plasmaCard = makeCard(2, "Live plasma  192 x 192", "Rewritten every frame with WritePixelsBuffer: the compute and upload time below is measured here, live.")
+local marbleCard = makeCard(3, "Procedural marble  256 x 256", "Deterministic fractal noise: every client computes the same bytes. Fills in as the scheduler allows.")
+local mandelCard = makeCard(4, "Beyond 1024:  1152 x 1152 canvas", "Nine 384 x 384 tiles, each its own EditableImage. No single image may exceed 1024, the canvas does.")
+local hardCard = makeCard(5, "LOD: hard switch", "Zooms in and out. At the midpoint it swaps the 64 px level for the 512 px level: watch the sharpness jump.")
+local fadeCard = makeCard(6, "LOD: two-phase fade", "Same two images, same zoom. The fine level fades in over the coarse one, then the coarse one fades out beneath it.")
+local greenCard = makeCard(7, "Green screen  256 x 256", "A portrait with 1 px hair strands and a glass bubble, plus sensor noise.")
+local matteCard = makeCard(8, "Matte (alpha)  256 x 256", "Soft chroma key. The glass bubble comes out grey: partly transparent, not cut out.")
+local cutCard = makeCard(9, "Cut-out on a new backdrop", "Foreground colour recovered by removing the green fringe, then composited over the sunset.")
+
+----------------------------------------------------------------------------------------
+-- Panel jobs
+----------------------------------------------------------------------------------------
+
+local sceneImg: EditableImage? = nil
+local lowImg: EditableImage? = nil
+local plasmaImg: EditableImage? = nil
+local mandelImgs: { EditableImage } = {}
+
+-- 1. badge, plus its 64 px level for the LOD cards
+spawnJob("badge", function(job)
+	local img = createImage(512, 512, "badge")
+	if not img then
+		sceneCard.info.Text = "could not create the image"
+		return
+	end
+	sceneImg = img
+	imageLabel(sceneCard.body, img, UDim2.fromOffset(288, 288))
+	local buf = buffer.create(512 * 512 * 4)
+	local edge, tiles = Panels.renderScene(buf, 512, 512, function(y0: number, y1: number)
+		uploadRows(img, buf, 512, y0, y1)
+		checkpoint()
+	end)
+	sceneCard.info.Text = string.format("rendered in %.0f ms CPU  |  %d of %d tiles needed math", cpuMs(job), edge, tiles)
+	wear(Enum.NormalId.Front, img)
+
+	local low = createImage(64, 64, "badge level 64")
+	if low then
+		lowImg = low
+		local lbuf = buffer.create(64 * 64 * 4)
+		Panels.renderScene(lbuf, 64, 64, nil)
+		uploadRows(low, lbuf, 64, 0, 64)
+		wear(Enum.NormalId.Bottom, low)
+	end
+end)
+
+-- 2. plasma image (frames are drawn in the main loop)
+do
+	local img = createImage(192, 192, "plasma")
+	if img then
+		plasmaImg = img
+		imageLabel(plasmaCard.body, img, UDim2.fromOffset(288, 288))
+		wear(Enum.NormalId.Back, img)
+	else
+		plasmaCard.info.Text = "could not create the image"
+	end
+end
+
+-- 3. marble
+spawnJob("marble", function(job)
+	local img = createImage(256, 256, "marble")
+	if not img then
+		marbleCard.info.Text = "could not create the image"
+		return
+	end
+	imageLabel(marbleCard.body, img, UDim2.fromOffset(288, 288))
+	local buf = buffer.create(256 * 256 * 4)
+	Panels.renderMarble(buf, 256, 256, 1234, function(y0: number, y1: number)
+		uploadRows(img, buf, 256, y0, y1)
+		marbleCard.info.Text = string.format("%d%% drawn  |  %.0f ms CPU so far", y1 / 256 * 100, cpuMs(job))
+		checkpoint()
+	end)
+	marbleCard.info.Text = string.format("rendered in %.0f ms CPU", cpuMs(job))
+	wear(Enum.NormalId.Left, img)
+end)
+
+-- 7 to 9. green screen, matte, cut-out
+spawnJob("green screen", function(job)
+	local src = createImage(256, 256, "green screen")
+	local matte = createImage(256, 256, "matte")
+	local cut = createImage(256, 256, "cut-out")
+	if not (src and matte and cut) then
+		greenCard.info.Text = "could not create the images"
+		return
+	end
+	imageLabel(greenCard.body, src, UDim2.fromOffset(288, 288))
+	imageLabel(matteCard.body, matte, UDim2.fromOffset(288, 288))
+	imageLabel(cutCard.body, cut, UDim2.fromOffset(288, 288))
+	local gbuf = buffer.create(256 * 256 * 4)
+	Panels.renderGreenScreen(gbuf, 256, 256, function(y0: number, y1: number)
+		uploadRows(src, gbuf, 256, y0, y1)
+		checkpoint()
+	end)
+	greenCard.info.Text = string.format("rendered in %.0f ms CPU", cpuMs(job))
+	local mbuf = buffer.create(256 * 256 * 4)
+	local cbuf = buffer.create(256 * 256 * 4)
+	local before = cpuMs(job)
+	Panels.keyMatte(gbuf, 256, 256, mbuf, cbuf, function(y0: number, y1: number)
+		uploadRows(matte, mbuf, 256, y0, y1)
+		uploadRows(cut, cbuf, 256, y0, y1)
+		checkpoint()
+	end)
+	local took = string.format("matte + cut-out in %.0f ms CPU", cpuMs(job) - before)
+	matteCard.info.Text = took
+	cutCard.info.Text = took
+	wear(Enum.NormalId.Top, cut)
+end)
+
+-- 4. nine tiles
+local TILE, GRID = 384, 3
+spawnJob("mandelbrot", function(job)
+	local buf = buffer.create(TILE * TILE * 4)
+	local labels: { ImageLabel } = {}
+	for i = 0, GRID * GRID - 1 do
+		local tx, ty = i % GRID, i // GRID
+		local img = createImage(TILE, TILE, "mandelbrot tile " .. (i + 1))
+		if not img then
+			mandelCard.info.Text = string.format("tile %d: out of editable memory", i + 1)
+			return
+		end
+		table.insert(mandelImgs, img)
+		local shown = 288 // GRID
+		labels[i + 1] = imageLabel(mandelCard.body, img, UDim2.fromOffset(shown, shown), UDim2.fromOffset(tx * shown, ty * shown))
+		Panels.renderMandelbrotTile(buf, TILE, tx, ty, GRID, function(y0: number, y1: number)
+			uploadRows(img, buf, TILE, y0, y1)
+			mandelCard.info.Text = string.format("tile %d of %d  |  %.0f ms CPU so far", i + 1, GRID * GRID, cpuMs(job))
+			checkpoint()
+		end)
+		if i == 4 then
+			wear(Enum.NormalId.Right, img)
+		end
+	end
+	mandelCard.info.Text = string.format("%d x %d px from %d images  |  %.0f ms CPU", TILE * GRID, TILE * GRID, GRID * GRID, cpuMs(job))
+end)
+
+----------------------------------------------------------------------------------------
+-- LOD cards: two stacked labels per card, driven by the zoom size
+----------------------------------------------------------------------------------------
+
+local function lodStage(card: Card): (ImageLabel, ImageLabel)
+	local coarse = imageLabel(card.body, nil, UDim2.fromOffset(36, 36))
+	local fine = imageLabel(card.body, nil, UDim2.fromOffset(36, 36))
+	for _, l in { coarse, fine } do
+		l.AnchorPoint = Vector2.new(0.5, 0.5)
+		l.Position = UDim2.fromScale(0.5, 0.5)
+	end
+	coarse.ZIndex = 1
+	fine.ZIndex = 2
+	return coarse, fine
+end
+
+local hardCoarse, hardFine = lodStage(hardCard)
+local fadeCoarse, fadeFine = lodStage(fadeCard)
+local lodBound = false
+
+local function bindLod()
+	if lodBound or not (sceneImg and lowImg) then
+		return
+	end
+	lodBound = true
+	for _, l in { hardCoarse, fadeCoarse } do
+		l.ImageContent = Content.fromObject(lowImg :: EditableImage)
+	end
+	for _, l in { hardFine, fadeFine } do
+		l.ImageContent = Content.fromObject(sceneImg :: EditableImage)
+	end
+end
+
+local function updateLod(t: number)
+	bindLod()
+	local size = Panels.zoomSize(t)
+	local f = Panels.lodBlend(size)
+	local dim = UDim2.fromOffset(size, size)
+	local hc, hf = Panels.hardSwitch(f)
+	local fc, ff = Panels.twoPhase(f)
+	hardCoarse.Size, hardFine.Size = dim, dim
+	fadeCoarse.Size, fadeFine.Size = dim, dim
+	hardCoarse.ImageTransparency, hardFine.ImageTransparency = hc, hf
+	fadeCoarse.ImageTransparency, fadeFine.ImageTransparency = fc, ff
+	hardCard.info.Text = string.format("shown at %3.0f px  |  %s level", size, if f < 0.5 then "64 px" else "512 px")
+	fadeCard.info.Text = string.format("shown at %3.0f px  |  fine %2.0f%%  coarse %2.0f%%", size, (1 - ff) * 100, (1 - fc) * 100)
+end
+
+----------------------------------------------------------------------------------------
+-- Main loop
+----------------------------------------------------------------------------------------
+
+local plasmaState = if plasmaImg then Panels.plasmaInit(192, 192) else nil
+local plasmaBuf = buffer.create(192 * 192 * 4)
+local plasmaFailed = false
+local plasmaComputeMs, plasmaUploadMs = 0, 0
+local fps, hudClock = 60, 0
+local started = os.clock()
+
+RunService.RenderStepped:Connect(function(dt: number)
+	local now = os.clock()
+	local t = now - started
+	if dt > 0 then
+		fps += (1 / dt - fps) * 0.08
+	end
+
+	-- live plasma: compute, then upload, each timed separately
+	local pImg = plasmaImg
+	if pImg and plasmaState and not plasmaFailed then
+		local ok, err = try(function()
+			local t0 = os.clock()
+			Panels.plasmaFrame(plasmaState, plasmaBuf, t)
+			local t1 = os.clock()
+			pImg:WritePixelsBuffer(Vector2.zero, Vector2.new(192, 192), plasmaBuf)
+			local t2 = os.clock()
+			plasmaComputeMs += ((t1 - t0) * 1000 - plasmaComputeMs) * 0.1
+			plasmaUploadMs += ((t2 - t1) * 1000 - plasmaUploadMs) * 0.1
+		end)
+		if not ok then
+			plasmaFailed = true
+			reportError("plasma frame", tostring(err))
+		end
+		plasmaCard.info.Text = string.format("compute %.2f ms  |  upload %.2f ms  per frame", plasmaComputeMs, plasmaUploadMs)
+	end
+
+	local okLod, errLod = try(function()
+		updateLod(t)
+	end)
+	if not okLod then
+		reportError("LOD", tostring(errLod))
+	end
+
+	cube.CFrame = CFrame.new(0, 9, -24) * CFrame.Angles(0.35, t * 0.6, 0.12)
+
+	runJobs(0.008)
+
+	hudClock += dt
+	if hudClock > 0.25 then
+		hudClock = 0
+		local total, tex = 0, 0
+		pcall(function()
+			total = Stats:GetTotalMemoryUsageMb()
+			tex = Stats:GetMemoryUsageMbForTag(Enum.DeveloperMemoryTag.GraphicsTexture)
+		end)
+		hud.Text = string.format(
+			"FPS %.0f   frame %.1f ms\nEditableImages alive: %d  (%.2f Mpx, %.1f MB as RGBA)\nClient memory %.0f MB   GraphicsTexture %.0f MB\nPanels still drawing: %d   Errors: %d\nG: hide or show panels",
+			fps,
+			1000 / math.max(fps, 1),
+			liveImages,
+			livePixels / 1e6,
+			livePixels * 4 / 1048576,
+			total,
+			tex,
+			#jobs,
+			#errors
+		)
+	end
+end)
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="Workspace" referent="8">
+    <Properties>
+      <string name="Name">Workspace</string>
+      <bool name="NeedsPivotMigration">false</bool>
+    </Properties>
+    <Item class="Part" referent="9">
+      <Properties>
+        <string name="Name">Baseplate</string>
+        <bool name="Anchored">true</bool>
+        <Color3uint8 name="Color3uint8">3364659</Color3uint8>
+        <token name="Material">1280</token>
+        <Vector3 name="Position">
+          <X>0</X>
+          <Y>-2</Y>
+          <Z>0</Z>
+        </Vector3>
+        <Vector3 name="size">
+          <X>512</X>
+          <Y>4</Y>
+          <Z>512</Z>
+        </Vector3>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>

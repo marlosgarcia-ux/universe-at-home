@@ -7,3 +7,5 @@ trace.json
 .scratch/
 .liquid_tmp/
 __pycache__/
+tools/.gallery_mock_combined.luau
+.gallery-sourcemap.json
