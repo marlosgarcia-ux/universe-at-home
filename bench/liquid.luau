@@ -138,8 +138,8 @@ local function noiseScene(): buffer
 	local img = buffer.create(SIZE * SIZE * 4)
 	for y = 0, SIZE - 1 do
 		for x = 0, SIZE - 1 do
-			local n1 = MyMath.fbm2(x / 96, y / 96, 11, 5)
-			local n2 = MyMath.fbm2(x / 64 + 17.3, y / 64 - 4.1, 23, 4)
+			local n1 = MyMath.fbm2(x / 24, y / 24, 11, 5)
+			local n2 = MyMath.fbm2(x / 16 + 17.3, y / 16 - 4.1, 23, 4)
 			local r = 60 + 170 * n1
 			local g = 40 + 120 * n2 + 50 * n1
 			local b = 30 + 90 * (1 - n1) * n2
@@ -470,6 +470,7 @@ local scenes = {
 }
 local reservoirs = {
 	{ name = "walsh[inst,0,-2]", scales = { INSTANT, 0, -2 } },
+	{ name = "walsh[inst,-2,-4]", scales = { INSTANT, -2, -4 } },
 }
 
 for _, sc in scenes do
@@ -493,10 +494,18 @@ for _, sc in scenes do
 		local tRef = minTime(math.min(RUNS, 2), function()
 			Liquid.reference(plan, tree, ref, SIZE, true)
 		end)
+		local refB = buffer.create(SIZE * SIZE * 4)
+		local tRefB = minTime(math.min(RUNS, 2), function()
+			Liquid.reference(plan, tree, refB, SIZE, true, nil, true)
+		end)
+		assert(buffer.tostring(refB) == buffer.tostring(ref), "band-deduplicated reference must equal the reference")
 		local p, mx = psnr(ref, img, SIZE * SIZE)
-		print(string.format("reservoir %s: fit %.1f s; model PSNR %.2f dB (max err %d); reference %.1f ms", rv.name, tFit, p, mx, tRef))
-		print("| epsilon | level | vertical | ms | speedup vs reference | rendered rows | events/row | evals/row | fill px % | max diff vs ref |")
-		print("|---|---|---|---|---|---|---|---|---|---|")
+		print(string.format(
+			"reservoir %s: fit %.1f s; model PSNR %.2f dB (max err %d); reference %.1f ms, reference with band copies %.1f ms",
+			rv.name, tFit, p, mx, tRef, tRefB
+		))
+		print("| epsilon | level | vertical | ms | speedup vs reference | vs reference with band copies | rendered rows | events/row | evals/row | fill % of rendered px | max diff vs ref |")
+		print("|---|---|---|---|---|---|---|---|---|---|---|")
 		for _, cfg in {
 			{ 0.5, 0, "box" },
 			{ 0, 0, "box" },
@@ -517,16 +526,17 @@ for _, sc in scenes do
 			end)
 			local md = if L == 0 then string.format("%d", maxDiff(out, ref, SIZE * SIZE)) else "-"
 			print(string.format(
-				"| %g | %d | %s | %.2f | %.1fx | %d | %.1f | %.1f | %.1f | %s |",
+				"| %g | %d | %s | %.2f | %.1fx | %s | %d | %.1f | %.1f | %.1f | %s |",
 				eps,
 				L,
 				vert,
 				ms,
 				tRef / ms,
+				if L == 0 then string.format("%.1fx", tRefB / ms) else "-",
 				st.rendered,
 				st.segments / math.max(st.rendered, 1),
 				st.evals / math.max(st.rendered, 1),
-				100 * st.fillPixels / (Wl * Wl),
+				100 * st.fillPixels / math.max(st.rendered * Wl, 1),
 				md
 			))
 		end

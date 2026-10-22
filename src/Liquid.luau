@@ -2665,9 +2665,14 @@ function Liquid.reference(plan: Plan, tree: Tree, out: buffer, outWidth: number,
 		end
 	end
 	local sc = getScratch(plan, W + 2)
-	for y = 0, H - 1 do
-		if fast then
-			local n = segmentStored(plan, tree, sc, y, 0, W, 0)
+	local y = 0
+	while y < H do
+		local bandEnd = y + 1
+		if fast or bands then
+			local n, be = segmentStored(plan, tree, sc, y, 0, W, 0)
+			if bands then
+				bandEnd = be
+			end
 			for s = 1, n do
 				for x = sc.sx[s], sc.sx[s] + sc.sl[s] - 1 do
 					segLeaf[x + 1] = sc.sleaf[s]
@@ -2686,6 +2691,10 @@ function Liquid.reference(plan: Plan, tree: Tree, out: buffer, outWidth: number,
 				buffer.writeu32(out2, rowAt + x * 4, packZ(zp, M, 4))
 			end
 		end
+		for yy = y + 1, bandEnd - 1 do
+			copyRow(out, out2, M, yy * outWidth * 4, rowAt, W * 4)
+		end
+		y = bandEnd
 	end
 end
 
