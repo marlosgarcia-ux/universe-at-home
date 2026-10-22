@@ -20,7 +20,10 @@ return {
 	-- FAR BODIES (billboards)
 	sphereCacheN = 128, -- texels per cube-face edge of the lookup cache; 256 = twice as sharp from orbit,
 	-- but each of the workers keeps ~10 MB (3 bodies); 128 = ~2.4 MB each
-	impostorMax = 512, -- largest billboard image (power of two, 32 to 1024); 1024 = 4 MB per body instead of 1 MB
+	impostorMax = 1024, -- largest billboard (power of two, 32 to 2048). Beyond 1024 a billboard is a
+	-- 2 x 2 grid of 1024 images (16 MB per body at 2048, uploaded over four frames). A full
+	-- 2048 render takes about 3 s across six interpreted workers; 1024 takes about 0.8 s.
+	exposure = 0.55, -- scene exposure before the filmic curve (lower = darker; black stays black)
 
 	-- SPACE
 	skyFace = 512, -- star skybox face size (up to 1024; 1024 = 24 MB instead of 6 MB)

@@ -6,27 +6,33 @@
 -- Raytraces a body into an EditableImage shown on a camera-facing BillboardGui. The
 -- billboard is a square of half-size `half` studs through the body's centre, spanned by
 -- the camera's right and up axes; pixel (x, y) is the ray from the camera through the
--- billboard point under it. Because every ray uses the true geometry, the silhouette,
--- phase, rings and atmosphere are exactly right for the current view, at any distance and
--- off-axis, and the billboard can be drawn nearer the camera at a reduced size (scaled
--- space) without changing the image.
+-- billboard point under it, so silhouette, phase, rings and atmosphere are exact for the
+-- current view at any distance, and the billboard can be drawn nearer the camera at a
+-- reduced size (scaled space) without changing the image.
 --
--- Exact anti-aliasing, the project's axioms applied to a sphere:
---   limb   the distance from the centre to the ray, d, minus the radius is a signed
---          distance in studs; divided by its per-pixel change (central differences of d
---          over neighbouring rays) it is a signed distance in pixels, and the disc's share
---          of the pixel is the exact area MyMath.coverageHalfPlane gives against the limb's
---          tangent line.
---   rings  the ring radius under the pixel spans an interval (its per-pixel change); the
---          ring's opacity and colour are the exact box filter of the profile over that
---          interval (Bodies.ringAt, prefix integrals). Gaps narrower than a pixel dim it by
---          their share instead of shimmering.
--- Lighting: Lambert on the cached normal with a soft terminator, Blinn-Phong glint on
--- smooth (water) texels, ring shadows on the planet, the planet's shadow on the rings,
--- clouds lit by the sphere normal, and an atmosphere rim lit on the day side.
+-- LIGHT. Everything is computed in linear radiance and tone mapped once at the end
+-- (Atmos.tonemap: exposure, ACES fit, sRGB; 0 stays exactly 0). Units: a Lambert surface
+-- of albedo A facing the unobstructed sun has radiance A.
+--   surface   A (T_sun(mu_s) max(0, n . s) + ambient(mu_s)): sunlight reddened by the air
+--             it crosses, so the terminator turns orange, and exactly nothing on the night
+--             side (the ambient table is exactly zero there)
+--   air       a ray that ends on the ground adds the tabulated in-scatter and dims the
+--             surface by the column's transmittance; a ray that grazes past the planet
+--             reads the limb table: the blue halo, the orange rim against the sun, Mie glare
+--   clouds    a shell above the surface, found by intersecting the ray with it (so clouds
+--             shift against the ground with the view, parallax), lit through the air at
+--             their height, self-shadowed by sampling the cloud field one step towards
+--             the sun, with a silver lining when backlit; they shadow the ground the same way
+--   rings     radii box-filtered exactly over the pixel (no shimmer in gaps), lit by the sun
+--             at the ring plane, exactly dark in the planet's shadow
+-- Exact anti-aliasing of the limb as before (MyMath.coverageHalfPlane on the distance
+-- from the centre to the ray). The image is premultiplied-composited back to front and
+-- written as straight alpha: planet coverage is the alpha of the disc; a faint halo has
+-- a small alpha so stars show through it.
 
 local Bodies = require("./Bodies")
 local SphereCache = require("./SphereCache")
+local Atmos = require("./Atmos")
 local MyMath = require("../Universe/MyMath")
 
 local Impostor = {}
@@ -48,17 +54,16 @@ export type Params = {
 	sy: number,
 	sz: number,
 	cloudAngle: number, -- cloud layer rotation about +Y (radians)
+	exposure: number?, -- default 1
+	cloudHeight: number?, -- studs above the surface (default 16)
 }
 
 local sqrt = math.sqrt
 local smoothstep = MyMath.smoothstep
 local coverageHalfPlane = MyMath.coverageHalfPlane
 local sample, cloudAt = SphereCache.sample, SphereCache.cloud
-
-local function byte(v: number): number
-	local q = (v * 255 + 0.5) // 1
-	return if q < 0 then 0 elseif q > 255 then 255 else q
-end
+local tonemap = Atmos.tonemap
+local hash2 = MyMath.hash2
 
 -- Half-size (studs) of the billboard that contains the body plus `extra` radii (atmosphere,
 -- rings) seen from distance D: the tangent cone of that sphere crosses the billboard plane
@@ -78,6 +83,11 @@ function Impostor.halfSize(radius: number, extra: number, D: number, n: number?)
 	return r * D / sqrt(D * D - r * r) * margin
 end
 
+local function byteOf(v: number): number
+	local q = (v * 255 + 0.5) // 1
+	return if q < 0 then 0 elseif q > 255 then 255 else q
+end
+
 -- Renders rows [y0, y1) of the n x n image into `out` (RGBA8, straight alpha). With
 -- `bandStart`, `out` holds only a band of rows starting at that row (worker jobs return
 -- bands); otherwise it is the whole image.
@@ -85,21 +95,26 @@ function Impostor.render(out: buffer, p: Params, cache: SphereCache.Cache?, y0: 
 	local base = bandStart or 0
 	local B = Bodies.get(p.body)
 	local R = B.radius
+	local A = Atmos.get(p.body)
 	local n = p.n
 	local cx, cy, cz = p.cx, p.cy, p.cz
 	local rx, ry, rz, ux, uy, uz = p.rx, p.ry, p.rz, p.ux, p.uy, p.uz
 	local half = p.half
 	local sx, sy, sz = p.sx, p.sy, p.sz
+	local exposure = p.exposure or 1
 	local cc = cx * cx + cy * cy + cz * cz
 	local c2 = cc - R * R
-	local atm = B.atmosphere
-	local Ra = if atm then R * (1 + atm.thickness) else R
+	local Rt = if A then A.Rt else R
 	local rings = B.rings
 	local terra = p.body == "terra"
+	local gas = B.kind == "gas"
 	local cosA, sinA = math.cos(p.cloudAngle), math.sin(p.cloudAngle)
-	local pix = 2 * half / n -- billboard pixel size (studs)
+	local pix = 2 * half / n
+	local hC = p.cloudHeight or 16
+	local Rc = R + hC
+	local useClouds = terra and cache ~= nil
+	local hasSea = B.sea
 
-	-- direction of the ray through pixel centre (x + 0.5, y + 0.5)
 	local function ray(x: number, y: number): (number, number, number)
 		local qx = ((x + 0.5) / n * 2 - 1) * half
 		local qy = (1 - (y + 0.5) / n * 2) * half
@@ -109,40 +124,15 @@ function Impostor.render(out: buffer, p: Params, cache: SphereCache.Cache?, y0: 
 		local l = sqrt(dx * dx + dy * dy + dz * dz)
 		return dx / l, dy / l, dz / l
 	end
-	-- distance from the centre to the ray's line
 	local function perp(dx: number, dy: number, dz: number): number
 		local b = cx * dx + cy * dy + cz * dz
 		local q = cc - b * b
 		return if q > 0 then sqrt(q) else 0
 	end
-	-- ring radius (body radii) where the ray crosses the ring plane, or -1
 	local nrx, nry, nrz = 0, 1, 0
 	if rings then
 		nrx, nry, nrz = rings.nx, rings.ny, rings.nz
 	end
-	-- Atmosphere brightness 0..1 for a ray passing at distance d from the centre: density
-	-- (1 - altitude / thickness) integrated along the chord through the shell (both sides of
-	-- the closest approach for a ray that misses, the near side only for one that hits),
-	-- normalised so the grazing ray is 1, then saturated as 1 - 1 / (1 + 3 tau).
-	local Ra2, R2 = Ra * Ra, R * R
-	local norm = if atm then 2 * sqrt(Ra2 - R2) * 0.5 else 1
-	local function atmGlow(d: number, hits: boolean): number
-		if not atm then
-			return 0
-		end
-		local d2 = d * d
-		local outer = if Ra2 > d2 then sqrt(Ra2 - d2) else 0
-		local inner = if R2 > d2 then sqrt(R2 - d2) else 0
-		-- mean density along the chord is about (1 - (d - R) / (Ra - R)) / 2 for a miss
-		local path = if hits then outer - inner else 2 * outer
-		local alt = (d - R) / (Ra - R)
-		if alt < 0 then
-			alt = 0
-		end
-		local tau = path / norm * (1 - alt) * 0.5
-		return (1 - 1 / (1 + 3 * tau)) * atm.strength
-	end
-
 	local function ringHit(dx: number, dy: number, dz: number): (number, number)
 		local den = dx * nrx + dy * nry + dz * nrz
 		if den > -1e-12 and den < 1e-12 then
@@ -155,36 +145,30 @@ function Impostor.render(out: buffer, p: Params, cache: SphereCache.Cache?, y0: 
 		local qx, qy, qz = cx + dx * t, cy + dy * t, cz + dz * t
 		return sqrt(qx * qx + qy * qy + qz * qz) / R, t
 	end
+	-- cloud cover at a unit direction of the (rotating) shell
+	local function cloudCover(hx: number, hy: number, hz: number): number
+		local qx = hx * cosA - hz * sinA
+		local qz = hx * sinA + hz * cosA
+		return cloudAt(cache :: SphereCache.Cache, qx, hy, qz)
+	end
 
 	for y = y0, y1 - 1 do
 		for x = 0, n - 1 do
 			local dx, dy, dz = ray(x, y)
 			local b = cx * dx + cy * dy + cz * dz
 			local d0 = perp(dx, dy, dz)
-			-- premultiplied accumulation, back to front
-			local ar, ag, ab, aa = 0, 0, 0, 0
-			local disc = b * b - c2
 			local tHit = math.huge
-			if disc >= 0 then
+			local disc = b * b - c2
+			if disc >= 0 and b < 0 then
 				local t = -b - sqrt(disc)
 				if t > 0 then
 					tHit = t
 				end
 			end
-			-- planet coverage of the pixel (exact area against the limb's tangent line)
-			local cov = if tHit < math.huge then 1 else 0
-			if d0 - R < 3 * pix and R - d0 < 3 * pix and b < 0 then
-				local ex, ey, ez = ray(x + 1, y)
-				local fx, fy, fz = ray(x, y + 1)
-				local gx = perp(ex, ey, ez) - d0
-				local gy = perp(fx, fy, fz) - d0
-				local g = sqrt(gx * gx + gy * gy)
-				if g > 1e-12 then
-					cov = coverageHalfPlane((d0 - R) / g, gx / g, gy / g)
-				end
-			end
-			-- rings: hit, footprint, box-filtered profile
-			local ringA, ringR, ringG, ringB, ringT = 0, 0, 0, 0, 0
+			local hits = tHit < math.huge
+			-- anything here at all? (the planet, its air, its clouds, its rings)
+			local near = d0 < Rt + 2 * pix or d0 < Rc + 2 * pix
+			local ringR, ringG, ringB, ringA, ringT = 0, 0, 0, 0, 0
 			if rings then
 				local rr, t = ringHit(dx, dy, dz)
 				if rr > 0 and rr > rings.inner - 0.1 and rr < rings.outer + 0.1 then
@@ -197,12 +181,12 @@ function Impostor.render(out: buffer, p: Params, cache: SphereCache.Cache?, y0: 
 					if dens > 0 then
 						local qx, qy, qz = cx + dx * t, cy + dy * t, cz + dz * t
 						local ndl = nrx * sx + nry * sy + nrz * sz
-						local lit = 0.22 + 0.78 * math.abs(ndl)
-						-- the planet's shadow on the rings
+						local lit = 0.18 + 0.82 * math.abs(ndl)
+						-- the planet's shadow on the rings: exactly dark
 						local bq = qx * sx + qy * sy + qz * sz
 						local cq = qx * qx + qy * qy + qz * qz - R * R
 						if bq < 0 and bq * bq - cq > 0 then
-							lit *= 0.07
+							lit = 0
 						end
 						ringA = dens * 0.95
 						ringR, ringG, ringB = cr * lit, cg * lit, cb * lit
@@ -210,121 +194,222 @@ function Impostor.render(out: buffer, p: Params, cache: SphereCache.Cache?, y0: 
 					end
 				end
 			end
-			local ringFront = ringA > 0 and ringT < tHit
-			if ringA > 0 and not ringFront then
-				ar, ag, ab, aa = ringR * ringA, ringG * ringA, ringB * ringA, ringA
-			end
-			-- atmosphere around the limb: light scattered along the ray's path through the
-			-- shell, weighted by density (falling linearly with altitude) and lit by the
-			-- sun at the ray's closest approach
-			if atm and d0 < Ra and b < 0 and cov < 1 then
-				local glow = atmGlow(d0, false)
-				local px, py, pz = cx + dx * -b, cy + dy * -b, cz + dz * -b
-				local pl = sqrt(px * px + py * py + pz * pz)
-				local sdl = if pl > 0 then (px * sx + py * sy + pz * sz) / pl else 0
-				glow *= smoothstep(-0.3, 0.35, sdl)
-				local ga = glow * (1 - cov)
-				ar = atm.r * ga + ar * (1 - ga)
-				ag = atm.g * ga + ag * (1 - ga)
-				ab = atm.b * ga + ab * (1 - ga)
-				aa = ga + aa * (1 - ga)
-			end
-			-- the planet
-			if cov > 0 then
-				-- surface point: the hit, or the closest approach for limb pixels whose centre misses
-				local px, py, pz
-				if tHit < math.huge then
-					px, py, pz = cx + dx * tHit, cy + dy * tHit, cz + dz * tHit
-				else
-					px, py, pz = cx - dx * b, cy - dy * b, cz - dz * b
+			local pr, pg, pb, pa = 0, 0, 0, 0 -- premultiplied display colour and alpha so far
+			if near or ringA > 0 then
+				local t0 = -b -- parameter of the closest approach
+				-- ---- the planet disc (exact coverage) and its air
+				local cov = if hits then 1 else 0
+				if d0 - R < 3 * pix and R - d0 < 3 * pix and b < 0 then
+					local ex, ey, ez = ray(x + 1, y)
+					local fx, fy, fz = ray(x, y + 1)
+					local gx = perp(ex, ey, ez) - d0
+					local gy = perp(fx, fy, fz) - d0
+					local g = sqrt(gx * gx + gy * gy)
+					if g > 1e-12 then
+						cov = coverageHalfPlane((d0 - R) / g, gx / g, gy / g)
+					end
 				end
-				local pl = sqrt(px * px + py * py + pz * pz)
-				local hx, hy, hz = px / pl, py / pl, pz / pl
-				local alr, alg, alb, rough, nx, ny, nz = 0.5, 0.5, 0.5, 0.9, hx, hy, hz
-				if cache then
-					alr, alg, alb, rough, nx, ny, nz = sample(cache, hx, hy, hz)
+				-- ring behind the body (farther than the closest approach)
+				local ringBehind = ringA > 0 and ringT >= t0
+				local backR, backG, backB, backA = 0, 0, 0, 0
+				if ringBehind then
+					local ar, ag, ab = tonemap(ringR, ringG, ringB, exposure)
+					backR, backG, backB, backA = ar * ringA, ag * ringA, ab * ringA, ringA
 				end
-				local sdl = hx * sx + hy * sy + hz * sz
-				local term = smoothstep(-0.06, 0.1, sdl)
-				local ndl = nx * sx + ny * sy + nz * sz
-				local diffuse = (if ndl > 0 then ndl else 0) * term
-				-- ring shadow on the planet
-				if rings then
-					local den = sx * nrx + sy * nry + sz * nrz
-					if den > 1e-9 or den < -1e-9 then
-						local t = -(px * nrx + py * nry + pz * nrz) / den
-						if t > 0 then
-							local qx, qy, qz = px + sx * t, py + sy * t, pz + sz * t
-							local rr = sqrt(qx * qx + qy * qy + qz * qz) / R
-							local dens = Bodies.ringAt(rings, rr, rr)
-							diffuse *= 1 - 0.85 * dens
+				local planetR, planetG, planetB = 0, 0, 0
+				-- clouds: the ray against the shell at R + hC
+				local cl, clR, clG, clB = 0, 0, 0, 0
+				if useClouds and d0 < Rc and b < 0 then
+					local dcl = Rc * Rc - d0 * d0
+					local tc = -b - sqrt(dcl)
+					if tc > 0 and (not hits or tc < tHit) then
+						local qx, qy, qz = (cx + dx * tc) / Rc, (cy + dy * tc) / Rc, (cz + dz * tc) / Rc
+						local cover = cloudCover(qx, qy, qz)
+						if cover > 0.01 then
+							local mus = qx * sx + qy * sy + qz * sz
+							local tr, tg, tb = 1, 1, 1
+							if A then
+								tr, tg, tb = Atmos.sunlight(A, hC, mus)
+							elseif mus <= 0 then
+								tr, tg, tb = 0, 0, 0
+							end
+							-- soft self shading from the cover gradient along the sun: a neighbour one
+							-- texel towards the sun with less cover means a lit, sun-facing edge; with
+							-- more cover, a shadowed one
+							local stx, sty, stz = sx - qx * mus, sy - qy * mus, sz - qz * mus
+							local sl = 0.02 / (if mus > 0.25 then mus else 0.25)
+							local kx, ky, kz = qx + stx * sl, qy + sty * sl, qz + stz * sl
+							local kl = sqrt(kx * kx + ky * ky + kz * kz)
+							local cs = cloudCover(kx / kl, ky / kl, kz / kl)
+							local shade = 0.92 + 0.9 * (cover - cs)
+							if shade < 0.4 then
+								shade = 0.4
+							elseif shade > 1.1 then
+								shade = 1.1
+							end
+							local lit = smoothstep(-0.1, 0.35, mus) * shade
+							-- silver lining: forward scattering through thin cloud edges
+							local cosv = -(dx * sx + dy * sy + dz * sz)
+							local fwd = if cosv > 0 then cosv ^ 6 else 0
+							local silver = 0.9 * fwd * (1 - cover) * smoothstep(-0.05, 0.3, mus)
+							local ar, ag, ab = 0, 0, 0
+							if A then
+								ar, ag, ab = Atmos.ambient(A, mus)
+							end
+							local k = 0.95
+							clR = k * (tr * (lit + silver) + ar * 0.8)
+							clG = k * (tg * (lit + silver) + ag * 0.8)
+							clB = k * (tb * (lit + silver) + ab * 0.8)
+							cl = cover * 0.97
 						end
 					end
 				end
-				local amb = 0.018
-				local cr = alr * (amb + diffuse * 1.05)
-				local cg = alg * (amb + diffuse * 1.05)
-				local cb = alb * (amb + diffuse * 1.05)
-				-- limb darkening for gas giants
-				local mu = -(hx * dx + hy * dy + hz * dz)
-				if B.kind == "gas" then
-					local ld = 0.55 + 0.45 * mu
-					cr, cg, cb = cr * ld, cg * ld, cb * ld
+				-- the air for rays that miss the planet (the halo), including limb pixels
+				local mr, mg, mb = 0, 0, 0
+				if A and d0 < Rt and b < 0 then
+					local dd = if d0 < R + 0.001 then R + 0.001 else d0
+					local qx, qy, qz = cx - dx * b, cy - dy * b, cz - dz * b
+					local ql = sqrt(qx * qx + qy * qy + qz * qz)
+					local a = dx * sx + dy * sy + dz * sz
+					local bs = if ql > 1e-9 then (qx * sx + qy * sy + qz * sz) / ql else 0
+					mr, mg, mb = Atmos.lookMiss(A, dd, a, bs)
 				end
-				-- glint on smooth texels (Blinn-Phong, exponent 64 by squaring)
-				local gloss = 1 - rough
-				if gloss > 0.5 and diffuse > 0 then
-					local hvx, hvy, hvz = sx - dx, sy - dy, sz - dz
-					local hl = sqrt(hvx * hvx + hvy * hvy + hvz * hvz)
-					local nh = (nx * hvx + ny * hvy + nz * hvz) / hl
-					if nh > 0 then
-						local s2 = nh * nh
-						local s4 = s2 * s2
-						local s8 = s4 * s4
-						local s16 = s8 * s8
-						local s32 = s16 * s16
-						local spec = s32 * s32 * (gloss - 0.5) * 2 * 0.9 * term
-						cr += spec
-						cg += spec * 0.97
-						cb += spec * 0.9
+				-- ---- the planet's own surface
+				if cov > 0 then
+					local px, py, pz
+					if hits then
+						px, py, pz = cx + dx * tHit, cy + dy * tHit, cz + dz * tHit
+					else
+						px, py, pz = cx - dx * b, cy - dy * b, cz - dz * b
 					end
-				end
-				-- clouds, lit by the sphere normal
-				if terra and cache then
-					local qx = hx * cosA - hz * sinA
-					local qz = hx * sinA + hz * cosA
-					local cl = cloudAt(cache, qx, hy, qz)
+					local pl = sqrt(px * px + py * py + pz * pz)
+					local hx, hy, hz = px / pl, py / pl, pz / pl
+					local alr, alg, alb, rough, nx, ny, nz = 0.5, 0.5, 0.5, 0.9, hx, hy, hz
+					if cache then
+						alr, alg, alb, rough, nx, ny, nz = sample(cache, hx, hy, hz)
+					end
+					local mus = hx * sx + hy * sy + hz * sz
+					local mu = -(hx * dx + hy * dy + hz * dz)
+					if mu < 0.001 then
+						mu = 0.001
+					end
+					-- light reaching the ground
+					local er, eg, eb = 1, 1, 1
+					local amr, amg, amb = 0, 0, 0
+					if A then
+						er, eg, eb = Atmos.sunlight(A, 0, mus)
+						amr, amg, amb = Atmos.ambient(A, mus)
+					elseif mus <= 0 then
+						er, eg, eb = 0, 0, 0
+					end
+					local ndl = nx * sx + ny * sy + nz * sz
+					if ndl < 0 then
+						ndl = 0
+					end
+					-- cloud shadow on the ground: the cover where the sun's ray crosses the shell
+					if useClouds and mus > 0.05 then
+						local kx, ky, kz = hx + (sx - hx * mus) * (hC / R) / mus, hy + (sy - hy * mus) * (hC / R) / mus, hz + (sz - hz * mus) * (hC / R) / mus
+						local kl = sqrt(kx * kx + ky * ky + kz * kz)
+						local sh = cloudCover(kx / kl, ky / kl, kz / kl)
+						ndl *= 1 - 0.78 * sh
+					end
+					local Lr = alr * (er * ndl + amr)
+					local Lg = alg * (eg * ndl + amg)
+					local Lb = alb * (eb * ndl + amb)
+					-- glint on smooth texels (water), Blinn-Phong exponent 64
+					local gloss = 1 - rough
+					if hasSea and gloss > 0.5 and ndl > 0 then
+						local hvx, hvy, hvz = sx - dx, sy - dy, sz - dz
+						local hl = sqrt(hvx * hvx + hvy * hvy + hvz * hvz)
+						local nh = (nx * hvx + ny * hvy + nz * hvz) / hl
+						if nh > 0 then
+							local s2 = nh * nh
+							local s4 = s2 * s2
+							local s8 = s4 * s4
+							local s16 = s8 * s8
+							local s32 = s16 * s16
+							local spec = s32 * s32 * (gloss - 0.5) * 2 * 0.9
+							Lr += spec * er
+							Lg += spec * eg
+							Lb += spec * eb
+						end
+					end
+					if gas then
+						local ld = 0.55 + 0.45 * mu
+						Lr, Lg, Lb = Lr * ld, Lg * ld, Lb * ld
+					end
+					-- clouds over the ground (parallax: they came from the shell hit above)
 					if cl > 0 then
-						local light = amb + 1.0 * (if sdl > 0 then sdl else 0) * term
-						cr += (light - cr) * cl * 0.95
-						cg += (light - cg) * cl * 0.95
-						cb += (light - cb) * cl * 0.95
+						Lr = clR * cl + Lr * (1 - cl)
+						Lg = clG * cl + Lg * (1 - cl)
+						Lb = clB * cl + Lb * (1 - cl)
+					end
+					-- through the air to the camera
+					if A then
+						local tr, tg, tb = Atmos.columnT(A, mu)
+						local ir, ig, ib = Atmos.lookHit(A, mu, mus, dx * sx + dy * sy + dz * sz)
+						Lr = Lr * tr + ir
+						Lg = Lg * tg + ig
+						Lb = Lb * tb + ib
+					end
+					planetR, planetG, planetB = tonemap(Lr, Lg, Lb, exposure)
+				end
+				-- ---- the uncovered part of the pixel: the ring behind, the halo over it, then
+				-- clouds beyond the limb (a halo is an emission of opacity max(rgb): stars show
+				-- through a faint one)
+				local rest = 1 - cov
+				local restR, restG, restB, restA = backR, backG, backB, backA
+				if rest > 0 then
+					if A and d0 < Rt then
+						local hr, hg, hb = tonemap(mr, mg, mb, exposure)
+						local ha = math.max(hr, hg, hb)
+						if ha > 0 then
+							restR = hr + (1 - ha) * restR
+							restG = hg + (1 - ha) * restG
+							restB = hb + (1 - ha) * restB
+							restA = ha + (1 - ha) * restA
+						end
+					end
+					if cl > 0 and not hits then
+						local ar, ag, ab = tonemap(clR, clG, clB, exposure)
+						restR = ar * cl + (1 - cl) * restR
+						restG = ag * cl + (1 - cl) * restG
+						restB = ab * cl + (1 - cl) * restB
+						restA = cl + (1 - cl) * restA
 					end
 				end
-				-- atmospheric haze: the same path model for a ray that ends on the surface
-				if atm then
-					local haze = atmGlow(if d0 < R then d0 else R, true) * smoothstep(-0.3, 0.35, sdl)
-					cr += (atm.r - cr) * haze
-					cg += (atm.g - cg) * haze
-					cb += (atm.b - cb) * haze
+				pr = planetR * cov + restR * rest
+				pg = planetG * cov + restG * rest
+				pb = planetB * cov + restB * rest
+				pa = cov + restA * rest
+				-- ring in front of the body
+				if ringA > 0 and not ringBehind then
+					local ar, ag, ab = tonemap(ringR, ringG, ringB, exposure)
+					pr = ar * ringA + pr * (1 - ringA)
+					pg = ag * ringA + pg * (1 - ringA)
+					pb = ab * ringA + pb * (1 - ringA)
+					pa = ringA + pa * (1 - ringA)
 				end
-				ar = cr * cov + ar * (1 - cov)
-				ag = cg * cov + ag * (1 - cov)
-				ab = cb * cov + ab * (1 - cov)
-				aa = cov + aa * (1 - cov)
-			end
-			if ringFront then
-				ar = ringR * ringA + ar * (1 - ringA)
-				ag = ringG * ringA + ag * (1 - ringA)
-				ab = ringB * ringA + ab * (1 - ringA)
-				aa = ringA + aa * (1 - ringA)
 			end
 			local o = ((y - base) * n + x) * 4
-			if aa <= 0 then
+			if pa <= 0 then
 				buffer.writeu32(out, o, 0)
 			else
-				local inv = 1 / aa
-				buffer.writeu32(out, o, byte(ar * inv) + byte(ag * inv) * 256 + byte(ab * inv) * 65536 + byte(aa) * 16777216)
+				-- straight alpha; one least-significant-bit of dither on non-zero values so
+				-- dark glows do not band (zero stays exactly zero)
+				local inv = 1 / pa
+				local dth = (hash2(x, y, 977) / 4294967296 - 0.5) / 255
+				local r, g, bl = pr * inv, pg * inv, pb * inv
+				if r > 0 then
+					r += dth
+				end
+				if g > 0 then
+					g += dth
+				end
+				if bl > 0 then
+					bl += dth
+				end
+				buffer.writeu32(out, o, byteOf(r) + byteOf(g) * 256 + byteOf(bl) * 65536 + byteOf(pa) * 16777216)
 			end
 		end
 	end

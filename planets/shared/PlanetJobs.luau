@@ -19,6 +19,7 @@ local SphereCache = require("./SphereCache")
 local Impostor = require("./Impostor")
 local SkyGen = require("./SkyGen")
 local Clouds = require("./Clouds")
+local Atmos = require("./Atmos")
 
 type State = { [string]: any }
 
@@ -57,6 +58,49 @@ Jobs.impostor = {
 		local band = buffer.create(rows * p.n * 4)
 		Impostor.render(band, p, cache, payload.y0, payload.y1, payload.y0)
 		return { y0 = payload.y0, y1 = payload.y1, n = p.n, band = band, cached = cache ~= nil }
+	end,
+}
+
+-- Atmosphere tables (planets/shared/Atmos): slices of the two big scattering tables, the
+-- small tables, and the install in a worker. The optical-depth table is rebuilt once per
+-- worker and body (cheap) and kept in the worker's state.
+local function atmosModel(state: State, body: string, quality: number): any
+	local cache = state.atmosShapes
+	if not cache then
+		cache = {}
+		state.atmosShapes = cache
+	end
+	local key = body .. "/" .. quality
+	local M = cache[key]
+	if not M then
+		local spec = Atmos.specFor(body)
+		assert(spec, "no atmosphere for " .. body)
+		M = Atmos.new(spec, quality)
+		cache[key] = M
+	end
+	return M
+end
+
+Jobs.atmosSlice = {
+	parallel = function(payload: any, state: State): any
+		local M = atmosModel(state, payload.body, payload.quality)
+		if payload.kind == "miss" then
+			return Atmos.buildMiss(M, payload.i0, payload.i1)
+		end
+		return Atmos.buildHit(M, payload.i0, payload.i1)
+	end,
+}
+
+Jobs.atmosSmall = {
+	parallel = function(payload: any, state: State): any
+		local M = atmosModel(state, payload.body, payload.quality)
+		return { chord = Atmos.buildChord(M), amb = Atmos.buildAmbient(M) }
+	end,
+}
+
+Jobs.setAtmos = {
+	parallel = function(payload: any, state: State): any
+		return Atmos.installFor(payload.body, payload.quality, payload.miss, payload.chord, payload.hit, payload.amb)
 	end,
 }
 

@@ -26,7 +26,7 @@ def main(path):
         if not cond:
             failures.append(msg)
 
-    shared = ["Config", "Layout", "Noise3", "CubeSphere", "Bodies", "TileGen", "Quadtree", "SphereCache",
+    shared = ["Config", "Atmos", "Layout", "Noise3", "CubeSphere", "Bodies", "TileGen", "Quadtree", "SphereCache",
               "Impostor", "SkyGen", "Clouds", "PlanetJobs", "WorkerPool", "WorkerMain"]
     client = ["Uploader", "MeshPool", "PlanetLod", "Impostors", "Sky", "CloudLayer", "Flight", "Hud", "Workers"]
     wanted = [("ReplicatedStorage.Universe.MyMath", "ModuleScript")]

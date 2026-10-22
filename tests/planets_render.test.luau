@@ -202,4 +202,84 @@ do
 	check(centre // 16777216 == 255 and corner // 16777216 == 0, "sun sprite: opaque core, transparent corners")
 end
 
+-- 6. atmosphere in the impostor: true black on the night side, a warm terminator, and the
+-- billboard border stays transparent with the halo drawn
+do
+	local Atmos = require("../planets/shared/Atmos")
+	local M = Atmos.new(Atmos.terra(), 0.7)
+	Atmos.buildAll(M)
+	Atmos.models.terra = M
+	local C = SphereCache.build("terra", 48)
+	local N = 96
+	local function renderTerra(cx: number, cy: number, cz: number, sx: number, sy: number, sz: number): (buffer, Impostor.Params)
+		local p = params("terra", cx, cy, cz, N, 1.14)
+		p.sx, p.sy, p.sz = sx, sy, sz
+		local out = buffer.create(N * N * 4)
+		Impostor.render(out, p, C, 0, N)
+		return out, p
+	end
+	-- the sun behind the planet: the visible hemisphere is in night
+	local out, p = renderTerra(0, 0, 4000, 0, 0, -1)
+	local Rb = Bodies.get("terra").radius
+	local blackOk, interior, lit = true, 0, 0
+	for y = 0, N - 1 do
+		for x = 0, N - 1 do
+			-- distance from the image centre relative to the disc
+			local qx = ((x + 0.5) / N * 2 - 1) * p.half
+			local qy = (1 - (y + 0.5) / N * 2) * p.half
+			local d = sqrt(qx * qx + qy * qy)
+			if d < 0.8 * Rb then
+				interior += 1
+				local c = buffer.readu32(out, (y * N + x) * 4)
+				if c ~= 4278190080 then
+					blackOk = false
+					lit += 1
+				end
+			end
+		end
+	end
+	check(interior > 1000 and blackOk, string.format("night side is exactly black, opaque (%d of %d pixels not 0,0,0,255)", lit, interior))
+	-- the terminator: sun along +x, camera on +z. Sunlight crossing the long slant path is
+	-- redder than sunlight near the sub-solar point; compare red / blue of land near the
+	-- terminator (just right of the centre) with the middle of the lit side
+	local out2, p2 = renderTerra(0, 0, 4000, 1, 0, 0.02)
+	local function redBlue(x0: number, x1: number): number
+		local r, b = 0, 0
+		for y = 20, N - 21 do
+			for x = x0, x1 do
+				local c = buffer.readu32(out2, (y * N + x) * 4)
+				r += c % 256
+				b += (c // 65536) % 256
+			end
+		end
+		return r / math.max(b, 1)
+	end
+	local near = redBlue(N // 2 + 1, N // 2 + 4)
+	local far = redBlue(N // 2 + 14, N // 2 + 20)
+	check(near > far, string.format("light near the terminator is redder than mid-day light (r/b %.2f vs %.2f)", near, far))
+	check(p2.half > 0, "second view built")
+	-- the border is transparent with the halo, from several views and suns
+	for _, v in { { 0, 0, 4000, 0.6, 0.3, 0.7 }, { 2600, 900, 1900, -0.4, 0.2, 0.9 }, { 900, -300, 6000, 0, 0, -1 } } do
+		local o, pp = renderTerra(v[1] :: number, v[2] :: number, v[3] :: number, v[4] :: number, v[5] :: number, v[6] :: number)
+		local border = 0
+		for k = 0, N - 1 do
+			for _, idx in { k, (N - 1) * N + k, k * N, k * N + N - 1 } do
+				border = math.max(border, buffer.readu32(o, idx * 4) // 16777216)
+			end
+		end
+		check(border <= 3, string.format("halo stays inside the billboard (border alpha %d, half %.0f)", border, pp.half))
+	end
+	-- a faint halo lets stars through: some limb-adjacent pixel has partial alpha
+	local partial = 0
+	local o3 = renderTerra(0, 0, 4000, 0.5, 0.2, 0.8)
+	for i = 0, N * N - 1 do
+		local a = buffer.readu32(o3, i * 4) // 16777216
+		if a > 4 and a < 250 then
+			partial += 1
+		end
+	end
+	check(partial > 60, string.format("a halo of partial opacity surrounds the disc (%d pixels)", partial))
+	Atmos.models.terra = nil :: any
+end
+
 print("planets_render: " .. checks .. " checks passed")

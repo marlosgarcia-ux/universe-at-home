@@ -500,7 +500,7 @@ local terra: Body = {
 	maxHeight = 90,
 	sea = true,
 	fields = fields(11, 6),
-	atmosphere = { r = 0.36, g = 0.62, b = 1.0, thickness = 0.065, strength = 1.0 },
+	atmosphere = { r = 0.36, g = 0.62, b = 1.0, thickness = 0.081, strength = 1.0 }, -- thickness = Atmos.terra().H / radius
 	rings = nil,
 	coarse = terraCoarse,
 	height = terraHeight,
@@ -542,7 +542,7 @@ local saturnia: Body = {
 	maxHeight = 0,
 	sea = false,
 	fields = fields(37, 1),
-	atmosphere = { r = 0.95, g = 0.85, b = 0.65, thickness = 0.025, strength = 0.6 },
+	atmosphere = { r = 0.95, g = 0.85, b = 0.65, thickness = 0.0375, strength = 0.6 }, -- Atmos.saturnia().H / radius
 	rings = buildRings(37),
 	coarse = gasCoarse,
 	height = gasHeight,

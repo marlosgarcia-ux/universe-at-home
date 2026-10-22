@@ -9,6 +9,7 @@ local SphereCache = require("../planets/shared/SphereCache")
 local Bodies = require("../planets/shared/Bodies")
 local SkyGen = require("../planets/shared/SkyGen")
 local Clouds = require("../planets/shared/Clouds")
+local Atmos = require("../planets/shared/Atmos")
 
 local only = ...
 
@@ -42,7 +43,9 @@ local function normalize(x, y, z)
 	return x / l, y / l, z / l
 end
 
-local function view(id: string, distance: number, azimuth: number, elevation: number, sun: { number }, n: number)
+local EXPOSURE = 0.55
+
+local function view(id: string, distance: number, azimuth: number, elevation: number, sun: { number }, n: number, tag: string?)
 	local B = Bodies.get(id)
 	local D = B.radius * distance
 	local ce = math.cos(math.rad(elevation))
@@ -57,6 +60,9 @@ local function view(id: string, distance: number, azimuth: number, elevation: nu
 	local half = Impostor.halfSize(B.radius, extra, D)
 	local sx, sy, sz = normalize(sun[1], sun[2], sun[3])
 	local t0 = os.clock()
+	Atmos.ensure(id)
+	print(string.format("TIME %s: atmosphere tables %.0f ms", id, (os.clock() - t0) * 1000))
+	t0 = os.clock()
 	local cache = SphereCache.build(id, 96)
 	local tc = os.clock() - t0
 	local out = buffer.create(n * n * 4)
@@ -78,13 +84,18 @@ local function view(id: string, distance: number, azimuth: number, elevation: nu
 		sy = sy,
 		sz = sz,
 		cloudAngle = 0.3,
+		exposure = EXPOSURE,
 	}, cache, 0, n)
 	print(string.format("TIME %s: cache %.0f ms, impostor %dx%d %.0f ms", id, tc * 1000, n, n, (os.clock() - t0) * 1000))
-	dump("impostor_" .. id, onBackdrop(out, n), n, n)
+	dump("impostor_" .. id .. (tag or ""), onBackdrop(out, n), n, n)
 end
 
 if only == nil or only == "terra" then
 	view("terra", 3.2, 25, 12, { 1, 0.35, 0.55 }, 320)
+end
+if only == nil or only == "terra2" then
+	view("terra", 3.2, 25, 12, { -0.9, 0.1, 0.45 }, 320, "_dusk")
+	view("terra", 3.2, 25, 12, { -0.5, 0.2, -0.85 }, 320, "_night")
 end
 if only == nil or only == "selene" then
 	view("selene", 3.5, 20, 5, { 1, 0.25, 0.35 }, 256)

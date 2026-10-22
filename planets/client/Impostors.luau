@@ -30,13 +30,19 @@ local Uploader = require(script.Parent:WaitForChild("Uploader"))
 
 local Impostors = {}
 
-local MAX_N: number = require(Planets:WaitForChild("Config")).impostorMax
+local Config = require(Planets:WaitForChild("Config"))
+local Atmos = require(Planets:WaitForChild("Atmos"))
+local MAX_N: number = Config.impostorMax -- up to 2048: beyond 1024 a billboard is a 2 x 2 grid of images
+local TILE_MAX = 1024
 local BAND = 32
 
 export type Item = {
 	def: any,
 	img: EditableImage?,
 	entry: Uploader.Entry?,
+	images: { EditableImage }, -- 1 image, or 4 tiles once the billboard goes beyond 1024
+	entries: { Uploader.Entry },
+	labels: { ImageLabel },
 	anchor: Part,
 	gui: BillboardGui,
 	label: ImageLabel,
@@ -60,6 +66,7 @@ export type Manager = {
 	U: Uploader.Uploader,
 	workers: any,
 	cachesReady: number,
+	atmosReady: number,
 	stats: { renders: number, bands: number, failed: number, lastError: string? },
 }
 
@@ -82,9 +89,9 @@ local function extraFor(def: any): number
 end
 
 function Impostors.new(U: Uploader.Uploader, workers: any, folder: Instance): Manager
-	local M: Manager = { items = {}, byId = {}, U = U, workers = workers, cachesReady = 0, stats = { renders = 0, bands = 0, failed = 0, lastError = nil } }
+	local M: Manager = { items = {}, byId = {}, U = U, workers = workers, cachesReady = 0, atmosReady = 0, stats = { renders = 0, bands = 0, failed = 0, lastError = nil } }
 	for _, def in Bodies.list do
-		local img = MeshPool.createImage(MAX_N, MAX_N)
+		local img = MeshPool.createImage(math.min(MAX_N, TILE_MAX), math.min(MAX_N, TILE_MAX))
 		local anchor = Instance.new("Part")
 		anchor.Name = "Impostor_" .. def.name
 		anchor.Anchored = true
@@ -110,15 +117,30 @@ function Impostors.new(U: Uploader.Uploader, workers: any, folder: Instance): Ma
 		label.BackgroundTransparency = 1
 		label.Size = UDim2.fromScale(1, 1)
 		label.ImageRectOffset = Vector2.zero
-		label.ImageRectSize = Vector2.new(MAX_N, MAX_N)
+		label.ImageRectSize = Vector2.new(math.min(MAX_N, TILE_MAX), math.min(MAX_N, TILE_MAX))
 		if img then
 			label.ImageContent = Content.fromObject(img)
 		end
 		label.Parent = gui
+		local labels: { ImageLabel } = { label }
+		for k = 2, 4 do
+			local l = Instance.new("ImageLabel")
+			l.Name = "Tile" .. k
+			l.BackgroundTransparency = 1
+			l.Visible = false
+			l.Size = UDim2.fromScale(0.5, 0.5)
+			l.Position = UDim2.fromScale(if k % 2 == 0 then 0.5 else 0, if k > 2 then 0.5 else 0)
+			l.Parent = gui
+			labels[k] = l
+		end
+		local entry = if img then Uploader.register(U, "impostor " .. def.name, img) else nil
 		local item: Item = {
 			def = def,
 			img = img,
-			entry = if img then Uploader.register(U, "impostor " .. def.name, img) else nil,
+			entry = entry,
+			images = if img then { img } else {},
+			entries = if entry then { entry } else {},
+			labels = labels,
 			anchor = anchor,
 			gui = gui,
 			label = label,
@@ -214,18 +236,84 @@ local function startRender(M: Manager, item: Item, params: any, now: number)
 			if item.bandsLeft == 0 then
 				item.rendering = false
 				item.ms = (os.clock() - t0) * 1000
-				local entry = item.entry
-				if entry and back then
-					Uploader.queue(M.U, entry, 0, 0, n, n, back, function()
-						-- switch the visible region together with the new pixels
-						item.label.ImageRectOffset = Vector2.zero
-						item.label.ImageRectSize = Vector2.new(n, n)
-						item.n = n
-						item.shown = true
-					end)
+				if back then
+					Impostors.present(M, item, back, n)
 				end
 				item.renders += 1
 				M.stats.renders += 1
+			end
+		end)
+	end
+end
+
+-- Allocates the three extra tile images a billboard beyond 1024 needs (once). Returns false
+-- when the engine refuses (the billboard then stays at 1024).
+local function ensureTiles(M: Manager, item: Item): boolean
+	if #item.images >= 4 then
+		return true
+	end
+	while #item.images < 4 do
+		local img = MeshPool.createImage(TILE_MAX, TILE_MAX)
+		if not img then
+			return false
+		end
+		table.insert(item.images, img)
+		table.insert(item.entries, Uploader.register(M.U, "impostor " .. item.def.name .. " tile " .. #item.images, img))
+		item.labels[#item.images].ImageContent = Content.fromObject(img)
+	end
+	return true
+end
+
+-- Uploads a finished n x n render: one image, or four tiles (beyond 1024) that become
+-- visible together once all four have been written.
+function Impostors.present(M: Manager, item: Item, back: buffer, n: number)
+	local tiled = n > TILE_MAX
+	if tiled and not ensureTiles(M, item) then
+		-- cannot hold four tiles: show the top-left quarter scaled? no: skip this render
+		M.stats.failed += 1
+		M.stats.lastError = "tile images refused by the memory budget"
+		return
+	end
+	if not tiled then
+		local entry = item.entries[1]
+		if not entry then
+			return
+		end
+		Uploader.queue(M.U, entry, 0, 0, n, n, back, function()
+			local l = item.labels[1]
+			l.Position = UDim2.fromScale(0, 0)
+			l.Size = UDim2.fromScale(1, 1)
+			l.ImageRectOffset = Vector2.zero
+			l.ImageRectSize = Vector2.new(n, n)
+			for k = 2, 4 do
+				item.labels[k].Visible = false
+			end
+			item.n = n
+			item.shown = true
+		end)
+		return
+	end
+	local h = n // 2
+	local waiting = 4
+	for k = 1, 4 do
+		local tx, ty = (k - 1) % 2, (k - 1) // 2
+		local tile = buffer.create(h * h * 4)
+		for row = 0, h - 1 do
+			buffer.copy(tile, row * h * 4, back, ((ty * h + row) * n + tx * h) * 4, h * 4)
+		end
+		Uploader.queue(M.U, item.entries[k], 0, 0, h, h, tile, function()
+			waiting -= 1
+			if waiting == 0 then
+				for j = 1, 4 do
+					local l = item.labels[j]
+					l.Position = UDim2.fromScale(if j % 2 == 0 then 0.5 else 0, if j > 2 then 0.5 else 0)
+					l.Size = UDim2.fromScale(0.5, 0.5)
+					l.ImageRectOffset = Vector2.zero
+					l.ImageRectSize = Vector2.new(h, h)
+					l.Visible = true
+				end
+				item.n = n
+				item.shown = true
 			end
 		end)
 	end
@@ -318,6 +406,7 @@ function Impostors.update(M: Manager, cam: Camera, sun: Vector3, focus: any?, fo
 					sy = sun.Y,
 					sz = sun.Z,
 					cloudAngle = cloudAngle,
+					exposure = Config.exposure,
 				}, now)
 			end
 		end
@@ -328,11 +417,83 @@ end
 function Impostors.pixels(M: Manager): number
 	local n = 0
 	for _, item in M.items do
-		if item.img then
-			n += MAX_N * MAX_N
+		for _, img in item.images do
+			n += img.Size.X * img.Size.Y
 		end
 	end
 	return n
+end
+
+-- Builds every atmosphere's scattering tables on the workers (slices of the two big
+-- tables in parallel), joins them, and installs them in every worker and in this Luau
+-- state (for the serial fallback). Yields; run it in its own thread. Billboards re-render
+-- with the air once their body's tables are in.
+function Impostors.buildAtmos(M: Manager)
+	local q = Atmos.QUALITY
+	for _, item in M.items do
+		local id = item.def.id
+		local spec = Atmos.specFor(id)
+		if spec then
+			local shape = Atmos.new(spec, q) -- the dimensions only (cheap)
+			local slices: { { kind: string, i0: number, i1: number } } = {}
+			local step = math.max(1, math.ceil(shape.ND / 6))
+			for i = 0, shape.ND - 1, step do
+				table.insert(slices, { kind = "miss", i0 = i, i1 = math.min(shape.ND, i + step) })
+			end
+			local hstep = math.max(1, math.ceil(shape.NMV / 4))
+			for i = 0, shape.NMV - 1, hstep do
+				table.insert(slices, { kind = "hit", i0 = i, i1 = math.min(shape.NMV, i + hstep) })
+			end
+			local missParts: { [number]: buffer } = {}
+			local hitParts: { [number]: buffer } = {}
+			local small: any = nil
+			local pending = #slices + 1
+			for _, sl in slices do
+				WorkerPool.submit(M.workers, "atmosSlice", { body = id, quality = q, kind = sl.kind, i0 = sl.i0, i1 = sl.i1 }, function(ok: boolean, res: any)
+					pending -= 1
+					if ok then
+						if sl.kind == "miss" then
+							missParts[sl.i0] = res
+						else
+							hitParts[sl.i0] = res
+						end
+					else
+						M.stats.failed += 1
+						M.stats.lastError = tostring(res)
+					end
+				end)
+			end
+			WorkerPool.submit(M.workers, "atmosSmall", { body = id, quality = q }, function(ok: boolean, res: any)
+				pending -= 1
+				if ok then
+					small = res
+				end
+			end)
+			local t0 = os.clock()
+			while pending > 0 and os.clock() - t0 < 120 do
+				task.wait(0.05)
+			end
+			local function joined(parts: { [number]: buffer }): buffer?
+				local keys: { number } = {}
+				for k in parts do
+					table.insert(keys, k)
+				end
+				table.sort(keys)
+				local list: { buffer } = {}
+				for _, k in keys do
+					table.insert(list, parts[k])
+				end
+				return Atmos.concat(list)
+			end
+			local miss, hit = joined(missParts), joined(hitParts)
+			if miss and hit and small and buffer.len(miss) == shape.ND * shape.NA * shape.NB * 36 and buffer.len(hit) == shape.NMV * shape.NMS * shape.NNU * 36 then
+				Atmos.installFor(id, q, miss, small.chord, hit, small.amb)
+				WorkerPool.broadcast(M.workers, "setAtmos", { body = id, quality = q, miss = miss, hit = hit, chord = small.chord, amb = small.amb }, 30)
+				item.last = nil -- re-render with the air
+				M.atmosReady += 1
+			end
+		end
+	end
 end
 
 return Impostors

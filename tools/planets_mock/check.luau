@@ -17,7 +17,7 @@ moduleInstance(Universe, "MyMath", { file = "../src/MyMath" })
 local PlanetsF = makeClass("Folder")
 PlanetsF.Name = "Planets"
 PlanetsF.Parent = ReplicatedStorage
-for _, n in { "Config", "Layout", "Noise3", "CubeSphere", "Bodies", "TileGen", "Quadtree", "SphereCache", "Impostor", "SkyGen", "Clouds", "PlanetJobs" } do
+for _, n in { "Config", "Atmos", "Layout", "Noise3", "CubeSphere", "Bodies", "TileGen", "Quadtree", "SphereCache", "Impostor", "SkyGen", "Clouds", "PlanetJobs" } do
 	moduleInstance(PlanetsF, n, { file = "../planets/shared/" .. n })
 end
 moduleInstance(PlanetsF, "WorkerPool", { wrapped = "WorkerPool" })
@@ -130,6 +130,50 @@ cloudWrites = D.clouds.img.writes
 check(skyWrites >= 6, "six sky faces written (" .. skyWrites .. ")")
 check(cloudWrites >= 6, "six cloud faces written (" .. cloudWrites .. ")")
 check(D.lod.body == nil, "from orbit no mesh is active")
+-- the atmosphere tables were built (by jobs) and installed for both atmospheric bodies
+do
+	local AtmosReal = realRequire("../planets/shared/Atmos")
+	for _ = 1, 600 do
+		if D.imps.atmosReady == 2 then
+			break
+		end
+		frame(1 / 60)
+	end
+	check(D.imps.atmosReady == 2 and AtmosReal.get("terra") ~= nil and AtmosReal.get("saturnia") ~= nil, "atmosphere tables built and installed for Terra and Saturnia")
+	local line = statusLine("atmosphere")
+	check(line ~= nil and string.find(line, "|ok|", 1, true) ~= nil, "atmosphere stage reported ok: " .. tostring(line))
+end
+-- a billboard beyond 1024 is four tile images that appear together
+do
+	local Impostors = mockRequire(ClientF.Impostors)
+	local item = D.imps.byId.selene
+	local n = 2048
+	local big = buffer.create(n * n * 4)
+	for i = 0, n * n - 1 do
+		buffer.writeu32(big, i * 4, (i * 2654435761 + 12345) % 4294967296)
+	end
+	Impostors.present(D.imps, item, big, n)
+	check(#item.images == 4, "a 2048 billboard allocated four tile images")
+	check(item.labels[2].Visible == false, "tiles stay hidden until all four are written")
+	run(12)
+	check(item.n == 2048 and item.labels[1].Visible and item.labels[2].Visible and item.labels[3].Visible and item.labels[4].Visible, "all four tiles become visible together")
+	local h = n // 2
+	local same = true
+	for k = 1, 4 do
+		local tx, ty = (k - 1) % 2, (k - 1) // 2
+		local img = item.images[k]
+		for _, probe in { { 0, 0 }, { h - 1, 0 }, { 0, h - 1 }, { h - 1, h - 1 }, { 511, 733 }, { 1000, 17 } } do
+			local px, py = probe[1], probe[2]
+			local got = buffer.readu32(img.pixels, (py * img.w + px) * 4)
+			local want = buffer.readu32(big, ((ty * h + py) * n + tx * h + px) * 4)
+			if got ~= want then
+				same = false
+			end
+		end
+	end
+	check(same, "each tile holds its quadrant of the 2048 render")
+	check(item.labels[1].Size.X.Scale == 0.5 and item.labels[4].Position.X.Scale == 0.5 and item.labels[4].Position.Y.Scale == 0.5, "tiles are laid out as a 2 x 2 grid")
+end
 
 -- the Uploader rule: at most one image refreshed per frame, ever
 local function uploaderRule(label)
