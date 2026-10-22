@@ -23,7 +23,7 @@ for f in "$HERE"/tests/*.test.luau; do
   done
 done
 if [ -x "$ANALYZE" ]; then
-  if out="$("$ANALYZE" --mode=strict "$HERE"/src/*.luau "$HERE"/tests/*.luau 2>&1)"; then
+  if out="$("$ANALYZE" --mode=strict "$HERE"/src/*.luau "$HERE"/src/compute/*.luau "$HERE"/tests/*.luau 2>&1)"; then
     echo "PASS luau-analyze --mode=strict"
   else
     fail=$((fail + 1))

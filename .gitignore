@@ -5,3 +5,5 @@ coverage.out
 callgrind.out
 trace.json
 .scratch/
+.liquid_tmp/
+__pycache__/

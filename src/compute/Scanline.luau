@@ -29,7 +29,7 @@ export type Accumulator = {
 }
 
 function Scanline.new(width: number, height: number): Accumulator
-	local ranges = table.create(height)
+	local ranges: { { number } } = {}
 	for y = 1, height do
 		ranges[y] = {}
 	end
@@ -217,6 +217,114 @@ function Scanline.resolve(acc: Accumulator, out: buffer, rgb: number, alpha: num
 		if pos < W then
 			local a = math.min(1, math.abs(sum))
 			Pixels.fillSpan(out, rowOut + pos * 4, W - pos, rgb + ((a * alpha + 0.5) // 1) * 16777216)
+		end
+		table.clear(r)
+	end
+	return perPixel
+end
+
+-- Composites the accumulated coverage onto an RGBA8 destination with straight-alpha
+-- source-over, in colour `color` (packed RGBA8): the exact-area vector painter.
+-- Rows without touched cells are not visited at all. Between touched ranges the
+-- running sum is constant: 0 (span skipped), 1 (fully covered: one span fill for
+-- an opaque colour) or a fraction, in rows that a horizontal edge or a vertex
+-- crosses (blended pixel by pixel with that constant coverage). Clears the
+-- accumulator. Returns the number of touched cells blended one by one.
+function Scanline.composite(acc: Accumulator, dst: buffer, color: number): number
+	local W, H, stride = acc.width, acc.height, acc.stride
+	local cells = acc.cells
+	local cr, cg, cb = color % 256, (color // 256) % 256, (color // 65536) % 256
+	local ca = (color // 16777216) / 255
+	local opaque = ca >= 1
+	local perPixel = 0
+	local function blend(o: number, cov: number)
+		local sa = cov * ca
+		if sa <= 0 then
+			return
+		end
+		if sa >= 1 then
+			buffer.writeu32(dst, o, color)
+			return
+		end
+		local p = buffer.readu32(dst, o)
+		local da = (p // 16777216) / 255 * (1 - sa)
+		local oa = sa + da
+		local r = (cr * sa + (p % 256) * da) / oa
+		local g = (cg * sa + ((p // 256) % 256) * da) / oa
+		local b = (cb * sa + ((p // 65536) % 256) * da) / oa
+		buffer.writeu32(dst, o, (r + 0.5) // 1 + ((g + 0.5) // 1) * 256 + ((b + 0.5) // 1) * 65536 + ((oa * 255 + 0.5) // 1) * 16777216)
+	end
+	-- span [x0, x1) with constant winding sum s
+	local function spanFill(rowOut: number, x0: number, x1: number, s: number)
+		local a = if s < 0 then -s else s
+		if a < 1e-9 then
+			return
+		end
+		if a >= 1 - 1e-9 and opaque then
+			Pixels.fillSpan(dst, rowOut + x0 * 4, x1 - x0, color)
+			return
+		end
+		if a > 1 then
+			a = 1
+		end
+		for x = x0, x1 - 1 do
+			blend(rowOut + x * 4, a)
+		end
+	end
+	for y = 0, H - 1 do
+		local r = acc.ranges[y + 1]
+		local n = #r
+		if n == 0 then
+			continue
+		end
+		local rowOut = y * W * 4
+		local base = y * stride * 8
+		for i = 3, n, 2 do
+			local lo, hi = r[i], r[i + 1]
+			local j = i - 2
+			while j >= 1 and r[j] > lo do
+				r[j + 2], r[j + 3] = r[j], r[j + 1]
+				j -= 2
+			end
+			r[j + 2], r[j + 3] = lo, hi
+		end
+		local sum = 0
+		local pos = 0
+		local i = 1
+		while i <= n do
+			local lo, hi = r[i], r[i + 1]
+			i += 2
+			while i <= n and r[i] <= hi + 1 do
+				if r[i + 1] > hi then
+					hi = r[i + 1]
+				end
+				i += 2
+			end
+			if lo > pos and pos < W then
+				spanFill(rowOut, pos, if lo < W then lo else W, sum)
+			end
+			for x = lo, hi do
+				local o = base + x * 8
+				sum += buffer.readf64(cells, o)
+				buffer.writef64(cells, o, 0)
+				if x < W then
+					local a = sum
+					if a < 0 then
+						a = -a
+					end
+					if a > 1 then
+						a = 1
+					end
+					blend(rowOut + x * 4, a)
+					perPixel += 1
+				end
+			end
+			if hi + 1 > pos then
+				pos = hi + 1
+			end
+		end
+		if pos < W then
+			spanFill(rowOut, pos, W, sum)
 		end
 		table.clear(r)
 	end

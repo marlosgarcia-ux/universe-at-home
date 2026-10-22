@@ -21,15 +21,32 @@
 -- has coverage exactly 1 and alpha 255, and the per-pixel arithmetic is the same
 -- function with the same operand order.
 --
+-- Two coverage modes (docs/COMPUTE.md 3.3):
+--   MODE_LINEAR  clamp(0.5 - d / aa, 0, 1), MyMath.coverage. Exact only on
+--                axis-aligned edges: up to 10.94/255 on a 45 degree edge (C3),
+--                38/255 at sharp box corners, 26 to 83/255 at star tips.
+--   MODE_EXACT   pixel-area coverage: half-plane area from the distance and the
+--                gradient minus the first-order curvature term (curves of radius
+--                >= 8 px, ring edges, capsule caps), exact disc areas from a
+--                deterministic arcsine (small circles, rounded box corners), the
+--                product of two 1D overlaps (sharp boxes), and exact clipping by
+--                the two nearest edges (polygon vertices, slivers, gaps). Measured
+--                within 0.50/255 of the exact area, i.e. correctly rounded bytes,
+--                for every tested primitive except capsule caps (0.74/255). Costs
+--                1.2x MODE_LINEAR. Culling reach is sqrt(2)/2 AA widths (C4).
+--
 -- Deterministic ops only: + - * / sqrt abs floor, comparisons (RUNTIME_AUDIT 6.5).
 
 local Pixels = require("../Pixels")
 local MyMath = require("../MyMath")
+local Coverage = require("./Coverage")
 
 local Raster = {}
 
 local CIRCLE, BOX, SEGMENT, RING, POLYGON = 1, 2, 3, 4, 5
 Raster.CIRCLE, Raster.BOX, Raster.SEGMENT, Raster.RING, Raster.POLYGON = CIRCLE, BOX, SEGMENT, RING, POLYGON
+local MODE_LINEAR, MODE_EXACT = 0, 1
+Raster.MODE_LINEAR, Raster.MODE_EXACT = MODE_LINEAR, MODE_EXACT
 
 export type Scene = {
 	n: number,
@@ -49,7 +66,8 @@ export type Scene = {
 	bx1: { number },
 	by1: { number },
 	verts: { number },
-	aa: number, -- anti-aliasing width in pixels (coverage = clamp(0.5 - d / aa, 0, 1))
+	aa: number, -- anti-aliasing (box filter) width in pixels
+	mode: number, -- MODE_LINEAR or MODE_EXACT
 	bgR: number,
 	bgG: number,
 	bgB: number,
@@ -76,7 +94,7 @@ end
 -- Scene construction
 ----------------------------------------------------------------------------------
 
-function Raster.newScene(background: number, aa: number?): Scene
+function Raster.newScene(background: number, aa: number?, mode: number?): Scene
 	local r, g, b, a = MyMath.unpack(background)
 	return {
 		n = 0,
@@ -97,6 +115,7 @@ function Raster.newScene(background: number, aa: number?): Scene
 		by1 = {},
 		verts = {},
 		aa = aa or 1,
+		mode = mode or MODE_LINEAR,
 		bgR = r,
 		bgG = g,
 		bgB = b,
@@ -118,8 +137,9 @@ end
 -- can have nonzero coverage).
 local function updateBounds(sc: Scene, s: number)
 	local k = sc.kind[s]
-	local h = sc.aa * 0.5
-	local x0, y0, x1, y1
+	-- coverage can be nonzero up to half an AA width (linear) or sqrt(2)/2 (exact)
+	local h = sc.aa * (if sc.mode == MODE_EXACT then 0.70710678118654757 else 0.5)
+	local x0, y0, x1, y1 = 0, 0, 0, 0
 	if k == CIRCLE then
 		local r = sc.p3[s] + h
 		x0, y0, x1, y1 = sc.p1[s] - r, sc.p2[s] - r, sc.p1[s] + r, sc.p2[s] + r
@@ -140,8 +160,19 @@ local function updateBounds(sc: Scene, s: number)
 		local first, count = sc.p1[s], sc.p2[s]
 		x0, y0, x1, y1 = math.huge, math.huge, -math.huge, -math.huge
 		for i = first, first + 2 * count - 2, 2 do
-			x0, x1 = math.min(x0, v[i]), math.max(x1, v[i])
-			y0, y1 = math.min(y0, v[i + 1]), math.max(y1, v[i + 1])
+			local vx: number, vy: number = v[i], v[i + 1]
+			if vx < x0 then
+				x0 = vx
+			end
+			if vx > x1 then
+				x1 = vx
+			end
+			if vy < y0 then
+				y0 = vy
+			end
+			if vy > y1 then
+				y1 = vy
+			end
 		end
 		x0, y0, x1, y1 = x0 - h, y0 - h, x1 + h, y1 + h
 	end
@@ -182,14 +213,23 @@ function Raster.ring(sc: Scene, color: number, cx: number, cy: number, r: number
 	return s
 end
 
--- Polygon from flat {x1, y1, x2, y2, ...}; even-odd fill, exact distance.
+-- Polygon from flat {x1, y1, x2, y2, ...}; even-odd fill, exact distance. p3 holds
+-- the orientation (sign of the shoelace area), which exact coverage needs at vertices.
 function Raster.polygon(sc: Scene, color: number, pts: { number }): number
 	local v = sc.verts
 	local first = #v + 1
 	for i = 1, #pts do
 		v[first + i - 1] = pts[i]
 	end
-	local s = push(sc, POLYGON, color, first, #pts // 2, 0, 0, 0, 0)
+	local area = 0
+	local n = #pts // 2
+	local jx, jy = pts[2 * n - 1], pts[2 * n]
+	for i = 1, n do
+		local ix, iy = pts[2 * i - 1], pts[2 * i]
+		area += jx * iy - ix * jy
+		jx, jy = ix, iy
+	end
+	local s = push(sc, POLYGON, color, first, n, if area >= 0 then 1 else -1, 0, 0, 0)
 	updateBounds(sc, s)
 	return s
 end
@@ -213,7 +253,7 @@ end
 -- A copy of the scene with every length multiplied by f (for rendering a mip
 -- level directly at its own resolution; the AA width stays one output pixel).
 function Raster.scaled(sc: Scene, f: number): Scene
-	local out = Raster.newScene(0, sc.aa)
+	local out = Raster.newScene(0, sc.aa, sc.mode)
 	out.bgR, out.bgG, out.bgB, out.bgA = sc.bgR, sc.bgG, sc.bgB, sc.bgA
 	for i = 1, #sc.verts do
 		out.verts[i] = sc.verts[i] * f
@@ -224,7 +264,7 @@ function Raster.scaled(sc: Scene, f: number): Scene
 		out.kind[s] = k
 		out.cr[s], out.cg[s], out.cb[s], out.ca[s] = sc.cr[s], sc.cg[s], sc.cb[s], sc.ca[s]
 		if k == POLYGON then
-			out.p1[s], out.p2[s], out.p3[s], out.p4[s], out.p5[s], out.p6[s] = sc.p1[s], sc.p2[s], 0, 0, 0, 0
+			out.p1[s], out.p2[s], out.p3[s], out.p4[s], out.p5[s], out.p6[s] = sc.p1[s], sc.p2[s], sc.p3[s], 0, 0, 0
 		elseif k == SEGMENT then
 			out.p1[s], out.p2[s], out.p3[s], out.p4[s], out.p5[s] = sc.p1[s] * f, sc.p2[s] * f, sc.p3[s] * f, sc.p4[s] * f, sc.p5[s] * f
 			local len2 = out.p3[s] * out.p3[s] + out.p4[s] * out.p4[s]
@@ -240,8 +280,8 @@ end
 
 -- Deterministic demo scene: n shapes on a size x size canvas. Mixes every kind,
 -- radii from 2 to 60 px at 1024 (scaled with size), one in four translucent.
-function Raster.demoScene(n: number, size: number, seed: number, background: number?): Scene
-	local sc = Raster.newScene(background or 0xFF201810)
+function Raster.demoScene(n: number, size: number, seed: number, background: number?, mode: number?): Scene
+	local sc = Raster.newScene(background or 0xFF201810, 1, mode)
 	local f = size / 1024
 	local hash = MyMath.hash32
 	local h = hash(seed)
@@ -467,6 +507,315 @@ local function shadeRect(
 end
 
 ----------------------------------------------------------------------------------
+-- Exact-area shading (MODE_EXACT). Same structure and compositing as shadeRect;
+-- only the coverage estimate differs. Coverage is exactly 0 for d >= REACH and
+-- exactly 1 for d <= -REACH (REACH = sqrt(2) / 2 AA widths), which classify uses.
+----------------------------------------------------------------------------------
+
+local REACH = 0.70710678118654757
+
+-- Half-plane area (unit gradient components nx, ny; only magnitudes matter) minus
+-- the first-order curvature term k (t1^3 - t0^3) / 6 over the chord the tangent
+-- line cuts from the pixel. Inputs in AA-width units. See Coverage.halfPlaneCurved.
+local function covCurved(d: number, nx: number, ny: number, k: number): number
+	if d >= REACH then
+		return 0
+	elseif d <= -REACH then
+		return 1
+	end
+	local a, b = abs(nx), abs(ny)
+	if a < b then
+		a, b = b, a
+	end
+	local u = (a + b) * 0.5 - d
+	local base
+	if u <= 0 then
+		base = 0
+	elseif u >= a + b then
+		base = 1
+	elseif u < b then
+		base = u * u / (2 * a * b)
+	elseif u <= a then
+		base = (2 * u - b) / (2 * a)
+	else
+		local v = a + b - u
+		base = 1 - v * v / (2 * a * b)
+	end
+	if k == 0 then
+		return base
+	end
+	-- chord of the tangent line inside the pixel, parametrised by t along (-ny, nx)
+	-- (signs of nx, ny do not change the chord length or its offset magnitude)
+	local t0, t1 = -1e300, 1e300
+	local ox, oy = -d * a, -d * b
+	-- direction along the line is (-b, a); |coordinate| <= 1/2 on both axes
+	if b ~= 0 then
+		local p0 = (ox - 0.5) / b
+		local p1 = (ox + 0.5) / b
+		if p0 > p1 then
+			p0, p1 = p1, p0
+		end
+		t0 = p0
+		t1 = p1
+	elseif ox < -0.5 or ox > 0.5 then
+		return base
+	end
+	local q0 = (-0.5 - oy) / a
+	local q1 = (0.5 - oy) / a
+	if q0 > q1 then
+		q0, q1 = q1, q0
+	end
+	if q0 > t0 then
+		t0 = q0
+	end
+	if q1 < t1 then
+		t1 = q1
+	end
+	if t1 <= t0 then
+		return base
+	end
+	local c = base - k * (t1 * t1 * t1 - t0 * t0 * t0) / 6
+	return if c < 0 then 0 elseif c > 1 then 1 else c
+end
+Raster.covCurved = covCurved
+
+local corner = Coverage.corner
+local edgePair = Coverage.edgePair
+local roundCorner = Coverage.roundCorner
+local discRectArea = Coverage.discRectArea
+local REACH2 = 0.5 * (1 + 1e-9) -- REACH^2 with margin: a second edge this close may enter the pixel
+local SMALL_RADIUS = 8 -- below this radius (AA widths) circles use the exact disc area
+
+local function shadeExact(
+	sc: Scene,
+	out: buffer,
+	width: number,
+	x0: number,
+	y0: number,
+	x1: number,
+	y1: number,
+	base: number,
+	list: { number },
+	lo: number,
+	hi: number
+)
+	local K, P1, P2, P3, P4, P5, P6 = sc.kind, sc.p1, sc.p2, sc.p3, sc.p4, sc.p5, sc.p6
+	local CR, CG, CB, CA = sc.cr, sc.cg, sc.cb, sc.ca
+	local V = sc.verts
+	local w = sc.aa
+	local iw = 1 / w
+	local hw = w * 0.5
+	local r0, g0, b0, a0
+	if base > 0 then
+		r0, g0, b0, a0 = CR[base], CG[base], CB[base], 1
+	else
+		r0, g0, b0, a0 = sc.bgR, sc.bgG, sc.bgB, sc.bgA
+	end
+	for y = y0, y1 do
+		local py = y + 0.5
+		local o = (y * width + x0) * 4
+		for x = x0, x1 do
+			local px = x + 0.5
+			local ar, ag, ab, aa = r0, g0, b0, a0
+			for j = lo, hi do
+				local s = list[j]
+				local k = K[s]
+				local cov
+				if k == CIRCLE then
+					local cx, cy = P1[s], P2[s]
+					local dx, dy = px - cx, py - cy
+					local len = sqrt(dx * dx + dy * dy)
+					local r = P3[s]
+					local d = (len - r) * iw
+					if d >= REACH then
+						cov = 0
+					elseif d <= -REACH then
+						cov = 1
+					elseif r * iw < SMALL_RADIUS then
+						-- small circle: exact disc area (curvature term not accurate enough)
+						cov = discRectArea(cx, cy, r, px - hw, py - hw, px + hw, py + hw) * iw * iw
+					elseif len > 0 then
+						cov = covCurved(d, dx / len, dy / len, w / r)
+					else
+						cov = covCurved(-r * iw, 1, 0, 0)
+					end
+				elseif k == BOX then
+					local rad = P5[s]
+					local qx = abs(px - P1[s]) - P3[s] + rad
+					local qy = abs(py - P2[s]) - P4[s] + rad
+					if rad == 0 then
+						-- axis-aligned sharp box: exact product of the 1D overlaps
+						local cx = 0.5 - qx * iw
+						local cy = 0.5 - qy * iw
+						cx = if cx < 0 then 0 elseif cx > 1 then 1 else cx
+						cy = if cy < 0 then 0 elseif cy > 1 then 1 else cy
+						cov = cx * cy
+					elseif qx > -hw and qy > -hw then
+						-- the pixel reaches the corner quadrant: exact corner composition
+						local ox = if qx > 0 then qx else 0
+						local oy = if qy > 0 then qy else 0
+						local inside = if qx > qy then qx else qy
+						if inside > 0 then
+							inside = 0
+						end
+						local d = (sqrt(ox * ox + oy * oy) + inside - rad) * iw
+						if d >= REACH then
+							cov = 0
+						elseif d <= -REACH then
+							cov = 1
+						else
+							cov = roundCorner(qx, qy, rad, w)
+						end
+					else
+						local m = if qx > qy then qx else qy
+						local c = 0.5 - (m - rad) * iw
+						cov = if c < 0 then 0 elseif c > 1 then 1 else c
+					end
+				elseif k == SEGMENT then
+					local pax, pay = px - P1[s], py - P2[s]
+					local bax, bay = P3[s], P4[s]
+					local hh = (pax * bax + pay * bay) * P6[s]
+					local kk = 0
+					if hh <= 0 then
+						hh = 0
+						kk = w / P5[s]
+					elseif hh >= 1 then
+						hh = 1
+						kk = w / P5[s]
+					end
+					local dx, dy = pax - bax * hh, pay - bay * hh
+					local len = sqrt(dx * dx + dy * dy)
+					if len > 0 then
+						cov = covCurved((len - P5[s]) * iw, dx / len, dy / len, kk)
+					else
+						cov = covCurved(-P5[s] * iw, 1, 0, 0)
+					end
+				elseif k == RING then
+					local dx, dy = px - P1[s], py - P2[s]
+					local len = sqrt(dx * dx + dy * dy)
+					local r, t = P3[s], P4[s]
+					local m = len - r
+					if len > 0 then
+						if m >= 0 then
+							cov = covCurved((m - t) * iw, dx / len, dy / len, w / (r + t))
+						else
+							cov = covCurved((-m - t) * iw, dx / len, dy / len, if r > t then -w / (r - t) else 0)
+						end
+					else
+						cov = covCurved((r - t) * iw, 1, 0, 0)
+					end
+				else
+					local first = P1[s]
+					local last = first + 2 * P2[s] - 2
+					local d1, d2 = math.huge, math.huge
+					local i1, i2, t1 = first, first, 0
+					local sign = 1
+					local jx, jy = V[last], V[last + 1]
+					for i = first, last, 2 do
+						local vx, vy = V[i], V[i + 1]
+						local ex, ey = jx - vx, jy - vy
+						local wx, wy = px - vx, py - vy
+						local ee = ex * ex + ey * ey
+						local t = if ee > 0 then (wx * ex + wy * ey) / ee else 0
+						t = if t < 0 then 0 elseif t > 1 then 1 else t
+						local bx, by = wx - ex * t, wy - ey * t
+						local dd = bx * bx + by * by
+						if dd < d1 then
+							d2, i2 = d1, i1
+							d1, i1, t1 = dd, i, t
+						elseif dd < d2 then
+							d2, i2 = dd, i
+						end
+						local c1 = py >= vy
+						local c2 = py < jy
+						local c3 = ex * wy > ey * wx
+						if (c1 and c2 and c3) or (not c1 and not c2 and not c3) then
+							sign = -sign
+						end
+						jx, jy = vx, vy
+					end
+					local d = sign * sqrt(d1) * iw
+					local sigma = P3[s]
+					-- edge i runs from vertex prev(i) to vertex i in polygon order
+					local p1 = if i1 == first then last else i1 - 2
+					if d >= REACH then
+						cov = 0
+					elseif d <= -REACH then
+						cov = 1
+					elseif d2 * iw * iw >= REACH2 then
+						-- only the nearest edge can enter the pixel
+						local ex, ey = V[i1] - V[p1], V[i1 + 1] - V[p1 + 1]
+						local len = sqrt(ex * ex + ey * ey)
+						if len > 0 and t1 > 0 and t1 < 1 then
+							cov = covCurved(d, ey / len, ex / len, 0)
+						else
+							-- nearest point is a vertex (t1 = 0: vertex i1, t1 = 1: vertex p1)
+							-- whose other edge lies just beyond reach: wedge at that vertex
+							local sv = if t1 >= 1 then p1 else i1
+							local su = if sv == first then last else sv - 2
+							local sw = if sv == last then first else sv + 2
+							cov = corner(px * iw, py * iw, V[su] * iw, V[su + 1] * iw, V[sv] * iw, V[sv + 1] * iw, V[sw] * iw, V[sw + 1] * iw, sigma)
+						end
+					else
+						local n1 = if i1 == last then first else i1 + 2
+						if i2 == n1 or i2 == p1 then
+							-- adjacent edges: exact wedge at their shared vertex
+							local sv = if i2 == n1 then i1 else i2
+							local su = if sv == first then last else sv - 2
+							local sw = if sv == last then first else sv + 2
+							cov = corner(px * iw, py * iw, V[su] * iw, V[su + 1] * iw, V[sv] * iw, V[sv + 1] * iw, V[sw] * iw, V[sw + 1] * iw, sigma)
+						else
+							local p2 = if i2 == first then last else i2 - 2
+							cov = edgePair(px * iw, py * iw, V[p1] * iw, V[p1 + 1] * iw, V[i1] * iw, V[i1 + 1] * iw,
+								V[p2] * iw, V[p2 + 1] * iw, V[i2] * iw, V[i2 + 1] * iw, sigma)
+						end
+					end
+				end
+				if cov > 0 then
+					local sa = cov * CA[s] / 255
+					if sa >= 1 then
+						ar, ag, ab, aa = CR[s], CG[s], CB[s], 1
+					else
+						local da = aa * (1 - sa)
+						local oa = sa + da
+						ar = (CR[s] * sa + ar * da) / oa
+						ag = (CG[s] * sa + ag * da) / oa
+						ab = (CB[s] * sa + ab * da) / oa
+						aa = oa
+					end
+				end
+			end
+			buffer.writeu32(
+				out,
+				o,
+				(ar + 0.5) // 1 + ((ag + 0.5) // 1) * 256 + ((ab + 0.5) // 1) * 65536 + ((aa * 255 + 0.5) // 1) * 16777216
+			)
+			o += 4
+		end
+	end
+end
+
+local function shade(
+	sc: Scene,
+	out: buffer,
+	width: number,
+	x0: number,
+	y0: number,
+	x1: number,
+	y1: number,
+	base: number,
+	list: { number },
+	lo: number,
+	hi: number
+)
+	if sc.mode == MODE_EXACT then
+		shadeExact(sc, out, width, x0, y0, x1, y1, base, list, lo, hi)
+	else
+		shadeRect(sc, out, width, x0, y0, x1, y1, base, list, lo, hi)
+	end
+end
+
+----------------------------------------------------------------------------------
 -- Reference renderers
 ----------------------------------------------------------------------------------
 
@@ -479,16 +828,17 @@ function Raster.renderBrute(sc: Scene, out: buffer, width: number, height: numbe
 	end
 	if rows then
 		for _, y in rows do
-			shadeRect(sc, out, width, 0, y, width - 1, y, 0, list, 1, sc.n)
+			shade(sc, out, width, 0, y, width - 1, y, 0, list, 1, sc.n)
 		end
 	else
-		shadeRect(sc, out, width, 0, 0, width - 1, height - 1, 0, list, 1, sc.n)
+		shade(sc, out, width, 0, 0, width - 1, height - 1, 0, list, 1, sc.n)
 	end
 end
 
 -- Painter's algorithm over each shape's bounding box with an 8-bit framebuffer
 -- (read, unpack, blend, pack, write per covered pixel). Fast to write, but it
 -- rounds to 8 bits after every shape, so it is not identical to renderBrute.
+-- Linear coverage only (it is the baseline an engine DrawCircle loop gives).
 function Raster.renderPainter(sc: Scene, out: buffer, width: number, height: number)
 	local bg = (sc.bgR // 1) + (sc.bgG // 1) * 256 + (sc.bgB // 1) * 65536 + ((sc.bgA * 255 + 0.5) // 1) * 16777216
 	Pixels.fill(out, bg)
@@ -528,7 +878,7 @@ end
 function Raster.bin(sc: Scene, width: number, height: number, tile: number?): Bins
 	local t = tile or 64
 	local tilesX, tilesY = (width + t - 1) // t, (height + t - 1) // t
-	local lists = table.create(tilesX * tilesY)
+	local lists: { { number } } = {}
 	for i = 1, tilesX * tilesY do
 		lists[i] = {}
 	end
@@ -561,7 +911,8 @@ local stack: { number } = table.create(4096, 0)
 local function classify(sc: Scene, x: number, y: number, size: number, lo: number, hi: number, base: number): (number, number, number, boolean)
 	local cx, cy = x + size * 0.5, y + size * 0.5
 	local reach = (size - 1) * SQRT_HALF * (1 + 1e-12) -- half-diagonal to the farthest pixel centre
-	local half = sc.aa * 0.5
+	-- coverage is exactly 0 / 1 beyond half an AA width (linear) or sqrt(2)/2 (exact)
+	local half = sc.aa * (if sc.mode == MODE_EXACT then SQRT_HALF else 0.5)
 	local CA = sc.ca
 	local top = hi
 	local allFull = true
@@ -608,7 +959,7 @@ local function fillNode(sc: Scene, out: buffer, width: number, x: number, y: num
 			c = (sc.bgR + 0.5) // 1 + ((sc.bgG + 0.5) // 1) * 256 + ((sc.bgB + 0.5) // 1) * 65536 + ((sc.bgA * 255 + 0.5) // 1) * 16777216
 		end
 	else
-		shadeRect(sc, out, width, x, y, x, y, base, stack, lo, hi)
+		shade(sc, out, width, x, y, x, y, base, stack, lo, hi)
 		c = buffer.readu32(out, (y * width + x) * 4)
 	end
 	Pixels.fillRect(out, width, x, y, w, h, c)
@@ -637,7 +988,7 @@ local function node(
 	elseif size <= leaf then
 		stats.leaves += 1
 		stats.shaded += w * h
-		shadeRect(sc, out, width, x, y, x + w - 1, y + h - 1, nb, stack, nlo, nhi)
+		shade(sc, out, width, x, y, x + w - 1, y + h - 1, nb, stack, nlo, nhi)
 	else
 		local half = size // 2
 		node(sc, out, width, height, x, y, half, nlo, nhi, nb, leaf)
