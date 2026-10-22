@@ -60,6 +60,71 @@ Coverage.halfPlane = halfPlane
 -- <= sqrt(2) / 2. Tile culling for exact coverage uses this instead of w / 2.
 Coverage.HALF_PLANE_REACH = 0.70710678118654757
 
+-- Curvature-corrected coverage (docs/COMPUTE.md C5). The boundary near the pixel is
+-- a curve of signed curvature k (k > 0: the shape is convex there, e.g. 1 / R for a
+-- disc) tangent to the half-plane line. Along the line, at tangential offset t from
+-- the foot point, the curve lies k t^2 / 2 inside the line, so to first order in k
+-- the pixel loses the area integral of k t^2 / 2 over the chord the line cuts from
+-- the pixel: k (t1^3 - t0^3) / 6. With the chord from the clipped line, the
+-- remaining error is O(k^2). Deterministic: + - * / abs and comparisons only.
+local function halfPlaneCurved(d: number, nx: number, ny: number, k: number): number
+	local base = halfPlane(d, nx, ny)
+	if k == 0 then
+		return base
+	end
+	-- the line is {q : n . (q - c) = -d}; parametrise q = c - d n + t (-ny, nx)
+	-- and clip t to the unit square |qx - cx| <= 1/2, |qy - cy| <= 1/2
+	local t0, t1 = -1e300, 1e300
+	local tx, ty = -ny, nx
+	local ox, oy = -d * nx, -d * ny
+	if tx ~= 0 then
+		local a0 = (-0.5 - ox) / tx
+		local a1 = (0.5 - ox) / tx
+		if a0 > a1 then
+			a0, a1 = a1, a0
+		end
+		if a0 > t0 then
+			t0 = a0
+		end
+		if a1 < t1 then
+			t1 = a1
+		end
+	elseif ox < -0.5 or ox > 0.5 then
+		t1 = t0
+	end
+	if ty ~= 0 then
+		local a0 = (-0.5 - oy) / ty
+		local a1 = (0.5 - oy) / ty
+		if a0 > a1 then
+			a0, a1 = a1, a0
+		end
+		if a0 > t0 then
+			t0 = a0
+		end
+		if a1 < t1 then
+			t1 = a1
+		end
+	elseif oy < -0.5 or oy > 0.5 then
+		t1 = t0
+	end
+	local c = base
+	if t1 > t0 then
+		c = base - k * (t1 * t1 * t1 - t0 * t0 * t0) / 6
+	end
+	return if c < 0 then 0 elseif c > 1 then 1 else c
+end
+Coverage.halfPlaneCurved = halfPlaneCurved
+
+-- Curvature-corrected circle coverage (k = 1 / r).
+function Coverage.circleCurved(px: number, py: number, cx: number, cy: number, r: number): number
+	local dx, dy = px - cx, py - cy
+	local len = sqrt(dx * dx + dy * dy)
+	if len == 0 then
+		return if r > 0.70710678118654757 then 1 else halfPlane(-r, 1, 0)
+	end
+	return halfPlaneCurved(len - r, dx / len, dy / len, 1 / r)
+end
+
 -- Exact coverage estimate for a circle from its SDF (centre distance minus r).
 function Coverage.circleHalfPlane(px: number, py: number, cx: number, cy: number, r: number): number
 	local dx, dy = px - cx, py - cy
