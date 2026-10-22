@@ -1,0 +1,55 @@
+{
+  "name": "UniverseProbe",
+  "tree": {
+    "$className": "DataModel",
+
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "Universe": {
+        "$path": "src"
+      }
+    },
+
+    "ServerScriptService": {
+      "$className": "ServerScriptService",
+      "EditableImageProbe": { "$path": "studio/EditableImageProbe.luau" },
+      "RunProbe": { "$path": "studio/RunProbe.server.luau" },
+      "OpsBench": { "$path": "bench/ops.luau" },
+      "RunOpsBench": {
+        "$path": "studio/RunOpsBench.server.luau",
+        "$properties": { "Disabled": true }
+      }
+    },
+
+    "StarterPlayer": {
+      "$className": "StarterPlayer",
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+        "EditableImageProbe": { "$path": "studio/EditableImageProbe.luau" },
+        "RunProbe": { "$path": "studio/RunProbe.client.luau" },
+        "ParallelActor": {
+          "$className": "Actor",
+          "ParallelProbe": { "$path": "studio/ParallelProbe.client.luau" }
+        },
+        "OpsBench": { "$path": "bench/ops.luau" },
+        "RunOpsBench": {
+          "$path": "studio/RunOpsBench.client.luau",
+          "$properties": { "Disabled": true }
+        }
+      }
+    },
+
+    "Workspace": {
+      "$className": "Workspace",
+      "Baseplate": {
+        "$className": "Part",
+        "$properties": {
+          "Anchored": true,
+          "Size": [512, 4, 512],
+          "Position": [0, -2, 0],
+          "Material": "Grass"
+        }
+      }
+    }
+  }
+}
