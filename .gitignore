@@ -1,0 +1,6 @@
+bench/results/*.r*.tsv
+*.out
+profile.out
+coverage.out
+callgrind.out
+trace.json
