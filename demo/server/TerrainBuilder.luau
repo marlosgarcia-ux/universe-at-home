@@ -113,7 +113,12 @@ function TerrainBuilder.run(
 	local channelError: string? = nil
 	local failedChunks = 0
 	local spawnReady = false
-	local spawnChunks = 9
+	-- the first 9 chunks of the ring order are the 3 x 3 around the spawn chunk
+	local spawnSet: { [number]: boolean } = {}
+	local spawnLeft = math.min(9, total)
+	for i = 1, spawnLeft do
+		spawnSet[order[i]] = true
+	end
 	local nc = n // world.cfg.chunkColumns
 	-- adaptive dispatch: keep the serial write time per frame near the budget
 	local perFrame = 2
@@ -147,7 +152,11 @@ function TerrainBuilder.run(
 				end
 				mirror:SetAttribute("WorldChunks", done)
 				setProgress(mirror, "voxels", 0.3 + 0.7 * done / total)
-				if not spawnReady and done >= spawnChunks then
+				if spawnSet[id] then
+					spawnSet[id] = nil
+					spawnLeft -= 1
+				end
+				if not spawnReady and spawnLeft <= 0 then
 					spawnReady = true
 					task.spawn(onSpawnReady, spawn)
 				end

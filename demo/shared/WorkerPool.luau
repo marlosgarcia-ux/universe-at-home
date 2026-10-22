@@ -119,9 +119,9 @@ local function finish(pool: Pool, job: Job, ok: boolean, result: any, ms: number
 	pool.stats.ms += ms
 	local cb = job.callback
 	if cb then
-		local cok, cerr = pcall(cb, ok, result, ms, worker)
-		if not cok then
-			warn(string.format("[WorkerPool %s] callback for %s failed: %s", pool.name, job.kind, tostring(cerr)))
+		local outcome = table.pack(pcall(cb, ok, result, ms, worker))
+		if not outcome[1] then
+			warn(string.format("[WorkerPool %s] callback for %s failed: %s", pool.name, job.kind, tostring(outcome[2])))
 		end
 	end
 end

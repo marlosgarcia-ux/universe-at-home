@@ -74,3 +74,10 @@ Everything here is a design target for the build; claims about engine behaviour 
 
 - Open `build/UniverseMeadow.rbxlx` and press Play. In a published place, enable **Allow Mesh / Image APIs** in the experience's security settings.
 - Studio, servers and plugins have no editable memory budget, so T1 reports the real limit only on a device in a published place.
+
+## 8. How to run (build status: M1, landscape and HUD)
+
+1. Open `build/UniverseMeadow.rbxlx` in Roblox Studio (File, Open from File) and press **Play**.
+2. While the server generates the valley, the camera orbits above it and a progress bar shows the stage (heights, erosion, voxels) and the chunk count. Chunks appear in rings around the spawn; your character spawns when the 3 x 3 chunks under the spawn exist.
+3. The HUD (toggle with **H**) shows FPS, frame times, memory per tag, triangles, and a **self-check and capabilities** panel listing every stage of the server (S) and client (C) with ok / fallback / failed and a one-line reason. The same lines appear in Output as `MEADOW|side|feature|state|detail`.
+4. Rebuild from source with `tools/build_demo.sh` (Rojo 7.7.1, luau-lsp, Luau CLI).

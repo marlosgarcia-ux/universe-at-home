@@ -32,10 +32,12 @@
 --                pixel clipped by the end line), disc and clipped pixel (cut discs),
 --                per-edge Green integrals (polygons, any number of edges per pixel).
 --                F2: where two or more shapes' edges enter a pixel ("conflict
---                pixels") the composite is computed with exact visibility
---                (compute/Visibility.luau) instead of chaining coverage as alpha,
---                so abutting shapes leave no seam (C11). Elsewhere coverage as alpha
---                is exact. Culling reach is sqrt(2)/2 AA widths (C4).
+--                pixels") the composite is computed exactly instead of chaining
+--                coverage as alpha, so abutting shapes leave no seam (C11): when
+--                the partial shapes are pairwise disjoint (shared edges, chords)
+--                as sum A_i X_i + (1 - sum A_i) X_0 (C19), otherwise with exact
+--                visibility (compute/Visibility.luau, C18). Elsewhere coverage as
+--                alpha is exact (C17). Culling reach is sqrt(2)/2 AA widths (C4).
 --   MODE_LAYERED exact coverage (F1) composited as alpha everywhere: shows the
 --                conflation seam at shared edges (kept for comparison and cost).
 --   MODE_LINEAR  clamp(0.5 - d / aa, 0, 1), MyMath.coverage: the PREVIEW ramp.
@@ -91,13 +93,15 @@ export type Bins = {
 	lists: { { number } },
 }
 
-export type Stats = { nodes: number, uniform: number, leaves: number, shaded: number, evals: number, conflicts: number }
+-- conflicts: pixels where two or more shapes' edges enter (exact visibility);
+-- disjoint: those resolved by the disjoint fast path
+export type Stats = { nodes: number, uniform: number, leaves: number, shaded: number, evals: number, conflicts: number, disjoint: number }
 
-local stats: Stats = { nodes = 0, uniform = 0, leaves = 0, shaded = 0, evals = 0, conflicts = 0 }
+local stats: Stats = { nodes = 0, uniform = 0, leaves = 0, shaded = 0, evals = 0, conflicts = 0, disjoint = 0 }
 Raster.stats = stats
 
 function Raster.resetStats()
-	stats.nodes, stats.uniform, stats.leaves, stats.shaded, stats.evals, stats.conflicts = 0, 0, 0, 0, 0, 0
+	stats.nodes, stats.uniform, stats.leaves, stats.shaded, stats.evals, stats.conflicts, stats.disjoint = 0, 0, 0, 0, 0, 0, 0
 end
 
 ----------------------------------------------------------------------------------
@@ -247,7 +251,21 @@ function Raster.polygon(sc: Scene, color: number, pts: { number }): number
 		area += jx * iy - ix * jy
 		jx, jy = ix, iy
 	end
-	local s = push(sc, POLYGON, color, first, n, if area >= 0 then 1 else -1, 0, 0, 0)
+	local sigma = if area >= 0 then 1 else -1
+	-- p4 = 1 when convex (every turn agrees with the orientation): its edges are then
+	-- bounding half-planes, which the exact-visibility fast path uses
+	local convex = 1
+	local ax, ay = pts[2 * n - 3], pts[2 * n - 2]
+	local bx, by = pts[2 * n - 1], pts[2 * n]
+	for i = 1, n do
+		local cx, cy = pts[2 * i - 1], pts[2 * i]
+		if sigma * ((bx - ax) * (cy - by) - (by - ay) * (cx - bx)) < 0 then
+			convex = 0
+			break
+		end
+		ax, ay, bx, by = bx, by, cx, cy
+	end
+	local s = push(sc, POLYGON, color, first, n, sigma, if n >= 3 then convex else 0, 0, 0)
 	updateBounds(sc, s)
 	return s
 end
@@ -330,7 +348,7 @@ function Raster.scaled(sc: Scene, f: number): Scene
 		out.kind[s] = k
 		out.cr[s], out.cg[s], out.cb[s], out.ca[s] = sc.cr[s], sc.cg[s], sc.cb[s], sc.ca[s]
 		if k == POLYGON then
-			out.p1[s], out.p2[s], out.p3[s], out.p4[s], out.p5[s], out.p6[s] = sc.p1[s], sc.p2[s], sc.p3[s], 0, 0, 0
+			out.p1[s], out.p2[s], out.p3[s], out.p4[s], out.p5[s], out.p6[s] = sc.p1[s], sc.p2[s], sc.p3[s], sc.p4[s], 0, 0
 			local first = sc.p1[s]
 			for i = first, first + 2 * sc.p2[s] - 1 do
 				out.verts[i] = sc.verts[i] * f
@@ -932,6 +950,198 @@ Raster.addPieces = addPieces
 -- Per-pixel coverage of list[lo..hi], kept for the exact-visibility path.
 local COV: { number } = table.create(512, 0)
 
+----------------------------------------------------------------------------------
+-- Disjoint fast path (F2). If the shapes whose edges enter a pixel are pairwise
+-- disjoint (the usual seam: abutting tiles, mesh triangles, half-discs, pie slices),
+-- the pixel splits into the regions R_i = shape_i ^ pixel, of exact areas A_i (the
+-- F1 coverages), and the rest. Over R_i the shapes present are i and the shapes
+-- covering the whole pixel; over the rest only the latter. So the exact composite
+-- is sum_i A_i X_i + (1 - sum_i A_i) X_0, X_i the stack composite with shape i
+-- (and every full cover) and X_0 without any partial shape. Disjointness is
+-- decided exactly: a shape lies in the closed outer side of a bounding half-plane
+-- of the other (sides of boxes and convex polygons, chords of cut discs), by its
+-- support function (vertices, or centre minus radius) or by an exactly negated
+-- half-plane (two half-discs sharing a diameter, neighbouring pie slices). Shared
+-- vertices give exactly zero cross products, so shared edges separate.
+----------------------------------------------------------------------------------
+
+-- true if every point q of shape b satisfies n . (q - p) >= off. Differences are
+-- taken before the dot product, so a vertex shared with the half-plane's edge
+-- (q == p, or q - p == the edge vector) gives exactly 0, never a rounding sign.
+local function outerSide(sc: Scene, b: number, nx: number, ny: number, px: number, py: number, off: number): boolean
+	local k = sc.kind[b]
+	local P1, P2, P3, P4, P5 = sc.p1, sc.p2, sc.p3, sc.p4, sc.p5
+	if k == POLYGON then
+		local V = sc.verts
+		local first = P1[b]
+		for i = first, first + 2 * P2[b] - 2, 2 do
+			if nx * (V[i] - px) + ny * (V[i + 1] - py) < off then
+				return false
+			end
+		end
+		return true
+	end
+	local nn = sqrt(nx * nx + ny * ny)
+	local cx, cy = P1[b] - px, P2[b] - py
+	if k == CIRCLE then
+		return nx * cx + ny * cy - P3[b] * nn >= off
+	elseif k == RING then
+		return nx * cx + ny * cy - (P3[b] + P4[b]) * nn >= off
+	elseif k == BOX then
+		-- the rounded box is its inner rectangle swept by a disc of radius rad
+		local ix, iy = P3[b] - P5[b], P4[b] - P5[b]
+		return nx * cx + ny * cy - abs(nx) * ix - abs(ny) * iy - P5[b] * nn >= off
+	elseif k == SEGMENT then
+		local ea = nx * cx + ny * cy
+		local eb = nx * (cx + P3[b]) + ny * (cy + P4[b])
+		return (if ea < eb then ea else eb) - P5[b] * nn >= off
+	end
+	-- cut disc: the exactly complementary half-plane of a cut disc with the same
+	-- centre (a half-disc's partner, a neighbouring pie slice), or the disc outside
+	local V = sc.verts
+	local i = P4[b]
+	if cx == 0 and cy == 0 then
+		for h = 0, P5[b] - 1 do
+			if V[i + 3 * h] == -nx and V[i + 3 * h + 1] == -ny and V[i + 3 * h + 2] == -off then
+				return true
+			end
+		end
+	end
+	return nx * cx + ny * cy - P3[b] * nn >= off
+end
+
+-- true if b lies outside a bounding half-plane of a
+local function separates(sc: Scene, a: number, b: number): boolean
+	local k = sc.kind[a]
+	local P1, P2, P3, P4, P5 = sc.p1, sc.p2, sc.p3, sc.p4, sc.p5
+	if k == BOX then
+		local cx, cy, hx, hy = P1[a], P2[a], P3[a], P4[a]
+		return outerSide(sc, b, 1, 0, cx, cy, hx) or outerSide(sc, b, -1, 0, cx, cy, hx) or outerSide(sc, b, 0, 1, cx, cy, hy) or outerSide(sc, b, 0, -1, cx, cy, hy)
+	elseif k == POLYGON then
+		if P4[a] ~= 1 then
+			return false
+		end
+		-- interior: sigma * cross(e, q - p) >= 0; outside: n . (q - p) >= 0 with
+		-- n = sigma (ey, -ex)
+		local V = sc.verts
+		local sigma = P3[a]
+		local first = P1[a]
+		local last = first + 2 * P2[a] - 2
+		local px, py = V[last], V[last + 1]
+		for i = first, last, 2 do
+			local qx, qy = V[i], V[i + 1]
+			if outerSide(sc, b, sigma * (qy - py), -sigma * (qx - px), px, py, 0) then
+				return true
+			end
+			px, py = qx, qy
+		end
+		return false
+	elseif k == CUTDISC then
+		-- half-plane n . (q - c) <= o: outside is n . (q - c) >= o
+		local V = sc.verts
+		local i = P4[a]
+		for h = 0, P5[a] - 1 do
+			if outerSide(sc, b, V[i + 3 * h], V[i + 3 * h + 1], P1[a], P2[a], V[i + 3 * h + 2]) then
+				return true
+			end
+		end
+		return false
+	end
+	return false
+end
+
+local FR: { number } = table.create(16, 0) -- list indices of the partial shapes
+local XR: { number } = table.create(17, 0) -- premultiplied stack composites X_0..X_k
+local XG: { number } = table.create(17, 0)
+local XB: { number } = table.create(17, 0)
+local XA: { number } = table.create(17, 0)
+local MAX_DISJOINT = 8
+
+-- The exact composite when the partial shapes of list[from..hi] are pairwise
+-- disjoint; returns nil otherwise. Base: straight (br, bg, bb), alpha ba.
+local function disjointComposite(
+	sc: Scene,
+	list: { number },
+	lo: number,
+	from: number,
+	hi: number,
+	br: number,
+	bg: number,
+	bb: number,
+	ba: number
+): (number?, number, number, number)
+	local k = 0
+	for j = from, hi do
+		local c = COV[j - lo + 1]
+		if c > 0 and c < 1 then
+			k += 1
+			if k > MAX_DISJOINT then
+				return nil, 0, 0, 0
+			end
+			FR[k] = j
+		end
+	end
+	for i = 1, k - 1 do
+		local a = list[FR[i]]
+		for j = i + 1, k do
+			local b = list[FR[j]]
+			if not (separates(sc, a, b) or separates(sc, b, a)) then
+				return nil, 0, 0, 0
+			end
+		end
+	end
+	-- X_0 and X_1..X_k bottom-up: a partial shape starts its own composite (as if it
+	-- covered the pixel), every full cover applies to all composites so far
+	local CR, CG, CB, CA = sc.cr, sc.cg, sc.cb, sc.ca
+	XR[1], XG[1], XB[1], XA[1] = br * ba, bg * ba, bb * ba, ba
+	local n = 1
+	local area = 0
+	for j = from, hi do
+		local c = COV[j - lo + 1]
+		if c > 0 then
+			local s = list[j]
+			local a = CA[s] / 255
+			local ia = 1 - a
+			local r, g, b = CR[s] * a, CG[s] * a, CB[s] * a
+			if c >= 1 then
+				for m = 1, n do
+					XR[m] = r + XR[m] * ia
+					XG[m] = g + XG[m] * ia
+					XB[m] = b + XB[m] * ia
+					XA[m] = a + XA[m] * ia
+				end
+			else
+				n += 1
+				XR[n] = r + XR[1] * ia
+				XG[n] = g + XG[1] * ia
+				XB[n] = b + XB[1] * ia
+				XA[n] = a + XA[1] * ia
+				area += c
+			end
+		end
+	end
+	local rest = 1 - area
+	if rest < 0 then
+		rest = 0
+	end
+	local R, G, B, A = XR[1] * rest, XG[1] * rest, XB[1] * rest, XA[1] * rest
+	local m = 1
+	for j = from, hi do
+		local c = COV[j - lo + 1]
+		if c > 0 and c < 1 then
+			m += 1
+			R += XR[m] * c
+			G += XG[m] * c
+			B += XB[m] * c
+			A += XA[m] * c
+		end
+	end
+	if A <= 0 then
+		return br, bg, bb, 0
+	end
+	return R / A, G / A, B / A, if A > 1 then 1 else A
+end
+
 -- Exact composite of the pixel (F2): shapes list[from..hi] above the base colour
 -- (straight r, g, b, alpha a), with coverages COV[j - lo + 1]. Top-down.
 local function resolve(
@@ -958,7 +1168,7 @@ local function resolve(
 			if cov >= 1 then
 				Visibility.full(CR[s], CG[s], CB[s], a)
 			else
-				Visibility.begin(CR[s], CG[s], CB[s], a)
+				Visibility.begin(CR[s], CG[s], CB[s], a, cov)
 				addPieces(sc, s, px, py, w)
 				Visibility.commit()
 			end
@@ -1204,7 +1414,13 @@ local function shadeExact(
 				else
 					br, bgc, bb, ba = r0, g0, b0, a0
 				end
-				ar, ag, ab, aa = resolve(sc, list, lo, reset + 1, hi, px, py, w, br, bgc, bb, ba)
+				local dr, dg, db, da = disjointComposite(sc, list, lo, reset + 1, hi, br, bgc, bb, ba)
+				if dr then
+					stats.disjoint += 1
+					ar, ag, ab, aa = dr, dg, db, da
+				else
+					ar, ag, ab, aa = resolve(sc, list, lo, reset + 1, hi, px, py, w, br, bgc, bb, ba)
+				end
 			end
 			buffer.writeu32(
 				out,

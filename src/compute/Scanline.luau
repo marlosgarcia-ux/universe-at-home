@@ -359,7 +359,7 @@ end
 -- values 0 or +-1, e.g. outer contours one way and holes the other) filled with
 -- a straight-alpha RGBA8 colour.
 export type Path = { contours: { { number } }, color: number }
-export type SceneStats = { conflicts: number, floatPixels: number, spans: number }
+export type SceneStats = { conflicts: number, disjoint: number, floatPixels: number, spans: number }
 
 type Prepared = {
 	edges: { number }, -- x0, y0, x1, y1, dir per edge; y0 < y1; x clamped to [0, W]; sorted by y0
@@ -375,6 +375,7 @@ type Prepared = {
 	a: number,
 	color: number,
 	sigma: number, -- orientation of the path (sign of its total signed area)
+	convex: boolean, -- one convex contour: its edges bound the path (disjoint fast path)
 	contours: { { number } },
 }
 
@@ -440,6 +441,22 @@ local function prepare(path: Path, W: number, H: number): Prepared
 		end
 	end
 	local color = path.color
+	local sigma = if area >= 0 then 1 else -1
+	local convex = #path.contours == 1
+	if convex then
+		local c = path.contours[1]
+		local n = #c // 2
+		local ax, ay = c[2 * n - 3], c[2 * n - 2]
+		local bx, by = c[2 * n - 1], c[2 * n]
+		for i = 1, n do
+			local cx, cy = c[2 * i - 1], c[2 * i]
+			if sigma * ((bx - ax) * (cy - by) - (by - ay) * (cx - bx)) < 0 then
+				convex = false
+				break
+			end
+			ax, ay, bx, by = bx, by, cx, cy
+		end
+	end
 	local row0 = if ymin > 0 then floor(ymin) else 0
 	local row1 = if ymax < H then ceil(ymax) - 1 else H - 1
 	return {
@@ -455,7 +472,8 @@ local function prepare(path: Path, W: number, H: number): Prepared
 		b = (color // 65536) % 256,
 		a = (color // 16777216) / 255,
 		color = color,
-		sigma = if area >= 0 then 1 else -1,
+		sigma = sigma,
+		convex = convex,
 		contours = path.contours,
 	}
 end
@@ -463,7 +481,7 @@ end
 -- Deposits the part of edge (x0, y0)-(x1, y1) (y0 < y1, x in [0, W]) inside row y
 -- into the row's cells (the per-row body of addLineInside) and records the
 -- touched cell range in R. Returns the new range count.
-local function rowEdge(cells: buffer, y: number, x0: number, y0: number, x1: number, y1: number, dir: number, R: { number }, nr: number): number
+local function rowEdge(cells: buffer, W: number, y: number, x0: number, y0: number, x1: number, y1: number, dir: number, R: { number }, nr: number): number
 	local top = if y > y0 then y else y0
 	local bot = if y + 1 < y1 then y + 1 else y1
 	if bot <= top then
@@ -472,6 +490,9 @@ local function rowEdge(cells: buffer, y: number, x0: number, y0: number, x1: num
 	local dxdy = (x1 - x0) / (y1 - y0)
 	local xt = x0 + (top - y0) * dxdy
 	local xn = x0 + (bot - y0) * dxdy
+	-- interpolation can round a hair outside [0, W] at the clipped borders
+	xt = if xt < 0 then 0 elseif xt > W then W else xt
+	xn = if xn < 0 then 0 elseif xn > W then W else xn
 	local d = (bot - top) * dir
 	local xa, xb = xt, xn
 	if xa > xb then
@@ -531,6 +552,45 @@ local function pathPieces(P: Prepared, x: number, y: number)
 	end
 end
 
+-- true if path B lies outside a bounding edge of the convex path A (exact on
+-- shared vertices: differences before products, as in Raster's fast path)
+local function pathSeparates(A: Prepared, B: Prepared): boolean
+	if not A.convex then
+		return false
+	end
+	local c = A.contours[1]
+	local n = #c // 2
+	local sigma = A.sigma
+	local px, py = c[2 * n - 1], c[2 * n]
+	for i = 1, n do
+		local qx, qy = c[2 * i - 1], c[2 * i]
+		local nx, ny = sigma * (qy - py), -sigma * (qx - px)
+		local out = true
+		for _, d in B.contours do
+			for v = 1, #d, 2 do
+				if nx * (d[v] - px) + ny * (d[v + 1] - py) < 0 then
+					out = false
+					break
+				end
+			end
+			if not out then
+				break
+			end
+		end
+		if out then
+			return true
+		end
+		px, py = qx, qy
+	end
+	return false
+end
+
+local EVL: { number } = table.create(64, 0) -- a pixel's events, bottom to top
+local XR: { number } = table.create(17, 0)
+local XG: { number } = table.create(17, 0)
+local XB: { number } = table.create(17, 0)
+local XA: { number } = table.create(17, 0)
+
 -- Renders paths (bottom to top) onto dst (width x height RGBA8, straight alpha),
 -- over a background colour if given (else over dst's current content), as the
 -- exact box filter of the source-over composite (F2): every pixel is computed in
@@ -558,7 +618,7 @@ function Scanline.renderScene(dst: buffer, width: number, height: number, paths:
 	local EVc: { number } = table.create(256, 0)
 	local EVn: { number } = table.create(256, 0)
 	local CL: { number } = table.create(64, 0)
-	local st: SceneStats = { conflicts = 0, floatPixels = 0, spans = 0 }
+	local st: SceneStats = { conflicts = 0, disjoint = 0, floatPixels = 0, spans = 0 }
 	for y = 0, H - 1 do
 		local rowOut = y * W * 4
 		buffer.fill(flag, 0, 0)
@@ -588,7 +648,7 @@ function Scanline.renderScene(dst: buffer, width: number, height: number, paths:
 				local e = act[i]
 				local ey1 = E[e + 3]
 				if ey1 > y then
-					nr = rowEdge(cells, y, E[e], E[e + 1], E[e + 2], ey1, E[e + 4], R, nr)
+					nr = rowEdge(cells, W, y, E[e], E[e + 1], E[e + 2], ey1, E[e + 4], R, nr)
 				end
 				if ey1 > y + 1 then
 					keep += 1
@@ -740,21 +800,114 @@ function Scanline.renderScene(dst: buffer, width: number, height: number, paths:
 				continue
 			end
 			st.conflicts += 1
-			Visibility.reset()
+			local o = x * 32
+			-- the pixel's events, bottom to top, and whether its partial paths are
+			-- pairwise disjoint (then the exact composite is sum A_i X_i + (1 - sum
+			-- A_i) X_0, see Raster's disjoint fast path)
+			local ne = 0
 			local e = buffer.readu32(head, x * 4)
 			while e ~= 0 do
-				local Q = P[EVp[e]]
-				local c = EVc[e]
+				ne += 1
+				EVL[ne] = e
+				e = EVn[e]
+			end
+			local i0, i1 = 1, ne
+			while i0 < i1 do
+				EVL[i0], EVL[i1] = EVL[i1], EVL[i0]
+				i0 += 1
+				i1 -= 1
+			end
+			local disjoint = true
+			local nfrac = 0
+			for i = 1, ne do
+				if EVc[EVL[i]] < 1 then
+					nfrac += 1
+				end
+			end
+			if nfrac > 8 then
+				disjoint = false
+			else
+				for i = 1, ne do
+					local ei = EVL[i]
+					if EVc[ei] < 1 then
+						for j = i + 1, ne do
+							local ej = EVL[j]
+							if EVc[ej] < 1 then
+								local A, B = P[EVp[ei]], P[EVp[ej]]
+								if not (pathSeparates(A, B) or pathSeparates(B, A)) then
+									disjoint = false
+									break
+								end
+							end
+						end
+						if not disjoint then
+							break
+						end
+					end
+				end
+			end
+			if disjoint then
+				st.disjoint += 1
+				XR[1] = buffer.readf64(snapF, o)
+				XG[1] = buffer.readf64(snapF, o + 8)
+				XB[1] = buffer.readf64(snapF, o + 16)
+				XA[1] = buffer.readf64(snapF, o + 24)
+				local n = 1
+				local area = 0
+				for i = 1, ne do
+					local ev = EVL[i]
+					local Q = P[EVp[ev]]
+					local c = EVc[ev]
+					local a, ia = Q.a, 1 - Q.a
+					local r, g, b = Q.r * a, Q.g * a, Q.b * a
+					if c >= 1 then
+						for m = 1, n do
+							XR[m] = r + XR[m] * ia
+							XG[m] = g + XG[m] * ia
+							XB[m] = b + XB[m] * ia
+							XA[m] = a + XA[m] * ia
+						end
+					else
+						n += 1
+						XR[n] = r + XR[1] * ia
+						XG[n] = g + XG[1] * ia
+						XB[n] = b + XB[1] * ia
+						XA[n] = a + XA[1] * ia
+						area += c
+					end
+				end
+				local rest = if area < 1 then 1 - area else 0
+				local sr, sg, sb, sa = XR[1] * rest, XG[1] * rest, XB[1] * rest, XA[1] * rest
+				local m = 1
+				for i = 1, ne do
+					local c = EVc[EVL[i]]
+					if c < 1 then
+						m += 1
+						sr += XR[m] * c
+						sg += XG[m] * c
+						sb += XB[m] * c
+						sa += XA[m] * c
+					end
+				end
+				buffer.writef64(rowF, o, sr)
+				buffer.writef64(rowF, o + 8, sg)
+				buffer.writef64(rowF, o + 16, sb)
+				buffer.writef64(rowF, o + 24, if sa > 1 then 1 else sa)
+				continue
+			end
+			Visibility.reset()
+			for i = ne, 1, -1 do
+				local ev = EVL[i]
+				local Q = P[EVp[ev]]
+				local c = EVc[ev]
 				if c >= 1 then
 					Visibility.full(Q.r, Q.g, Q.b, Q.a)
 				else
-					Visibility.begin(Q.r, Q.g, Q.b, Q.a)
+					Visibility.begin(Q.r, Q.g, Q.b, Q.a, c)
 					pathPieces(Q, x, y)
 					Visibility.commit()
 				end
-				e = EVn[e]
 			end
-			local o = x * 32
 			local sr = buffer.readf64(snapF, o)
 			local sg = buffer.readf64(snapF, o + 8)
 			local sb = buffer.readf64(snapF, o + 16)

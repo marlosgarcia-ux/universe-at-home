@@ -8,7 +8,9 @@
 -- because the shapes' coverage regions inside the pixel are correlated (abutting
 -- shapes are perfectly anti-correlated: two exact halves composite to 3/4, a
 -- 64/255 seam). This module computes the exact box filter of the source-over
--- composite of a pixel's shape stack instead.
+-- composite of a pixel's shape stack instead. (Raster and Scanline.renderScene
+-- first try the cheaper exact formula for pairwise disjoint partial shapes, C19 in
+-- docs/COMPUTE.md 12.2; this module handles everything else.)
 --
 -- Method (signed convex terms). In pixel-local coordinates (pixel = the square
 -- [-1/2, 1/2]^2), every shape's indicator inside the pixel is written as a signed
@@ -157,10 +159,15 @@ function Visibility.full(r: number, g: number, b: number, a: number)
 	end
 end
 
--- Starts a shape that covers the pixel partly; its pieces follow.
-function Visibility.begin(r: number, g: number, b: number, a: number)
+-- Starts a shape that covers the pixel partly; its pieces follow. area (optional):
+-- the shape's exact area in the pixel, already known to the caller (its F1
+-- coverage); when the shape turns out to be one positive piece, that is its
+-- intersection with the whole-pixel term and is not recomputed.
+local eArea = -1
+function Visibility.begin(r: number, g: number, b: number, a: number, area: number?)
 	eR, eG, eB, eA = r, g, b, a
 	nP, nPV = 0, 0
+	eArea = area or -1
 end
 
 -- Piece construction ---------------------------------------------------------------
@@ -327,10 +334,11 @@ end
 
 -- Region areas ---------------------------------------------------------------------
 
--- Area of polygon (px, py)[1..m] intersected with discs K[1..k] (power cells).
--- Discs that contain the (convex) polygon are dropped first and a disc that misses
--- its bounding box makes the area 0, so most regions need one disc area or none.
-local function regionArea(px: { number }, py: { number }, m: number, k: number): number
+-- Area of polygon (px, py)[1..m] intersected with discs K[1..k] (power cells), and
+-- the number of discs kept in K[1..]. Discs that contain the (convex) polygon are
+-- dropped first (they do not change the region) and a disc that misses its
+-- bounding box makes the area 0, so most regions need one disc area or none.
+local function regionArea(px: { number }, py: { number }, m: number, k: number): (number, number)
 	stats.areas += 1
 	if k > 0 then
 		local x0, y0, x1, y1 = px[1], py[1], px[1], py[1]
@@ -351,7 +359,7 @@ local function regionArea(px: { number }, py: { number }, m: number, k: number):
 		for i = 1, k do
 			local cx, cy, r = KX[i], KY[i], KR[i]
 			if cx - r >= x1 or cx + r <= x0 or cy - r >= y1 or cy + r <= y0 then
-				return 0
+				return 0, 0
 			end
 			local r2 = r * r
 			local all = true
@@ -370,9 +378,17 @@ local function regionArea(px: { number }, py: { number }, m: number, k: number):
 		k = k2
 	end
 	if k == 0 then
-		return polyArea(px, py, m)
+		return polyArea(px, py, m), 0
 	elseif k == 1 then
-		return discPolyArea(px, py, m, KX[1], KY[1], KR[1])
+		if m == 4 and ((px[1] == px[4] and px[2] == px[3] and py[1] == py[2] and py[3] == py[4]) or (px[1] == px[2] and px[3] == px[4] and py[2] == py[3] and py[4] == py[1])) then
+			-- an axis-aligned rectangle (the pixel, a box piece): quadrant integration
+			local x0 = if px[1] < px[3] then px[1] else px[3]
+			local x1 = if px[1] < px[3] then px[3] else px[1]
+			local y0 = if py[1] < py[3] then py[1] else py[3]
+			local y1 = if py[1] < py[3] then py[3] else py[1]
+			return Coverage.discBoxArea(KX[1], KY[1], KR[1], x0, y0, x1, y1), 1
+		end
+		return discPolyArea(px, py, m, KX[1], KY[1], KR[1]), 1
 	end
 	local total = 0
 	for i = 1, k do
@@ -417,7 +433,7 @@ local function regionArea(px: { number }, py: { number }, m: number, k: number):
 			end
 		end
 	end
-	return total
+	return total, k
 end
 
 -- Processes the shape begun with Visibility.begin against every current term.
@@ -479,7 +495,14 @@ function Visibility.commit()
 				k += 1
 				KX[k], KY[k], KR[k] = PDX[p], PDY[p], PDR[p]
 			end
-			local a = regionArea(X, Y, m, k)
+			local a
+			if t == 1 and nP == 1 and PS[1] == 1 and eArea >= 0 then
+				a = eArea
+			else
+				local kept
+				a, kept = regionArea(X, Y, m, k)
+				k = kept
+			end
 			if a <= 0 then
 				continue
 			end

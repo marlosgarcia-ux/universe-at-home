@@ -47,6 +47,7 @@ Hard facts that shape every design decision:
 | Bytecode or native IR dump | `/home/user/luau-lang/luau/build/luau-compile --text -O2 file.luau`, `--codegenir` |
 | Run the test suite (both runtimes) | `tests/run.sh` |
 | Ops benchmark | `tools/run_bench.sh /home/user/luau-lang/luau/build/luau 1` |
+| Flawless pipeline benchmark (both runtimes, 3 rounds) | `tools/run_flawless_bench.sh` (writes `bench/results/flawless-x64.md`) |
 | Roblox docs source | `/home/user/roblox/creator-docs/content/en-us/reference/engine/` (yaml per class) |
 | Roblox API dump | `/home/user/maximumadhd/roblox-client-tracker/API-Dump.json` |
 | Luau source | `/home/user/luau-lang/luau/` |
@@ -61,6 +62,16 @@ Network access to roblox.com and devforum is blocked in this environment; use th
 - Follow the economics in `docs/RUNTIME_AUDIT.md` 6.7: spans through `buffer.copy`/`fill`, arithmetic packing, no non-builtin per pixel, cache upvalues in locals before hot loops.
 - Tests live in `tests/*.test.luau`, run by `tests/run.sh` in both runtimes; they must assert, not print.
 
+## Flawless rules (docs/COMPUTE.md sections 1 and 12)
+
+- **F1: coverage is exact area.** Content edges use exact pixel areas: `Raster` `MODE_EXACT` (the default) or the exact functions in `compute/Coverage.luau` (`discBoxArea`, `discPolyArea`, `polygonBoxCoverage`, `MyMath.coverageHalfPlane` for straight edges). `MyMath.coverage` is the linear preview ramp (errs up to 57/255) and `MyMath.coverageCurved` an estimator (O(1/R) residual): neither may write content. Supersampling is never a reference.
+- **F2: composite with exact visibility.** A scene is the exact box filter of its source-over composite. Never paint shapes that share pixels by chaining coverage as alpha (C11 seams of 48 to 84/255): use `Raster` `MODE_EXACT` or `Scanline.renderScene`; `Scanline.composite` is for one path only. Keep the composite in floating point and round each byte once.
+- **F3: deterministic ops only.** `+ - * /`, `sqrt`, `floor`, comparisons, integer `//` and `%`, `bit32`, and angles through `Coverage.dasin` / `Coverage.datan2`; never `math.asin`, `atan`, `sin`, `cos`, `exp`, `pow`, `^` or `lerp` in content (references in tests may). Every new pixel path gets a hash constant asserted in both runtimes.
+- **Reach.** Culling and bounding boxes use the coverage function's reach: `MyMath.COVERAGE_REACH * w` (sqrt(2)/2) for exact coverage, `w/2` only for the ramp.
+- **Conditioning.** Exact formulas must stay well conditioned at their edge cases (vertical tangents, near-tangent chords, tiny or huge radii, shared vertices): prefer closed forms of differences (one arcsine of an angle difference, `(r - t)(r + t)` for `r^2 - t^2`), take differences before products in geometric predicates, and pin references to high-precision values where the double closed form is ill conditioned.
+- **References and proofs.** Every exactness claim is either proved in COMPUTE.md or asserted against an independent exact reference (`refPixel` in `tests/flawless.test.luau`, 50-digit values), with the bound `|byte - 255 A| <= 0.51`.
+- **LOD.** Render each level directly at its own resolution (`Raster.scaled`) or with the exact area resampler (`Filter.areaResample` for opaque, `Filter.areaResampleAlpha` for straight-alpha raster content). Switch levels only through `Saturn` (hysteresis selector, two-phase stacked fade applied to `ImageTransparency` / `Decal.Transparency`): never crossfade on the CPU and never fade both layers symmetrically.
+
 ## Repository map
 
 ```
@@ -69,9 +80,13 @@ docs/BRIEF.md           this file
 docs/DESIGN.md          the axioms, theorems, algorithms and architecture (written by the design workflow)
 bench/ops.luau          op and kernel micro-benchmark; bench/results/ holds runs
 studio/                 scripts to run inside Roblox Studio or a published place
-src/MyMath.luau         deterministic numerics, hashing, noise, SDF primitives, colour arithmetic, budget allocation
+src/MyMath.luau         deterministic numerics, hashing, noise, SDF primitives, colour arithmetic, budget allocation,
+                        the pixel axioms (F1 to F3, C3 to C5, reach) and exact half-plane coverage
 src/Pixels.luau         buffer-level RGBA8 ops (span fill, blits, 2x box mip, source-over, alpha bleed, palette expand)
 src/Canvas.luau         CPU image with dirty-tile tracking and a flush planner
+src/Saturn.luau         LOD selection with hysteresis and two-phase stacked GPU crossfades (pure logic)
+src/compute/            rasterizers and image operators of docs/COMPUTE.md; Raster (flawless by default),
+                        Scanline (exact multi-path scenes), Visibility (exact compositing), Coverage, Filter, ...
 tests/                  Luau tests runnable by the CLI
 tools/                  benchmark runner and result merger
 ```

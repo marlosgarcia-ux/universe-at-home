@@ -6,8 +6,9 @@
 --   2. timings     run time of every public EditableImage method and the AssetService
 --                  calls around it, as median and best of several runs
 --   3. ops         an empirical truth table for every Enum.ImageCombineType, plus
---                  write/read round-trips that reveal the stored alpha convention and
---                  how DrawImageTransformed actually filters
+--                  write/read round-trips that reveal the stored alpha convention,
+--                  how DrawImageTransformed actually filters, and whether baking
+--                  with CreateDataModelContentAsync keeps the bytes (probeBakeFidelity)
 --
 -- Usage: require this module from studio/RunProbe.client.luau (client budget, the
 -- interesting case) or studio/RunProbe.server.luau. Everything is wrapped in pcall, so a
@@ -676,6 +677,73 @@ local function probeSampling()
 	end
 end
 
+-- Bake fidelity: does content baked by CreateDataModelContentAsync keep the bytes the
+-- flawless pipeline computed (docs/COMPUTE.md "Flawless pipeline", engine-dependent
+-- guarantees)? Bakes a 64 x 64 pattern holding every byte value, alpha ramps, hard
+-- alpha edges and colour under alpha 0, then reads it back through a new
+-- EditableImage if the engine allows that. 0 differing visible pixels means F1, F2
+-- and F3 survive baking at mip level 0; mips themselves cannot be read back here.
+local function probeBakeFidelity()
+	out("## ops: bake fidelity, CreateDataModelContentAsync [%s]", context())
+	local W = 64
+	local src = newImage(W, W)
+	if not src then
+		return
+	end
+	local b = buffer.create(W * W * 4)
+	for y = 0, W - 1 do
+		for x = 0, W - 1 do
+			local r = (x * 4 + y) % 256
+			local g = (y * 4 + x * 3) % 256
+			local bl = ((x + y) * 2) % 256
+			local a = if y < 16 then 255 elseif y < 32 then (x * 4) % 256 elseif y < 48 then (if x % 2 == 0 then 0 else 255) else (x * 4 + 3) % 256
+			buffer.writeu32(b, (y * W + x) * 4, r + g * 256 + bl * 65536 + a * 16777216)
+		end
+	end
+	src:WritePixelsBuffer(Vector2.zero, Vector2.new(W, W), b)
+	local ok, err = pcall(function()
+		local result, content = AssetService:CreateDataModelContentAsync(Content.fromObject(src))
+		out("  bake result: %s", tostring(result))
+		if result ~= Enum.CreateContentResult.Success then
+			return
+		end
+		local okR, back = pcall(function()
+			return AssetService:CreateEditableImageAsync(content)
+		end)
+		if not okR or not back then
+			out("  baked content cannot be read back as an EditableImage (%s); compare visually", tostring(back))
+			return
+		end
+		local size = back.Size
+		out("  read back %dx%d", size.X, size.Y)
+		if size.X == W and size.Y == W then
+			local rb = back:ReadPixelsBuffer(Vector2.zero, Vector2.new(W, W))
+			local visibleDiff, hiddenDiff, maxD, maxA = 0, 0, 0, 0
+			for i = 0, W * W - 1 do
+				if buffer.readu32(b, i * 4) ~= buffer.readu32(rb, i * 4) then
+					local a = buffer.readu8(b, i * 4 + 3)
+					if a > 0 then
+						visibleDiff += 1
+						for c = 0, 2 do
+							maxD = math.max(maxD, math.abs(buffer.readu8(b, i * 4 + c) - buffer.readu8(rb, i * 4 + c)))
+						end
+					else
+						hiddenDiff += 1
+					end
+					maxA = math.max(maxA, math.abs(a - buffer.readu8(rb, i * 4 + 3)))
+				end
+			end
+			out("  baked vs source: %d visible pixels differ (max colour diff %d), %d pixels differ only under alpha 0, max alpha diff %d", visibleDiff, maxD, hiddenDiff, maxA)
+			out("    0 visible differences and alpha diff 0: baking keeps the computed bytes")
+		end
+		back:Destroy()
+	end)
+	if not ok then
+		out("  bake fidelity error: %s", tostring(err))
+	end
+	src:Destroy()
+end
+
 ----------------------------------------------------------------------------------
 
 function Probe.run(options: { budget: boolean?, timings: boolean?, ops: boolean?, limits: boolean? }?)
@@ -689,6 +757,7 @@ function Probe.run(options: { budget: boolean?, timings: boolean?, ops: boolean?
 		probeCombineOps()
 		probePrimitiveOps()
 		probeSampling()
+		probeBakeFidelity()
 	end
 	if o.timings ~= false then
 		probeTimings()

@@ -55,7 +55,9 @@ end
 
 -- Remotes ---------------------------------------------------------------------------
 Status.stage(reg, "remotes", function()
-	Net.serverInit(ReplicatedStorage)
+	Net.serverInit(ReplicatedStorage, function(className: string): any
+		return Instance.new(className :: any)
+	end)
 	return "ok", "RemoteEvents in ReplicatedStorage." .. Net.FOLDER
 end)
 
@@ -140,7 +142,7 @@ end
 
 -- Environment ------------------------------------------------------------------------
 Status.stage(reg, "environment", function()
-	local Environment = require(Server:WaitForChild("Environment"))
+	local Environment = require(script.Parent:WaitForChild("Environment"))
 	return "ok", Environment.apply()
 end)
 
@@ -168,7 +170,7 @@ statusFolder:SetAttribute("ServerActors", pool.readyCount)
 -- Terrain ----------------------------------------------------------------------------
 local terrainResult: any = nil
 task.spawn(function()
-	local TerrainBuilder = require(Server:WaitForChild("TerrainBuilder"))
+	local TerrainBuilder = require(script.Parent:WaitForChild("TerrainBuilder"))
 	local ok = Status.stage(reg, "terrain", function()
 		terrainResult = TerrainBuilder.run(reg, pool, statusFolder, onSpawnReady)
 		return "ok", string.format("%d chunks in %.1f s (%s)", terrainResult.chunks, terrainResult.seconds, terrainResult.mode)
@@ -220,9 +222,38 @@ task.spawn(function()
 	end)
 end)
 
+-- Static grass content baked for every client (ring 0 variants, ring 1 masks) ---------
+task.spawn(function()
+	local GrassBaker = optionalRequire("GrassBaker")
+	if not GrassBaker then
+		Status.set(reg, "bake_grass", "skipped", "GrassBaker not present; clients build grass content themselves")
+		return
+	end
+	Status.stage(reg, "bake_variants", function()
+		return GrassBaker.variants(reg)
+	end, function(message: string)
+		return "fallback", "clients build their own variant meshes"
+	end)
+	Status.stage(reg, "bake_masks", function()
+		return GrassBaker.masks(reg, pool)
+	end, function(message: string)
+		return "fallback", "clients render their own shell masks"
+	end)
+	local Bake = optionalRequire("Bake")
+	if Bake then
+		statusFolder:SetAttribute("BakeAvailable", Bake.successes > 0)
+		Status.set(
+			reg,
+			"baking",
+			if Bake.successes > 0 then "ok" else "fallback",
+			string.format("CreateDataModelContentAsync: %d of %d bakes succeeded%s", Bake.successes, Bake.attempts, if Bake.lastError then "; last error " .. tostring(Bake.lastError) else "")
+		)
+	end
+end)
+
 -- Clients say hello with a capability summary ------------------------------------------
 Status.stage(reg, "hello", function()
-	local hello = Net.serverGet(ReplicatedStorage, "Hello")
+	local hello = Net.serverGet(ReplicatedStorage, "Hello") :: RemoteEvent
 	local lim = Net.LIMITS.Hello
 	local limiter = Net.newLimiter(lim.rate, lim.burst)
 	hello.OnServerEvent:Connect(function(player: Player, payload: any)

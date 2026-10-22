@@ -110,10 +110,12 @@ Config.rocks = {
 Config.grass = {
 	ring0 = 24, -- blade geometry inside this radius (studs)
 	ring1 = 96, -- shell grass up to this radius
-	patch = 8, -- studs per side of a blade patch
-	bladesPerPatch = 900, -- density x1 (T11 multiplies it)
-	bladeSegments = 3, -- quads per blade below the tip triangle: 2 * 3 + 1 = 7 triangles
-	bladeSegmentsFar = 2, -- 5 triangles for the outer patches of ring 0
+	patch = 4, -- studs per side of a blade patch (rigid wind tilt keeps edges in the ground)
+	bladesPerPatch = 300, -- density x1 (T11 multiplies it): 18.75 blades per square stud
+	bladeSegments = 2, -- quads per blade below the tip: 2 * 2 + 1 = 5 triangles
+	bladeSegmentsFar = 1, -- 3 triangles for the sparse outer variant
+	lodNear = 12, -- studs: full density inside, 60 percent beyond (Saturn selector)
+	lodFar = 18, -- 30 percent beyond
 	bladeHeight = 1.25, -- studs, average
 	bladeHeightJitter = 0.55,
 	bladeWidth = 0.075, -- studs at the root
@@ -121,8 +123,11 @@ Config.grass = {
 	shellCount = 12,
 	shellHeight = 1.05, -- studs from shell 0 to the top shell
 	shellTile = 16, -- studs per shell sheet side
-	shellTexture = 256, -- alpha mask resolution of a shell layer
-	shellBlades = 2200, -- blade cross-sections per mask
+	shellTexture = 256, -- alpha mask resolution of a shell layer (one 4 x 4 stud repeat)
+	shellRepeat = 4, -- studs per mask repeat (= sheet grid spacing)
+	shellBlades = 2600, -- blade cross-sections per mask
+	shellBladeRadius = 0.011, -- base radius in tile units (2.8 px at 256)
+	shellLeanPx = 22, -- lean of a blade tip in mask pixels
 	fadeWidth = 6, -- studs of crossfade at each ring boundary
 	hysteresis = 1.15, -- LOD hysteresis factor (Saturn eta)
 	fadeSeconds = 0.6,

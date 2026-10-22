@@ -20,6 +20,7 @@ local Workspace = game:GetService("Workspace")
 local Demo = ReplicatedStorage:WaitForChild("Demo")
 local WorldGen = require(Demo:WaitForChild("WorldGen"))
 local RockGen = require(Demo:WaitForChild("RockGen"))
+local GrassGen = require(Demo:WaitForChild("GrassGen"))
 
 local Jobs = {}
 
@@ -179,6 +180,14 @@ Jobs.chunk = {
 			mode = mode,
 			channelError = channelError or state.channelError,
 		}
+	end,
+}
+
+Jobs.shellMask = {
+	parallel = function(p: any, _state: { [string]: any }): any
+		local t0 = os.clock()
+		local buf, how = GrassGen.renderMask(p.k, p.layers, p.size, p.seed, p.count, p.radius, p.lean)
+		return { k = p.k, pixels = buf, how = how, ms = (os.clock() - t0) * 1000 }
 	end,
 }
 

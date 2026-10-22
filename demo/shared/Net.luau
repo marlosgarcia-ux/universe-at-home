@@ -11,14 +11,14 @@ local Net = {}
 Net.FOLDER = "DemoNet"
 
 -- name -> direction ("c2s" client to server, "s2c" server to client)
-Net.EVENTS = {
+Net.EVENTS = ({
 	Hello = "c2s", -- client ready: { version, capabilities summary }
 	BenchHashes = "c2s", -- determinism referee input: { run, test, entries = { {key, hash} } }
 	TrainRequest = "c2s", -- ask the server to run T10 training slices: { slices }
 	BenchVerdict = "s2c", -- referee verdict broadcast: { run, test, text, ok }
 	TrainProgress = "s2c", -- T10 progress: { slice, of, ms, done, text }
 	ServerNote = "s2c", -- free-form status line for the HUD
-}
+} :: { [string]: string })
 
 -- Per event: maximum calls per second (token bucket rate) and burst.
 Net.LIMITS = {
@@ -27,23 +27,25 @@ Net.LIMITS = {
 	TrainRequest = { rate = 0.2, burst = 2 },
 }
 
-local function folderOf(parent: Instance): Instance?
-	return parent:FindFirstChild(Net.FOLDER)
+-- Engine objects are passed in (`rs` is ReplicatedStorage, `new` is Instance.new) and
+-- typed `any` here, so this module also loads in the Luau CLI tests; callers cast the
+-- results (RemoteEvent) and luau-lsp checks them there.
+
+local function folderOf(rs: any): any
+	return rs:FindFirstChild(Net.FOLDER)
 end
 
--- Server: creates the folder and every RemoteEvent (idempotent).
-function Net.serverInit(replicatedStorage: Instance): Instance
-	local folder = folderOf(replicatedStorage)
+-- Server: creates the folder and every RemoteEvent (idempotent). Returns the folder.
+function Net.serverInit(rs: any, new: (className: string) -> any): any
+	local folder = folderOf(rs)
 	if not folder then
-		local f = Instance.new("Folder")
-		f.Name = Net.FOLDER
-		f.Parent = replicatedStorage
-		folder = f
+		folder = new("Folder")
+		folder.Name = Net.FOLDER
+		folder.Parent = rs
 	end
-	assert(folder, "DemoNet folder missing")
 	for name in Net.EVENTS do
 		if not folder:FindFirstChild(name) then
-			local e = Instance.new("RemoteEvent")
+			local e = new("RemoteEvent")
 			e.Name = name
 			e.Parent = folder
 		end
@@ -52,23 +54,23 @@ function Net.serverInit(replicatedStorage: Instance): Instance
 end
 
 -- Server: the RemoteEvent called name (after serverInit).
-function Net.serverGet(replicatedStorage: Instance, name: string): RemoteEvent
-	local folder = folderOf(replicatedStorage)
+function Net.serverGet(rs: any, name: string): any
+	local folder = folderOf(rs)
 	assert(folder, "Net.serverInit has not run")
 	local e = folder:FindFirstChild(name)
 	assert(e and e:IsA("RemoteEvent"), "unknown remote " .. name)
-	return e :: RemoteEvent
+	return e
 end
 
--- Client: waits (up to timeout seconds) for the RemoteEvent called name.
-function Net.clientGet(replicatedStorage: Instance, name: string, timeout: number?): RemoteEvent?
-	local folder = replicatedStorage:WaitForChild(Net.FOLDER, timeout or 30)
+-- Client: waits (up to timeout seconds) for the RemoteEvent called name; nil if absent.
+function Net.clientGet(rs: any, name: string, timeout: number?): any
+	local folder = rs:WaitForChild(Net.FOLDER, timeout or 30)
 	if not folder then
 		return nil
 	end
 	local e = folder:WaitForChild(name, timeout or 30)
 	if e and e:IsA("RemoteEvent") then
-		return e :: RemoteEvent
+		return e
 	end
 	return nil
 end

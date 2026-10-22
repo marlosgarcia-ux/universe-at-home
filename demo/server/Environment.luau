@@ -95,7 +95,7 @@ function Environment.apply(): string
 	terrain.WaterWaveSize = t.waterWaveSize
 	terrain.WaterWaveSpeed = t.waterWaveSpeed
 	local colored = 0
-	for name, color in t.materialColors do
+	for name, color in (t.materialColors :: { [string]: { number } }) do
 		local ok = pcall(function()
 			terrain:SetMaterialColor((Enum.Material :: any)[name], rgb(color))
 		end)

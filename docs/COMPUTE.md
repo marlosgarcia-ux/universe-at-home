@@ -8,8 +8,9 @@ Times are milliseconds per full 1024 x 1024 frame, interpreter at `--!optimize 2
 
 ## 0. Headline findings
 
-1. **The project's coverage axiom is wrong in a measurable way.** `MyMath.coverage(d, w) = clamp(0.5 - d/w, 0, 1)` errs by up to 10.94/255 on a straight 45 degree edge (closed form, C3), 11/255 on circles of any radius, 38/255 at sharp box corners and 26 to 57/255 at polygon corners, against the exact pixel area. Section 9 gives the correction; `src/MyMath.luau` is left unchanged for its owner to decide.
-2. **Flawless anti-aliasing is cheap and deterministic.** `Raster` mode `MODE_EXACT` (half-plane area, a first-order curvature term, exact disc areas from a deterministic arcsine, exact wedge clipping at polygon corners) writes every tested primitive within 0.50/255 of the exact area, which is the 8-bit rounding floor itself (capsule caps 0.74/255), at about 1.2x the cost of the linear ramp interpreted, and stays pixel-identical between the quadtree renderer and brute force.
+0. **The 2D pipeline is now flawless by its own definition (section 12).** Every byte `Raster` writes in its default mode is the correctly rounded exact area for every primitive (F1, capsule caps included), every multi-shape pixel is the correctly rounded exact box filter of the source-over scene with no seam at shared edges (F2, also for multi-path `Scanline.renderScene`), interpreter and native code agree bit for bit (F3), every LOD level is the exact box filter at its own resolution, and `src/Saturn.luau` switches levels without oscillation and without a transparency dip. Measured worst error at most 0.5000/255 (the rounding floor) for every primitive and scene, against an independent exact reference; cost 1.35x the linear preview interpreted on the 256-shape scene (1.65x native), 2.1x on a seam-heavy triangle mesh.
+1. **The project's coverage axiom was wrong in a measurable way (corrected, section 9).** `MyMath.coverage(d, w) = clamp(0.5 - d/w, 0, 1)` errs by up to 10.94/255 on a straight 45 degree edge (closed form, C3), 11/255 on circles of any radius, 38/255 at sharp box corners and 26 to 57/255 at polygon corners, against the exact pixel area. `MyMath` now states the exact-area axioms (C3 to C5, the reach rule) and documents the ramp as the preview ramp.
+2. **Flawless anti-aliasing is cheap and deterministic.** `Raster` mode `MODE_EXACT` (now the default) uses exact areas for every primitive: disc areas by quadrant integration, exact capsule and rounded-box decompositions, per-edge Green integrals for polygons. An earlier version of this mode used a first-order curvature correction; its residual turned out to be O(1/R), not O(1/R^2) (C5, corrected), so it missed F1 on circles below a few hundred pixels and on capsule caps (0.74/255). The renderer stays pixel-identical between the quadtree and brute force.
 3. **For polygons and paths, exact is also fastest.** The scanline signed-area painter renders 256 stars exactly (0.50/255) in 39 ms interpreted, 10 to 12x faster than the SDF quadtree raster (397 ms linear, 485 ms exact).
 4. **Supersampling is not a reference.** 4 x 4 supersampling errs up to 31/255 and 16 x 16 up to 4.4 to 6/255 against exact area. Exact area, computed analytically, defines "flawless" (section 1).
 5. **The interpreter numbers in the previous notes were native numbers.** The "34 to 67 ms" quoted for 256 shapes at 1024 x 1024 came from the `--codegen` half of a two-run command. The interpreter takes 106 ms (linear) and 131 ms (exact), native 32 and 44 ms.
@@ -23,11 +24,11 @@ A rendered pixel is a box-filtered sample: the mean of the continuous image over
 
 **Definition (F1, per shape).** A coverage method is *flawless* when, for every pixel, `|byte - 255 A| <= 0.5 + epsilon` with `epsilon = 0.01`: the byte it writes is the correctly rounded exact area (a tie may round either way). It is *visually flawless* when the bound is 1.0 (one least significant bit).
 
-**Definition (F2, per scene).** For a scene composited with source-over, F1 applies to each shape's coverage. Compositing coverage as alpha is itself exact only when at most one edge crosses a pixel; where edges of different shapes cross the same pixel (shared or abutting edges) the composite differs from the exact box filter of the scene ("conflation", C11, measured at 64/255 in 3.2). Shapes that must abut without seams are merged into one exact-area path instead.
+**Definition (F2, per scene).** The composite of all shapes equals the correctly rounded exact box filter of the scene: each pixel is the sum over visible regions of colour times area, with source-over visibility (in premultiplied form, then converted to straight alpha and rounded once). Compositing coverage as alpha is exact only when at most one shape's edge enters a pixel (proof in 12.2); where edges of different shapes enter the same pixel (shared or abutting edges, crossings) chaining coverage as alpha differs from the box filter ("conflation", C11, 48 to 84/255 measured). The pipeline computes exact visibility at those pixels (section 12).
 
 **Definition (F3, determinism).** The same inputs give the same bytes in the interpreter and in native code, on every device: only the operations of `docs/RUNTIME_AUDIT.md` 6.5 touch content. `tests/compute.test.luau` checks this by hashing every prototype's output and comparing against constants that both runtimes must reproduce.
 
-**Exact references used** (all in `src/compute/Coverage.luau`): `circleArea` (closed form by splitting the x range where the clipping switches; uses `math.asin`, reference only), `discRectArea` (the same with a deterministic arcsine, usable for content), `polygonArea` (Sutherland-Hodgman clip to the pixel, then the shoelace formula), and compositions of these for rings (difference of discs), rounded boxes and capsules (polygons flattened to 400 to 600 vertices per arc). For images, `Filter.areaResample` is the exact box-filter reference at any scale (C9).
+**Exact references used** (all in `src/compute/Coverage.luau`): `circleArea` (closed form by splitting the x range where the clipping switches; uses `math.asin`, reference only), `discRectArea` (the same with a deterministic arcsine, usable for content), `polygonArea` (Sutherland-Hodgman clip to the pixel, then the shoelace formula), and compositions of these for rings (difference of discs), rounded boxes and capsules (polygons flattened to 400 to 600 vertices per arc). For images, `Filter.areaResample` is the exact box-filter reference at any scale (C9). The flawless tests use an independent exact scene reference instead (12.4), and pin disc areas to 50-digit decimal values: plain x-integration (`circleArea` as first written) lost about 1e-8 r^2 at vertical tangents (6.5e-7 at r = 30.6), now fixed by a well-conditioned chord integral.
 
 ## 2. Spatial structures
 
@@ -136,14 +137,14 @@ The quadtree is 570x faster than brute force interpreted (500x native) and 6x fa
 
 **Theorems.**
 - **Exactness [proved].** By Green's theorem the area of polygon-intersect-pixel is a sum over edges of signed trapezoid areas; the accumulator adds each edge's trapezoid area to the cells it crosses and the row prefix sum completes it. With the non-zero rule, coverage = `min(1, |sum|)`. Error: floating rounding only. **Measured** 0.50/255 for stars, squares, clipped triangles.
-- **C11 (conflation) [proved, measured].** Two shapes that share an edge, each with exact coverage 1/2 on the edge pixels, composite to `1/2 + 1/2 (1 - 1/2) = 3/4` instead of 1: a 64/255 seam. The same happens in `Raster` (any per-shape coverage composited with source-over). Accumulating both into **one** accumulator gives winding sums that cancel on the shared edge: measured 0.50/255.
+- **C11 (conflation) [proved, measured; fixed in 12].** Two shapes that share an edge, each with exact coverage 1/2 on the edge pixels, composite to `1/2 + 1/2 (1 - 1/2) = 3/4` instead of 1: a 64/255 seam. The same happens in `Raster` (any per-shape coverage composited with source-over). Accumulating both into **one** accumulator gives winding sums that cancel on the shared edge: measured 0.50/255, but only for paths of one colour. For any scene, `Scanline.renderScene` and `Raster` `MODE_EXACT` now compute exact visibility at every pixel where two or more edges enter (12.2), for different colours and translucent paths too.
 - Flattening tolerance `tau` bounds the area error per pixel by about `1.5 tau` (chord length in a pixel at most `sqrt(2)`); a circle of radius 90 needs 945 vertices at `tau = 0.0005` for 0.59/255 (previous notes). For circles the exact disc of 3.3 is cheaper.
 
 **Measured.** 256 stars, 1024 x 1024: scanline painter **39 / 12 ms**, SDF quadtree raster 397 / 91 ms (linear) and 485 / 139 ms (exact). The scanline path is 10 to 12x faster interpreted *and* exact.
 
 **ALLAN.** Both are event-driven row walkers. Scanline events are edge cells (exact); ALLAN events are leaf boundaries and convergence points (LIQUID T2). A combined row walker merges the two sorted event lists: between events, ALLAN's state jumps in closed form (T1) and coverage is constant, so a converged ALLAN output with coverage 0 or 1 is one span fill; at edge cells the pixel is ALLAN's paint composited with exact coverage. That is the classic vector split into *coverage x paint*, with ALLAN as the paint **[predicted]**: cost per row = ALLAN events + edge cells.
 
-**Verdict: adopt** as the primary path for polygons, glyphs and paths. Merge shapes that abut into one accumulator (C11).
+**Verdict: adopt** as the primary path for polygons, glyphs and paths. Render multi-path scenes with `Scanline.renderScene` (exact, F2; 12.3), not by calling `composite` per path, which conflates shared edges (C11) and rounds translucent layers to 8 bits after every path.
 
 ### 3.3 Exact area coverage versus distance approximations
 
@@ -152,12 +153,12 @@ The quadtree is 570x faster than brute force interpreted (500x native) and 6x fa
 | Method | Formula | Deterministic | Cost |
 |---|---|---|---|
 | linear (`MyMath.coverage`) | `clamp(0.5 - d, 0, 1)` | yes | 1x |
-| half-plane (`Coverage.halfPlane`) | exact area of the pixel inside the tangent line, from `d` and the gradient `n`: a trapezoid density of width `|nx| + |ny|` | yes | about 1.1x |
-| curvature-corrected half-plane (`Raster.covCurved`) | half-plane minus `k (t1^3 - t0^3) / 6` over the chord `[t0, t1]` the tangent line cuts from the pixel, `k` the boundary curvature | yes | about 1.2x |
-| exact pieces | `discRectArea` (circles under 8 px radius, rounded box corners), product of 1D overlaps (sharp boxes), wedge clipping at polygon vertices (`Coverage.corner`), two-edge clipping where non-adjacent edges share a pixel (`Coverage.edgePair`) | yes (deterministic arcsine `Coverage.dasin`, within 6.5e-14 of libm) | only on the few pixels that need it |
+| half-plane (`Coverage.halfPlane`) | exact area of the pixel inside the tangent line, from `d` and the gradient `n`: a trapezoid density of width `\|nx\| + \|ny\|` | yes | about 1.1x |
+| curvature-corrected half-plane (`MyMath.coverageCurved`, `Raster.covCurved`) | half-plane minus `k (t1^3 - t0^3) / 6` over the chord `[t0, t1]` the tangent line cuts from the pixel, `k` the boundary curvature | yes | about 1.2x |
+| exact areas (flawless, 12.1) | `Coverage.discBoxArea` (disc and rectangle by quadrant integration: circles, ring edges as a difference of discs, rounded-box corners), products of 1D overlaps (boxes, any width), the exact capsule decomposition, `Coverage.discPolyArea` (disc and convex polygon: capsule caps, cut discs), `Coverage.polygonBoxCoverage` (polygons, any number of edges per pixel) | yes (deterministic arcsine `Coverage.dasin`, now within 2 rounding units; `Coverage.datan2` built on it) | 1.0 to 1.3x the old approximate mode per primitive |
 | supersampling n x n | fraction of inside sample points | yes | n^2 evaluations |
 
-`Raster` `MODE_EXACT` combines the curvature-corrected half-plane with the exact pieces.
+`Raster` `MODE_EXACT` (the default) uses the exact areas for every primitive. Before this change it combined the curvature-corrected half-plane with exact pieces (disc areas under 8 px, wedge clipping `Coverage.corner` and `Coverage.edgePair` where at most two polygon edges enter); the table's `MODE_EXACT` column below is that earlier version, kept for the record, and 12.1 has the flawless numbers.
 
 **Measured error against exact area** (max over all pixels the edge touches, 1/255 units; single white shape on transparent black, so the alpha byte is the coverage):
 
@@ -170,7 +171,7 @@ The quadtree is 570x faster than brute force interpreted (500x native) and 6x fa
 | ring r = 30, t = 3 | 11.4 | - | - | **0.50** | - | - |
 | sharp box | 37.8 (corners) | - | - | **0.50** | - | - |
 | rounded box, corner radius 0.5 / 2 / 8 | 19.1 / 15.7 / 10.4 | - | 14.4 / 3.2 / 1.2 | **0.50 / 0.50 / 0.50** | - | - |
-| capsule r = 5 | 12.7 | - | 0.74 | **0.74** | - | - |
+| capsule r = 5 | 12.7 | - | 0.74 | **0.74** (now 0.50 for r 0.5 to 50, 12.1) | - | - |
 | star r = 6 / 20 / 60 (sharp corners) | 56.4 / 45.0 / 25.7 | 57 / 45 / 27 | - | **0.49 / 0.50 / 0.50** | - | - |
 | straight edge at 45 degrees | 10.94 (closed form, C3) | 0 | 0 | 0 | - | - |
 
@@ -180,16 +181,16 @@ The quadtree is 570x faster than brute force interpreted (500x native) and 6x fa
 
 - **C3 (linear ramp error on a straight edge) [proved].** For a straight edge with unit normal `(a, b)`, `a >= b >= 0`, the exact coverage is the trapezoid integral `H(d)`; the linear ramp is `clamp(1/2 - d)`. At 45 degrees (`a = b = sqrt(2)/2`) and `d = 1/2` the ramp gives 0 while `H = (sqrt(2)/2 - 1/2)^2 = 0.04289`, i.e. 10.94/255. On `u = sqrt(2)/2 - d` in `[sqrt(2)/2 - 1/2, sqrt(2)/2]`, `H = u^2` and the ramp is `u - (sqrt(2)/2 - 1/2)`, so the error `u^2 - u + 0.2071` reaches the same magnitude 0.0429 again at `u = 1/2`; by symmetry the maximum over `d` is 0.04289. The ramp is exact only for axis-aligned edges. Asserted in the tests.
 - **C4 (half-plane coverage is exact for straight edges) [proved].** The pixel's projection on `n` has a trapezoid density with ramps of width `b` and a plateau of width `a - b`; integrating it gives the four-piece formula in `Coverage.halfPlane` (asserted equal to clipped polygon area to 1e-9). It is exactly 0 for `d >= (a + b)/2` and exactly 1 for `d <= -(a + b)/2`, and `(a + b)/2 <= sqrt(2)/2`, so culling and bounding boxes must use the reach `sqrt(2)/2` instead of `1/2`.
-- **C5 (curvature bound) [proved to first order, measured beyond].** A boundary of curvature `k` tangent to the half-plane line lies `k t^2 / 2 + O(k^3 t^4)` inside it at tangential offset `t`. Every point of the pixel is within `sqrt(1/2 - d^2) <= sqrt(2)/2` of the foot point, so the half-plane overestimates the area by at most `integral over |t| <= sqrt(2)/2 of k t^2 / 2 dt = k (sqrt(2)/2)^3 / 3 = 0.1179 k`, i.e. **30/R in 1/255 units** for a circle of radius R (measured 29 to 30/R for R from 40 to 300). Subtracting the exact first-order term over the actual chord leaves an `O(k^2)` error: measured worst case over sub-pixel offsets 3.8/255 at R = 1.5, 1.56 at R = 2.5, 0.80 at R = 4, 0.29 at R = 8, 0.18 at R = 16. Hence curvature-corrected coverage is visually flawless for curvature radius >= 4 px and flawless for >= 8 px; below 8 px `MODE_EXACT` uses the exact disc area instead.
-- **C6 (corners need two lines) [proved].** At a polygon vertex the boundary inside the pixel is two segments, not a line, so no single `(d, n)` coverage function can be exact there (the linear ramp errs by 26 to 57/255 at star tips, the half-plane just as much). The exact area is the square clipped by both edges' half-planes (convex vertex: intersection; reflex: union by inclusion-exclusion), `Coverage.corner`, allocation-free. Where two non-adjacent edges share a pixel, the polygon is locally their intersection (inner sides facing each other: a sliver) or their union (facing away: a gap), `Coverage.edgePair`. The renderer tracks the two nearest edges per pixel to choose. Exact whenever at most two edges enter the pixel.
+- **C5 (curvature bound) [proved to first order; corrected by measurement].** A boundary of curvature `k` tangent to the half-plane line lies `k t^2 / 2 + O(k^3 t^4)` inside it at tangential offset `t`. Every point of the pixel is within `sqrt(1/2 - d^2) <= sqrt(2)/2` of the foot point, so the half-plane overestimates the area by at most `integral over |t| <= sqrt(2)/2 of k t^2 / 2 dt = k (sqrt(2)/2)^3 / 3 = 0.1179 k`, i.e. **30/R in 1/255 units** for a circle of radius R (measured 29 to 30/R for R from 40 to 300). Subtracting the exact first-order term over the chord does **not** leave an `O(k^2)` error everywhere: where the tangent line leaves the pixel at a shallow angle, the pixel side cuts the sliver between line and curve obliquely, and that end effect is `O(k)`. Worst case over 60 random placements: 3.08/255 at R = 2, 0.86 at R = 4, 0.36 at R = 8, 0.18 at R = 12, 0.09 at R = 16, 0.065 at R = 24, 0.036 at R = 48, 0.0082 at R = 96, 0.0042 at R = 128, 0.0021 at R = 300 (the earlier 16-placement figures, 0.29 at R = 8 and 0.008 at R = 20 to 40, missed the bad angles). So the estimator is visually flawless from about R = 4 but meets F1 (estimator error below 0.01/255) only from a few hundred pixels: `MODE_EXACT` no longer uses it and computes exact disc areas instead (12.1). `MyMath.coverageCurved` keeps it as a documented estimator.
+- **C6 (corners need two lines) [proved].** At a polygon vertex the boundary inside the pixel is two segments, not a line, so no single `(d, n)` coverage function can be exact there (the linear ramp errs by 26 to 57/255 at star tips, the half-plane just as much). The exact area is the square clipped by both edges' half-planes (convex vertex: intersection; reflex: union by inclusion-exclusion), `Coverage.corner`, allocation-free. Where two non-adjacent edges share a pixel, the polygon is locally their intersection (inner sides facing each other: a sliver) or their union (facing away: a gap), `Coverage.edgePair`. The earlier renderer tracked the two nearest edges per pixel to choose, which is exact whenever at most two edges enter the pixel; `MODE_EXACT` now integrates every edge over the pixel instead (`Coverage.polygonBoxCoverage`, Green's theorem), exact for any number of edges.
 
 **Owner problems.** Flawless 1024 (no edge error above rounding), deterministic textures (every op is in the deterministic set, including the arcsine), artifact-free LOD (`Raster.scaled` renders any mip level directly with exact area at that level, so levels agree with the exact box filter of the vector source).
 
-**Cost [measured].** 256-shape scene: exact 131 / 44 ms against linear 106 / 32 ms (1.2x interpreted, 1.4x native); 256 stars: 485 versus 397 ms (1.2x).
+**Cost [measured].** Earlier approximate exact mode, 256-shape scene: 131 / 44 ms against linear 106 / 32 ms (1.2x interpreted, 1.4x native); 256 stars: 485 versus 397 ms (1.2x). Flawless mode (F1 + F2): 178 / 51 ms against linear 132 / 31 ms in the 12.5 session (1.35x interpreted, 1.65x native).
 
 **ALLAN.** Exact coverage is ALLAN's quality reference: training targets for vector-sourced content are `MODE_EXACT` or scanline renders, never supersampled ones, and ALLAN's reported maximum error (LIQUID 5.4) is measured against them. ALLAN's own edges are its weak point (an exponential relaxation cannot represent an arbitrary sub-pixel step per row), so edges go to this path and ALLAN paints interiors (section 5).
 
-**Verdict: adopt `MODE_EXACT`** as the default for SDF shapes; keep the linear ramp only for previews; use the scanline path (3.2) for polygons.
+**Verdict: adopted.** `MODE_EXACT` is the default (flawless, section 12); the linear ramp is `MODE_LINEAR`, for previews only; use the scanline path (3.2) for large polygon sets.
 
 ### 3.4 Forward differencing
 
@@ -433,7 +434,10 @@ Full table: `bench/results/compute-x64.md`. Selected rows (ms per 1024 x 1024 fr
 | SDF shapes, brute force, linear (256 shapes) | 60 430 | 15 907 | 11 to 57 | reference only |
 | SDF shapes, painter's algorithm, linear | 653 | 144 | 11 to 57 (+ 8-bit rounding per layer) | reject |
 | SDF shapes, quadtree, linear, leaf 4 | 106 | 32 | 11 to 57 | previews |
-| **SDF shapes, quadtree, exact, leaf 4** | **131** | **44** | **0.50 (capsule caps 0.74)** | adopt |
+| SDF shapes, quadtree, earlier approximate exact mode, leaf 4 | 131 | 44 | 0.50 on the tested placements (capsule caps 0.74; up to 0.86 possible, C5) | superseded |
+| **SDF shapes, quadtree, flawless (F1 + F2), leaf 4** (12.5 session: linear 132 / 31) | **178** | **51** | **<= 0.50 for every primitive and scene (12.1, 12.2)** | **adopt (default)** |
+| seam-heavy mesh, 4608 triangles, linear / flawless (12.5) | 624 / 1 308 | 184 / 325 | 50 to 84 seams / <= 0.50 | adopt |
+| the 4 608-triangle mesh as paths: `Scanline.renderScene` vs per-path `composite` (12.5) | 649 vs 254 | 326 vs 96 | <= 0.50 vs conflated seams | adopt `renderScene` |
 | SDF shapes, dirty update (1 shape moved), exact | 2.2 | 0.6 | same as full | adopt |
 | **256 stars, scanline exact-area painter** | **39** | **12** | **0.50** | adopt |
 | 256 stars, SDF quadtree, exact | 485 | 139 | 0.50 | (use scanline) |
@@ -460,7 +464,7 @@ Full table: `bench/results/compute-x64.md`. Selected rows (ms per 1024 x 1024 fr
 Ranked by how much each stage contributes to "fastest, highest-quality, deterministic", with its ALLAN role:
 
 1. **Classify and bin before computing anything** (per-tile shape bins, quadtree with Lipschitz or interval classification, ring/Morton tile order, span fills for uniform nodes). 570x over brute force; exact by C2. *ALLAN: produces its input tree and its segments; only non-constant nodes reach the network.*
-2. **Exact-area edges.** Polygons, glyphs and paths through the scanline accumulator (exact and the fastest path measured, 39 ms for 256 stars interpreted; merge abutting shapes, C11). Curved SDF primitives through `MODE_EXACT` (flawless, 1.2x the linear ramp). *ALLAN: the crisp-edge path and its quality reference.*
+2. **Exact-area edges and exact visibility (flawless, section 12).** Polygons, glyphs and paths through the scanline accumulator (exact and the fastest path measured, 39 ms for 256 stars interpreted); multi-path scenes through `Scanline.renderScene` (F2). Curved SDF primitives through `Raster` `MODE_EXACT`, the default (F1 + F2; 1.35x the linear preview interpreted, 1.65x native). *ALLAN: the crisp-edge path and its quality reference.*
 3. **Reuse before recompute.** Dirty-tile re-rendering (63x less work per edit), content-addressed copy-on-write tiles (exact dedup at C speed), GPU crossfades and UV animation instead of CPU passes. *ALLAN: cache keyed by inputs; keyframes blended by the GPU.*
 4. **Interiors.** Flat: span fills. Organic texture, gradients, PBR: ALLAN, run column-at-a-time in a build-time generated kernel. Procedural fields: build-time generated row kernels or column-at-a-time op arrays. *ALLAN: the paint in paint x coverage.*
 5. **Integer-exact image operators.** Area resampling for every LOD level (C9), running-sum blur and glow, exact EDT for mattes, outlines and glows, height to normals. Full frames on the server, regions on clients. *ALLAN: exact LOD targets; matte band and features.*
@@ -475,27 +479,35 @@ Rejected: brute force and painter's algorithm, forward differencing as an optimi
 - **C2 (conservative classification identity).** Quadtree culling with conservative 0/1 classification and a shared per-pixel routine reproduces brute force bit for bit.
 - **C3 (linear ramp error).** `clamp(0.5 - d)` errs by up to `(sqrt(2)/2 - 1/2)^2 = 10.94/255` on a straight 45 degree edge; exact only on axis-aligned edges.
 - **C4 (half-plane exactness and reach).** Half-plane coverage is exact for straight edges and is exactly 0 or 1 beyond `|d| = sqrt(2)/2`; culling and bounds must use that reach.
-- **C5 (curvature).** The half-plane overestimates a convex boundary of curvature `k` by at most `0.1179 k` (30/R in 1/255 units); the first-order chord correction leaves `O(k^2)`: flawless for radius >= 8 px, visually flawless for >= 4 px.
+- **C5 (curvature, corrected).** The half-plane overestimates a convex boundary of curvature `k` by at most `0.1179 k` (30/R in 1/255 units); the first-order chord correction leaves an `O(k)` residual where the chord exits the pixel at a shallow angle (measured 0.36/255 at R = 8, 0.036 at R = 48, 0.002 at R = 300): visually flawless from about R = 4, flawless (F1) only from a few hundred pixels. Flawless rendering uses exact disc areas.
 - **C6 (corners).** No function of `(d, n)` is exact at a corner; exact coverage there clips the pixel by the two edges (intersection, union, or the two-edge sliver/gap rule).
 - **C7 (dyadic incremental evaluation).** Forward differencing is bit-identical to direct evaluation when all operands are dyadic and bounded.
 - **C8 (EDT exactness).** The Felzenszwalb-Huttenlocher transform on integers in doubles is exact for widths up to 8192.
 - **C9 (integer-weight resampling).** Area-average resampling with integer weights and `(2S + T) // (2T)` is the exact rational mean rounded half up, at any ratio, identical everywhere; it equals the 2 x 2 box mip at 2x.
 - **C10 (interned identity).** Equal Luau strings have equal bytes; content-addressed tiles dedup exactly at C speed.
-- **C11 (conflation).** Per-shape exact coverage composited with source-over leaves a seam of up to 64/255 on shared edges; abutting shapes must share one winding accumulator.
+- **C11 (conflation).** Per-shape exact coverage composited with source-over leaves a seam of 48 to 84/255 on shared edges (measured, 12.2). Fixed by exact visibility at conflict pixels (C17 to C19); one shared winding accumulator also works for paths of a single colour.
 - **C12 (work follows events).** With span fills, cost per row is O(edge crossings x band width + spans), independent of area (36x on a disc); interpretive dispatch must be paid per node per row (C12b, 2.7x).
 - **C13 (runtime identity).** Every prototype here produces the same bytes in the interpreter and native code (eight asserted hashes); deterministic ops plus a fixed operation order suffice.
 - **C14 (magnification bound).** Bilinear magnification of a distance field errs by `h^2 / (8R)` px on a curve of radius R and by O(h) at corners.
 - **C15 (integer division under fast-math).** Division by powers of two and integer floor division below 2^51 stay deterministic even if `//` and `%` are compiled with reciprocal multiplication or contraction.
+- **C16 (exact disc pieces) [proved, measured].** The disc and a rectangle: split the rectangle at the disc's centre lines, reflect each piece into the first quadrant, integrate the clamped column height in closed form along the flatter axis (one arcsine of an angle difference, no singularity). The disc and a convex polygon: the sum over edges of signed disc-triangle areas (triangle inside, sector `r^2 theta / 2` outside, `theta` from `Coverage.datan2`), robust because every edge is independent. Both within 4e-9 of 50-digit references up to r = 1e4 (12.1).
+- **C17 (single-edge exactness) [proved].** If at most one shape's edge enters a pixel, chaining coverage as alpha is the exact box filter: source-over is affine in the destination, so it commutes with the pixel average (12.2).
+- **C18 (exact visibility) [proved].** At a conflict pixel, the transmittance `prod (1 - alpha_t I_t)` kept as signed weighted convex terms, with every region area computed exactly (clipping plus the power-cell lemma for several discs), gives the exact box filter of the composite (12.2, `compute/Visibility.luau`).
+- **C19 (disjoint composite) [proved].** If the partial shapes in a pixel are pairwise disjoint, the exact composite is `sum A_i X_i + (1 - sum A_i) X_0` with the F1 areas `A_i`; pairwise disjointness is decided exactly by bounding half-planes and support functions, with differences taken before products so shared vertices give exact zeros (12.2).
+- **C20 (capsule decomposition) [proved].** A capsule is the disjoint union of its body (projection on the axis in `[0, L]`, distance to the axis `<= r`) and two caps (beyond an end line, within `r` of that end point), so its exact coverage is a clipped square plus two disc-and-clipped-square areas (12.1).
+- **C21 (LOD switching) [proved, sampled].** A selector with thresholds `t_k` and hysteresis factor `eta` never shows an undersampled level and cannot reverse inside any input interval that does not straddle a band `[t_k, t_k eta)`; the two-phase stacked fade keeps alpha exactly 1 on opaque pixels and is C1 in time (12.4, `src/Saturn.luau`).
 
 ## 9. Corrections to the project axioms
 
-1. **`MyMath.coverage` (the linear ramp) is not a flawless coverage function.** Its comments and the project's use treat `clamp(0.5 - d/w, 0, 1)` as the anti-aliasing rule. Its exact-0 and exact-1 claims beyond `|d| >= w/2` are right, but as an estimate of pixel area it errs by up to 10.94/255 on straight 45 degree edges (C3, closed form), 11/255 on circles of any radius, 38/255 at sharp box corners and up to 57/255 at polygon corners (measured, 3.3). Proposed correction, for the owner of `src/MyMath.luau` to decide:
-   - add `MyMath.coverageHalfPlane(d, nx, ny)` and `MyMath.coverageCurved(d, nx, ny, k)` (the functions in `Coverage.luau` and `Raster.covCurved`), and state C4 and C5 as axioms;
-   - keep `MyMath.coverage` but document it as "linear ramp, exact only for axis-aligned edges; up to 11/255 error elsewhere";
-   - use the reach `w sqrt(2)/2` instead of `w/2` wherever exact coverage is culled or bounded (C4). Code that culls at `w/2` and then switches to half-plane coverage silently cuts real coverage on diagonal edges.
-2. **The Lipschitz culling rule needs the coverage function's reach.** "Drop a shape when `d - reach > w/2`" is correct for the linear ramp only. The general rule is "drop when `d - L rho >= R_cov`", where `R_cov` is the largest `|d|` at which the coverage function is strictly between 0 and 1, and bounding boxes for binning must grow by the same `R_cov` (fixed in `Raster.updateBounds`).
-3. **Supersampling is not ground truth.** Any test that compares against an n x n supersampled render inherits up to about `1/(2n)` error per edge (measured 31/255 at 4 x 4, 4.4 to 6/255 at 16 x 16). The project's references are the exact areas of section 1.
-4. **Coverage-as-alpha is not exact for shared edges** (C11). Vector content whose shapes abut must be accumulated as one path.
+Status: corrections 1 to 4 are **applied** (section 12); 5 is a documentation fix; 6 awaits the Windows hash check.
+
+1. **`MyMath.coverage` (the linear ramp) is not a flawless coverage function. [APPLIED]** Its comments and the project's use treated `clamp(0.5 - d/w, 0, 1)` as the anti-aliasing rule. Its exact-0 and exact-1 claims beyond `|d| >= w/2` are right, but as an estimate of pixel area it errs by up to 10.94/255 on straight 45 degree edges (C3, closed form), 11/255 on circles of any radius, 38/255 at sharp box corners and up to 57/255 at polygon corners (measured, 3.3). Applied:
+   - `MyMath.coverageHalfPlane(d, nx, ny, w?)` and `MyMath.coverageCurved(d, nx, ny, k, w?)` moved verbatim from `Coverage.luau` (`Coverage.halfPlane`, `Coverage.halfPlaneCurved` and `Raster.covCurved` are now these functions; bit equality with frozen copies of the originals asserted on 200 000 random inputs), `MyMath.COVERAGE_REACH = sqrt(2)/2`, and C3, C4, C5 (with the corrected residual) and the reach rule written into MyMath's header as axioms;
+   - `MyMath.coverage` kept and documented as the linear preview ramp, exact only for axis-aligned edges, with its measured errors;
+   - the reach `w sqrt(2)/2` is used wherever exact coverage is culled or bounded (`Raster.updateBounds`, `classify`, every per-pixel early-out).
+2. **The Lipschitz culling rule needs the coverage function's reach. [APPLIED]** "Drop a shape when `d - reach > w/2`" is correct for the linear ramp only. The general rule is "drop when `d - L rho >= R_cov`", where `R_cov` is the largest `|d|` at which the coverage function is strictly between 0 and 1, and bounding boxes for binning must grow by the same `R_cov` (`Raster.updateBounds`, `classify`, for every non-linear mode).
+3. **Supersampling is not ground truth. [APPLIED]** Any test that compares against an n x n supersampled render inherits up to about `1/(2n)` error per edge (measured 31/255 at 4 x 4, 4.4 to 6/255 at 16 x 16). The project's references are exact areas; the flawless tests use an independent exact scene reference and 50-digit disc areas (12.4).
+4. **Coverage-as-alpha is not exact for shared edges** (C11). **[APPLIED]** Raster `MODE_EXACT` and `Scanline.renderScene` compute exact visibility wherever two or more shapes' edges enter a pixel (12.2); no merging into one path is needed.
 5. **The rasterizer's interpreter cost was understated about 3x** in the previous notes (native numbers reported as interpreter numbers): 256 shapes at 1024 x 1024 take 106 ms interpreted, not 34 ms. Full-frame vector renders do not fit a client frame; edits do.
 6. **RUNTIME_AUDIT 6.5's fast-math caveat is narrower than stated** for the integer and power-of-two cases the project uses (C15), pending a Windows client hash check.
 
@@ -505,11 +517,11 @@ Rejected: brute force and painter's algorithm, forward differencing as an optimi
 
 1. **Combine-op arithmetic** for each `ImageCombineType`: exact formula, rounding, clamping, straight versus premultiplied storage, and whether client and server agree bit for bit (decides 4.4).
 2. **`DrawImageTransformed` filtering**: bilinear weights and rounding, edge handling, channel independence with alpha 255, minification behaviour (decides 3.7 and engine resampling).
-3. **Baking fidelity**: read back content baked by `CreateDataModelContentAsync` and compare with the source buffer; mip filter used (decides whether F1/F3 survive 4.8).
+3. **Baking fidelity**: read back content baked by `CreateDataModelContentAsync` and compare with the source buffer; mip filter used (decides whether F1/F3 survive 4.8). `probeBakeFidelity` (added with section 12) bakes a 64 x 64 pattern holding every byte value, alpha ramps, hard alpha edges and colour under alpha 0, reads it back through `CreateEditableImageAsync` when the engine allows it, and reports differing visible pixels; mip levels themselves cannot be read back from Luau.
 4. **`WritePixelsBuffer` cost per byte and per call**, to size dirty-rectangle flushes (3.9).
 5. **Actors**: `SendMessage` copy cost for a 4 MB buffer, desynchronised compute throughput, real speedup on 4-core and 8-core phones (4.6).
 6. **Client interpreter speed per device class**: run the calibration kernel; scale every interpreter number in section 6 by its ratio to 8.8 ms.
-7. **Determinism on devices**: run `tests/compute.test.luau` (its hash constants) on an x64 Windows client, an ARM phone and a server; all must pass (F3, C15).
+7. **Determinism on devices**: run `tests/compute.test.luau` and `tests/flawless.test.luau` (their hash constants) on an x64 Windows client, an ARM phone and a server; all must pass (F3, C15).
 8. **`loadstring` on servers**: whether chunks are native-compiled and how slow they are with `LoadStringEnabled` (expected about 1.5x a generated module, 4.1).
 9. **Stacked transparent layers** (shell texturing): overdraw cost of 8 to 16 stacked `ImageLabel`s or `Decal`s on phones (2.5).
 
@@ -517,19 +529,146 @@ Rejected: brute force and painter's algorithm, forward differencing as an optimi
 
 | File | What |
 |---|---|
-| `src/compute/Coverage.luau` | Coverage estimators and exact references: half-plane, curvature-corrected, deterministic arcsine, disc-rectangle area, wedge and edge-pair clipping, rounded corners, polygon area, supersampling, error statistics |
-| `src/compute/Raster.luau` | Scene rasterizer: linear and exact coverage modes, brute force, painter, per-tile binning, Lipschitz quadtree, dirty re-render, time slicing |
-| `src/compute/Scanline.luau` | Exact-area signed accumulation: layer resolve and composite painter, curve flattening |
+| `src/MyMath.luau` | The axioms, including the pixel axioms F1 to F3, C3 to C5 and the reach rule; `coverageHalfPlane`, `coverageCurved`, `COVERAGE_REACH`; `coverage` documented as the preview ramp |
+| `src/compute/Coverage.luau` | Coverage estimators and exact areas: half-plane and curvature-corrected (the MyMath axioms), deterministic arcsine and atan2, disc and rectangle (quadrant integration), disc and convex polygon, polygon and pixel box, clipping and shoelace on scratch arrays, wedge and edge-pair clipping, rounded corners, references (circle, polygon), supersampling, error statistics |
+| `src/compute/Visibility.luau` | Exact visibility at conflict pixels (F2): signed convex terms, power cells, convex pieces of polygons |
+| `src/compute/Raster.luau` | Scene rasterizer: flawless (default), layered and linear modes; circles, boxes, capsules, rings, polygons, cut discs (half-discs, pie slices); disjoint fast path; brute force, painter, per-tile binning, Lipschitz quadtree, dirty re-render, time slicing |
+| `src/compute/Scanline.luau` | Exact-area signed accumulation: layer resolve and single-path composite; `renderScene`, exact multi-path compositing (F2); curve flattening |
+| `src/Saturn.luau` | LOD selection with hysteresis and two-phase stacked crossfades; slot bookkeeping for two engine layers |
 | `src/compute/Rows.luau` | Batch row kernels: direct, forward-differenced, analytic spans |
 | `src/compute/Distance.luau` | Exact EDT, jump flooding, 8SSEDT, brute force, signed distance, matte, shells, glow |
-| `src/compute/Filter.luau` | Running-sum box blur, summed-area table, exact area resampling, normal maps |
+| `src/compute/Filter.luau` | Running-sum box blur, summed-area table, exact area resampling (opaque and alpha-weighted), normal maps |
 | `src/compute/Tiles.luau` | Morton codes and orders, content-addressed store, copy-on-write grid |
 | `src/compute/Expr.luau` | SDF expressions: closures, op array (per pixel and per row), generated source, interval arithmetic, quadtree render |
 | `src/compute/Trace.luau` | Sphere tracing to normal and height maps |
 | `tools/gen_expr.luau` | Build-time code generation demo; writes `bench/generated/ExprDemoRow.luau` |
 | `tests/compute.test.luau` | Correctness and cross-runtime hashes for every prototype |
+| `tests/flawless.test.luau` | F1, F2, F3, LOD and Saturn checks against an independent exact scene reference (12.4) |
 | `bench/compute.luau` | Timings and quality numbers |
-| `tools/run_compute_bench.sh`, `tools/merge_compute.py` | Three interleaved rounds per runtime, per-key minimum, determinism check of quality rows |
-| `bench/results/compute-x64.md` | Merged results |
+| `bench/flawless.luau` | Cost of the flawless pipeline against the linear preview (12.5) |
+| `tools/run_compute_bench.sh`, `tools/run_flawless_bench.sh`, `tools/merge_compute.py` | Three interleaved rounds per runtime, per-key minimum, determinism check of quality rows |
+| `bench/results/compute-x64.md`, `bench/results/flawless-x64.md` | Merged results |
 
-Reproduce: `tools/run_compute_bench.sh` (about 2 minutes), `luau tests/compute.test.luau` and `luau --codegen tests/compute.test.luau` (about 11 s interpreted), `luau-analyze --mode=strict src/compute/*.luau tests/compute.test.luau bench/compute.luau`.
+Reproduce: `tools/run_compute_bench.sh` (about 2 minutes), `tools/run_flawless_bench.sh` (about 1.5 minutes), `luau tests/compute.test.luau` and `luau --codegen tests/compute.test.luau` (about 11 s interpreted), `luau tests/flawless.test.luau` (about 3 s; with `--codegen` about 1 s), `luau-analyze --mode=strict src/*.luau src/compute/*.luau tests/*.luau bench/compute.luau bench/flawless.luau`.
+
+## 12. Flawless pipeline
+
+The 2D pipeline (`Raster`, `Scanline`, `Filter`, `Saturn`) is flawless by the definitions of section 1, with the assumptions listed in 12.7. Everything below is asserted by `tests/flawless.test.luau` in both runtimes, measured by `bench/flawless.luau` (`bench/results/flawless-x64.md`), or proved here; labels as in the header.
+
+| Guarantee | Statement | How | Evidence |
+|---|---|---|---|
+| **F1** | every byte of a single shape is the correctly rounded exact area, `\|byte - 255 A\| <= 0.51` | exact area per primitive (12.1) | proved per primitive; worst measured 0.4962 to 0.5000 over all primitives, radii 0.3 to 300, random rotations and offsets |
+| **F2** | every pixel of a scene is the correctly rounded exact box filter of the source-over composite, colour and alpha, seams included | coverage as alpha where it is exact (C17), exact visibility at conflict pixels (C18, C19) | proved; worst measured 0.4946 to 0.5000 on abutting, crossing and translucent scenes, where coverage as alpha errs by 48 to 84 |
+| **F3** | the same bytes in the interpreter and native code | deterministic ops only; hash constants | three hashes in `tests/flawless.test.luau`, eight in `tests/compute.test.luau`, both runtimes |
+| **LOD levels** | each level is the exact box filter of the source at its own resolution; consecutive levels agree within 1 LSB | `Raster.scaled` renders levels directly; `Filter.areaResample` / `areaResampleAlpha` for raster content | proved; levels 1 and 2 measured at 0.4999 and 0.4982; 1 LSB agreement asserted |
+| **LOD transitions** | no oscillation; never undersampled; opaque pixels never see the background; C1 in time | `Saturn` selector with hysteresis, two-phase stacked fade | proved (S1, S2, X1 to X3, Z); dense sampling in the tests |
+
+### 12.1 F1: exact coverage for every primitive
+
+A pixel is the square `[x, x + 1] x [y, y + 1]` (or a `w x w` box for anti-aliasing width `w`; coverage is area / `w^2`). Every primitive first evaluates its signed distance at the pixel centre; if `|d| >= sqrt(2)/2` widths the coverage is exactly 0 or 1 (every point of the pixel is within `sqrt(2)/2` of its centre and every distance used is exact, or a lower bound outside that is exact inside, so the pixel lies entirely on one side: C4's reach). Otherwise the area is computed exactly:
+
+| Primitive | Exact area | Proof |
+|---|---|---|
+| circle | `Coverage.discBoxArea`: split the pixel at the centre lines, reflect each piece into the first quadrant, integrate `clamp(sqrt(r^2 - x^2), c, d) - c` in closed form along the flatter axis | C16. For `x <= sqrt(r^2 - d^2)` the column is full, for `x >= sqrt(r^2 - c^2)` empty, in between `sqrt(r^2 - x^2) - c`, whose integral is `(q sq - p sp)/2 + (r^2/2) asin((q sp - p sq)/r^2) - c (q - p)` (the difference of two arcsines as one arcsine, no singularity) |
+| ring | outer disc minus inner disc | the inner disc lies inside the outer one, so their areas subtract exactly; both edges in one pixel (thin rings) are handled |
+| box (sharp, rounded, any size) | vertical band `\|x\| <= hx - rad`, two side rectangles, four corner pieces (corner quadrant and corner disc) | a point with `\|x\| <= hx - rad` is inside iff `\|y\| <= hy`; with `hx - rad < \|x\| <= hx` and `\|y\| <= hy - rad` it is inside; in a corner quadrant iff within `rad` of the corner centre: seven disjoint pieces, each a product of 1D overlaps or C16. Boxes thinner than a pixel are exact (the old 1D ramp clamped them to 1) |
+| capsule | body (pixel clipped by the two end lines and the two sides) plus each cap (disc and pixel clipped by its end line) | C20. Points whose projection on the axis lies in `[0, L]` are inside iff within `r` of the axis; points beyond an end are inside iff within `r` of that end point; the three regions partition the plane. A pixel whose projection stays inside `[0, L]` sees only the straight sides: C4 |
+| cut disc (circular segment, half-disc, pie slice) | the pixel clipped by the 1 or 2 half-planes, intersected with the disc: `Coverage.discPolyArea` | the clip of a convex polygon by half-planes is exact; C16 for the disc part |
+| polygon (simple, any orientation) | `Coverage.polygonBoxCoverage`: per-edge Green integrals over the pixel | on a horizontal line the winding number at `x` is the signed count of edges crossing left of `x`; integrating over `x` in the pixel gives `sum dir_e (x1 - clamp(x_e, x0, x1))`, and over `y` a closed form per edge (linear in `y`). Exact for any number of edges per pixel (the earlier two-nearest-edges rule was exact for at most two) |
+
+`Coverage.discPolyArea` (disc and convex polygon): by Green's theorem the area is the sum over edges of the signed area of the disc intersected with the triangle (centre, edge): the part of the edge inside the circle contributes its triangle, the parts outside contribute sectors `r^2 theta / 2`, with `theta` from `Coverage.datan2` (a deterministic atan2 whose `dasin` arguments never exceed `sqrt(2)/2`). Every edge's term is independent, so no intersection points are paired and tangencies cannot flip a branch.
+
+**Precision [measured].** Against 50-digit decimal references (42 pixels, radii 0.05 to 5 000, including vertical and horizontal tangents): `discBoxArea` and `discPolyArea` within 1e-12 r^2, `datan2` within 4.4e-16 of libm, `polygonBoxCoverage` within 2e-14 of clip-and-shoelace. F1 needs the area within 0.01/255 = 3.9e-5, so the byte is the correctly rounded value except at exact ties. The deterministic arcsine was tightened from 18 to 28 series terms (its truncation, 7e-14, was visible in sector areas of radius-1 000 discs) and unrolled as nested Horner expressions (same operations, same bits, 1.5x to 4x faster in the interpreter).
+
+**Measured F1** (`tests/flawless.test.luau`, alpha byte of a white shape on transparent black against the exact reference of 12.4, max over every pixel the shape touches, 1/255):
+
+| Primitive | Samples | Max error |
+|---|---|---|
+| circle, r = 0.3 to 300 (log-uniform), random sub-pixel centre | 48 | 0.5000 |
+| box, sharp, including thinner than a pixel | 10 | 0.4962 |
+| box, rounded, random corner radius | 20 | 0.4989 |
+| capsule, r = 0.5 to 50 (log-uniform), random orientation, length and offset | 120 | 0.5000 |
+| ring, including thin rings (both edges in one pixel) | 16 | 0.4999 |
+| star, random rotation | 12 | 0.4997 |
+| random simple polygon, 3 to 16 vertices | 12 | 0.4998 |
+| cut disc: circular segments and pie slices | 12 | 0.4996 |
+
+0.5000 is the rounding floor: at an exact tie the byte may round either way. For comparison the earlier approximate mode measured 0.74 on capsule caps and could reach 0.86 on circles of radius 8 to 16 (its C5 estimator residual plus rounding), and the linear ramp 11 to 57.
+
+### 12.2 F2: exact compositing
+
+Per pixel, the shapes above the topmost one that covers the pixel completely and opaquely (the base) form a stack; each has its F1 area `A`.
+
+- **C17 (one partial shape) [proved].** If at most one shape `f` has `0 < A_f < 1`, chaining coverage as alpha is exact. In premultiplied form source-over by `(c, alpha)` is the affine map `P -> alpha c + (1 - alpha) P`. The full covers below `f` map the base to a uniform `X`; over `f`'s region the colour is `O_f(X)`, elsewhere `X`; the full covers above apply the same affine map `U` to both. The pixel average is `U(A_f O_f(X) + (1 - A_f) X) = U(A_f alpha_f c_f + (1 - A_f alpha_f) X)`, which is source-over with alpha `A_f alpha_f`: exactly what the fast path computes. So only pixels with two or more partial shapes (conflict pixels) need more.
+- **C19 (disjoint partial shapes) [proved].** If the partial shapes are pairwise disjoint, the pixel splits into their regions `R_i` (areas `A_i`) and the rest; over `R_i` the shapes present are `i` and the full covers, over the rest only the full covers. So the exact composite is `sum_i A_i X_i + (1 - sum_i A_i) X_0`, with `X_i` the stack's composite with shape `i` present and `X_0` without partial shapes, computed in one pass. Disjointness is decided exactly: one shape lies in the closed outer side of a bounding half-plane of the other (the sides of a box, the edges of a convex polygon, the chords of a cut disc), tested with its support function (vertices; centre minus radius for discs; inner rectangle minus radius for rounded boxes; the two end discs for capsules) or, for cut discs with the same centre, an exactly negated half-plane. Differences are taken before products, so a vertex shared with the edge gives exactly 0 (`ex ey - ey ex = 0` in IEEE arithmetic) and a shared edge separates. This is the seam case: abutting tiles, mesh triangles, half-discs sharing a diameter, pie slices.
+- **C18 (general visibility) [proved].** Otherwise (overlaps, crossings, more than 8 partial shapes) `compute/Visibility.luau` keeps the transmittance `nu = prod over shapes above (1 - alpha_t I_t)` as a signed weighted sum of convex terms (pixel clipped by half-planes, with discs), processes the stack top-down (shape `s` contributes `alpha_s c_s sum w_k sigma_j |R_k ^ K_j|` and appends the terms `(R_k ^ K_j, -alpha_s sigma_j w_k)`), and adds the base with `integral(nu)`. Shapes enter as signed convex pieces: a disc; a ring as outer minus inner disc; a box as up to seven disjoint pieces; a capsule as body plus two caps; a cut disc as clipped pixel and disc; a polygon as its convex clip or, where non-convex, the signed fan of its clip (the winding number of a closed polyline is the sum of its fan triangles' signed indicators). Region areas are exact: Sutherland-Hodgman clipping for the polygon part, `discPolyArea` or `discBoxArea` for one disc, and for several discs the **power-cell lemma**: with `p_i(q) = |q - c_i|^2 - r_i^2`, on the cell where `p_i` is largest the intersection of all discs is `{p_i <= 0}`, and the cells are convex (`p_i - p_j` is affine), so `|P ^ D_1 ^ ... ^ D_k| = sum_i |P ^ cell_i ^ D_i|` (identical discs tie-broken by index). Terms with zero area are pruned and discs that contain the region or miss its bounding box are dropped. The term list is capped at 1 024 terms (reached in no measured scene).
+- **Identity [proved, asserted].** `render` and `renderBrute` give the same per-pixel stack above the per-pixel base (C2), the same areas, the same branch (C17, C19 or C18) and the same arithmetic, so they stay pixel-identical (asserted on every F2 scene and in `tests/compute.test.luau`).
+- **Error budget [proved, measured].** Areas are exact to 4e-9 or better; weights are products of `(1 - alpha)`; the composite is kept in floating point and rounded once, so its error stays far below 0.01/255 and every byte is the correctly rounded exact box filter.
+
+**Measured F2** (72 x 72 scenes against the exact reference, max over all pixels of alpha and straight colour, 1/255; "as alpha" is the same scene in `MODE_LAYERED`, exact F1 coverage composited as alpha):
+
+| Scene | Flawless | Scanline.renderScene | As alpha (seam) |
+|---|---|---|---|
+| two half-discs sharing a diameter, two colours | 0.5000 | - | 48.2 |
+| the same, one colour (the union is a disc) | 0.4946 | - | 64.0 |
+| checkerboard of 7 x 7 squares at sub-pixel offsets | 0.5000 | 0.5000 | 69.6 |
+| a 9-gon split into 9 triangles, 9 colours | 0.4992 | 0.4992 | 56.0 |
+| the same, one colour | 0.4991 | 0.4991 | 83.0 |
+| pie chart of 7 slices | 0.5000 | - | 53.3 |
+| 16 overlapping translucent stars | 0.4994 | 0.4994 | - |
+| 22 overlapping shapes of every kind, some translucent, over a translucent background | 0.5000 | - | - |
+
+Conflict pixels in these scenes: 1 685 resolved by C19, 420 by C18 in `Raster`; 1 282 and 249 in `Scanline.renderScene`. On the 256-shape demo scene 2 090 pixels (0.2 percent of the frame) are conflict pixels; on a 4 608-triangle mesh 194 120 (18.5 percent), all resolved by C19.
+
+### 12.3 Exact multi-path scenes in the scanline painter
+
+`Scanline.composite` stays a single-path operation (exact for one path). `Scanline.renderScene(dst, width, height, paths, background?)` renders a list of paths (each one or more contours with a colour) exactly: rows are processed in order; for each path crossing the row, a one-row accumulator gives its exact coverage (the font-rs running sum, exact where the winding number is 0 or +-1); a pixel stays a byte while its value is exact (untouched, or covered fully by an opaque path: span fills), and moves to a floating-point premultiplied row buffer as soon as a fractional or translucent contribution arrives; where two or more paths' edges enter a pixel since its last opaque cover, the base is snapshotted and the contributing paths are recorded, and at the end of the row the pixel is recomputed by C19 or C18 from the paths' geometry. Every float pixel is rounded once. Measured on the jittered 4 608-triangle mesh: 649 / 326 ms (interpreted / native) against 254 / 96 ms for the conflating per-path painter; on 16 overlapping translucent stars its bytes equal `Raster`'s.
+
+### 12.4 F3, the reference, and LOD
+
+**F3.** Content code uses only `+ - * /`, `sqrt`, `floor`/`ceil`, comparisons, integer `//` and `%`, and `Coverage.dasin` / `datan2` built from them (no `math.asin`, `atan`, `sin`, `cos`, `exp`, `pow` or `lerp`; `math.asin` appears only in the reference functions `circleArea` and the test's reference). Hash constants: `raster flawless demo` (96 shapes at 256 x 256), `F2 scenes` (every F2 render of both renderers), `LOD levels` (levels 1 and 2 and four alpha-weighted resamples), all identical in the interpreter and with `--codegen`; `tests/compute.test.luau`'s `raster mode 1` constant changed intentionally (2126128460 to 2550832146: exact areas and exact visibility), every other constant there is unchanged (including `rows`: `Raster.covCurved` is now `MyMath.coverageCurved`, which gave the same bytes).
+
+**The exact scene reference** (`refPixel` in `tests/flawless.test.luau`, independent of the code under test): every shape is described by its boundary curves (segments and whole circles, a superset of the true boundary is harmless) and an exact inside test. A pixel is cut into vertical slabs at every curve end, every crossing of two curves, every circle's x-extremes and every crossing with the pixel's top and bottom; within a slab no curve crosses another, so sorting the curves at the slab's midpoint gives trapezoids whose cover set is constant; each trapezoid's area is a closed form (linear for segments, the chord integral with `math.asin` for arcs, written in the well-conditioned form of 12.1) and its colour is the source-over composite of the shapes covering its midpoint. The trapezoids tile the pixel (asserted to 1e-9); the reference agrees with `circleArea` and `polygonArea` to 1e-10, and disc areas are pinned to 50-digit values. Its only error is floating rounding, far below 0.01/255; no flattening is involved.
+
+**LOD levels [proved, measured].** `Raster.scaled(sc, f)` multiplies every length by `f` and keeps the AA width at one output pixel, so level `k` rendered at its own size satisfies F1 and F2 at that level (measured 0.4999 at level 1, 0.4982 at level 2). Box filters compose: the exact value of a level-`k + 1` pixel is the mean of the four exact level-`k` values it covers, so `Filter.areaResample` of a level-`k` render (each byte within 0.51 of exact, the mean rounded within 0.5) is within 1.01 of the exact level-`k + 1` value, and the directly rendered level within 0.51: they differ by at most 1 LSB (asserted for opaque scenes). For raster content, `Filter.areaResample` is the exact, correctly rounded box filter of opaque images (C9) and `Filter.areaResampleAlpha` that of straight-alpha images (colours weighted by alpha, so a transparent pixel's colour never tints the result; equal to `areaResample` on opaque images); both asserted against brute-force rational sums.
+
+**LOD transitions (`src/Saturn.luau`) [proved, sampled].** `Saturn.selector(thresholds, eta)` with `t_k` the input value from which level `k + 1` suffices (`Saturn.halvingThresholds` gives `t_k = 2^(k+1)` for the texel footprint `base texels / screen pixels`) moves coarser across boundary `k` only when `x >= t_k eta` and finer as soon as `x < t_k`.
+- **S1.** After each update `t_(L-1) <= x < t_L eta`: the shown level is never undersampled and, for `eta <= t_(k+1)/t_k`, at most one level finer than needed (asserted on 200 000 random inputs).
+- **S2.** Crossing boundary `k` upward needs an input `>= t_k eta`, downward one `< t_k`; an input sequence confined to an interval that does not straddle any band `[t_k, t_k eta)` crosses each boundary in at most one direction, so the level sequence is monotone and never reverses; inside one band the level changes at most once, at the first update. Jitter below the factor `eta` can never flicker (asserted on 3 000 band-confined and 3 000 narrow-interval random sequences).
+- **Crossfade.** The new level's layer is stacked on top of the old; with `u` the normalised time and `s` the smoothstep: phase 1 (`u <= 1/2`) `lambda_new = s(2u)`, `lambda_old = 1`; phase 2 `lambda_new = 1`, `lambda_old = 1 - s(2u - 1)`. **X1:** both opacities are C1 with zero derivative at `u = 0, 1/2, 1`, the composite of any straight-alpha pair is a polynomial in them, so colour and alpha are C1 in time, moving at most `3 du` of full scale (asserted on a 20 000-step grid and by one-sided difference quotients at the joints). **X2:** on opaque pixels alpha stays exactly 1 (the symmetric fade dips to 3/4 and shows the background) and the colour is the exact blend `(1 - w) c_old + w c_new` (asserted on 100 000 random pairs). **X3:** against the ideal blend of the two composites, the stack deviates by exactly `theta (1 - a_new) a_old (c_old - background)`, `theta` in `[0, 1]`: at most `(1 - a_new) a_old` of full scale (at most 1/4 when both levels have the same alpha, the LOD case), zero at both ends, and never more transparent than the ideal; no pair of per-layer opacities can do better for every semi-transparent pixel (asserted on 100 000 random pairs and times).
+- **Z.** `Saturn.lodStep` drives two engine layers: the empty, fully transparent slot receives the next level and moves on top, so z-order changes are invisible; requests during a fade wait for it to finish. Asserted over 20 000 frames of jittery input: z-order changes only when the moved slot is invisible, every frame's composite of opaque test levels is opaque, and frame-to-frame changes stay within the X1 bound.
+
+### 12.5 Measured cost
+
+`bench/results/flawless-x64.md`: minimum of 3 interleaved runs per runtime (each the minimum of 2 to 3 in-process repeats), ms per 1024 x 1024 frame, Xeon 2.1 GHz, 4 virtual cores shared with other agents (calibration this session 11.3 ms interpreted, 2.3 native, against 8.8 / 2.2 in section 6; ratios between rows are more reliable than absolute values).
+
+| Scene | Linear preview | Exact F1, as alpha | **Flawless F1 + F2** | Flawless / linear | Conflict pixels |
+|---|---|---|---|---|---|
+| 256-shape demo scene, leaf 4 | 132 / 31 | 157 / 43 | **178 / 51** | 1.35x / 1.65x | 2 090 (0.2 %) |
+| triangle mesh, 4 608 triangles, every edge shared | 624 / 184 | 815 / 231 | **1 308 / 325** | 2.1x / 1.8x | 194 120 (18.5 %) |
+| 64 pie charts, 384 slices | 59 / 25 | 105 / 41 | **137 / 54** | 2.3x / 2.1x | 24 077 (2.3 %) |
+| mesh through the scanline painter: per-path `composite` / `renderScene` | 254 / 96 (conflates) | - | **649 / 326** | 2.6x / 3.4x | 194 115 |
+
+(interpreted / native). Per conflict pixel: about 2.5 us interpreted and 0.5 us native on the disjoint path (C19, the mesh); about 10 us interpreted and 4 us native on the general path (C18, the demo scene, where 2 086 of the 2 090 conflict pixels are overlaps), up to about 30 us interpreted where curved shapes overlap densely (rings are the worst: two signed discs each). The earlier approximate exact mode cost 131 / 44 ms on the demo scene in its own session (linear 106 / 32 there): flawless costs about 10 to 25 percent more than it. Dirty re-rendering, time slicing and the quadtree are unchanged, so edits still fit a frame (3.9).
+
+### 12.6 What still depends on the engine
+
+The bytes are flawless when they leave Luau. Four engine steps can still change what the player sees; each has a probe in `studio/EditableImageProbe.luau` (report format in RUNTIME_AUDIT 7):
+
+| Engine step | Risk | Probe |
+|---|---|---|
+| Upload: `WritePixelsBuffer` and storage | bytes altered, premultiplied storage, colour under alpha 0 dropped | `probeCombineOps`, step 1 (write/read round trip of every source case) |
+| GPU filtering when an image is shown at a size other than its own (magnification, minification, mips) | bilinear blur on magnification, aliasing on minification, colour bleeding from transparent texels if the filter is not premultiplied-aware | `probeSampling`: magnify 2 -> 8 px (the filter kernel), red-under-alpha-0 bleed test, 256 -> 64 checkerboard minification in one and two steps. Saturn keeps the footprint between 1 and 2 texels per screen pixel (S1), which bounds magnification and minification to 2x |
+| Baking with `CreateDataModelContentAsync` ("transcoded into mips") | lossy GPU compression of the baked bytes; mip filter unknown | `probeBakeFidelity` (bakes a pattern with every byte value, alpha ramps and hard alpha edges, reads it back if possible) and `probeTimings` (bake latency); mip levels cannot be read back from Luau |
+| Engine combine ops (`DrawImage`, `DrawRectangle`, `DrawImageTransformed` with an `ImageCombineType`) if layers are composited in the engine instead of in Luau | unknown rounding, straight versus premultiplied blending, reported bugs | `probeCombineOps` (truth tables and best-fit formulas per combine type), `probePrimitiveOps` (`DrawRectangle` with transparency) |
+
+The crossfade's X1 to X3 assume the GPU blends the two stacked layers in at least 8-bit precision; that blend happens on screen and cannot be read back by any EditableImage probe (it needs a screen capture on device). Per-device determinism of the content (F3 on ARM and Windows clients) is section 10, item 7.
+
+### 12.7 Limits and assumptions
+
+- **Polygons must be simple** (no self-intersections; paths with winding numbers 0 or +-1). Self-overlapping paths are rendered with the non-zero rule clamped per pixel, which is not their exact area.
+- **More than 1 024 visibility terms** in one pixel (about 10 mutually overlapping partial shapes whose edges all cross the same pixel) would stop the exact path from subtracting deeper shapes; `Visibility.stats.capped` counts it (zero in every measured scene).
+- **Very large radii.** Disc areas carry an absolute error of about 1e-12 r^2 from double rounding: still below F1's budget for r up to about 10^5 px.
+- **Ties.** At an exact tie (`255 A` exactly halfway between integers) either byte is accepted (F1's epsilon covers it).
+- **The curvature estimator** `MyMath.coverageCurved` remains an estimator (C5); `compute/Rows.luau`'s span kernels still use it (they are a cost study; on their R = 300 disc the estimator is within 0.003/255 of exact, so their bytes are correctly rounded except within that distance of a tie).
+- **Engine steps** after upload (12.6) until the probes report.

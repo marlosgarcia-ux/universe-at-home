@@ -43,7 +43,7 @@ local F1 = 0.51 -- correctly rounded exact area: 0.5 + epsilon 0.01 (COMPUTE.md 
 
 local function report(name: string, value: number)
 	if PRINT then
-		print(string.format("%-60s %.4f", name, value))
+		print(string.format("%-60s %.6g", name, value))
 	end
 end
 
@@ -590,7 +590,7 @@ do
 	assert(hp < 1e-9, "C4 exactness " .. hp)
 	-- C5: the curvature estimator is NOT flawless below R of a few hundred (O(1/R) residual)
 	local worstC = 0
-	for k = 1, 40 do
+	for _ = 1, 40 do
 		local R = 8
 		local cx, cy = 50 + rnd(), 50 + rnd()
 		for y = 40, 60 do
@@ -602,7 +602,6 @@ do
 				end
 			end
 		end
-		local _ = k
 	end
 	report("C5 curvature estimator worst error at R = 8 (1/255)", worstC)
 	assert(worstC > 0.05, "C5 residual should be visible at R = 8")
@@ -754,6 +753,7 @@ end
 ----------------------------------------------------------------------------------
 
 do
+	seed = 3003 -- each section reseeds, so its inputs do not depend on the others
 	assert(Raster.newScene(0).mode == Raster.MODE_EXACT, "MODE_EXACT is the default")
 	local W = 160
 	local img = buffer.create(W * W * 4)
@@ -787,9 +787,9 @@ do
 		maxima[name] = math.max(maxima[name] or 0, worst)
 		assert(worst <= F1, string.format("F1 %s: error %.4f/255", name, worst))
 	end
-	-- circles, radius 0.3 to 300
-	for i = 1, 24 do
-		local r = 0.3 * 1000 ^ ((i - 1) / 23)
+	-- circles, radius 0.3 to 300 (log-uniform), random sub-pixel centres
+	for i = 1, 48 do
+		local r = 0.3 * 1000 ^ ((i - 1) / 47)
 		local size = if r > 70 then 2 * math.ceil(r) + 8 else W
 		local c = size / 2 + rnd() - 0.5
 		check("circle r 0.3..300", size, function(sc, rs)
@@ -807,9 +807,9 @@ do
 			box(sc, rs, 0xFFFFFFFF, 80 + rnd() - 0.5, 80 + rnd() - 0.5, hx, hy, rad)
 		end)
 	end
-	-- capsules, radius 0.5 to 50, random orientation and offset
-	for i = 1, 30 do
-		local r = 0.5 * 100 ^ ((i - 1) / 29)
+	-- capsules, radius 0.5 to 50 (log-uniform), random orientation and offset
+	for i = 1, 120 do
+		local r = 0.5 * 100 ^ ((i - 1) / 119)
 		local len = rnd() * (60 - r)
 		local ang = rnd() * 2 * PI
 		local ax, ay = 80 - math.cos(ang) * len / 2 + rnd() - 0.5, 80 - math.sin(ang) * len / 2 + rnd() - 0.5
@@ -826,7 +826,7 @@ do
 		end)
 	end
 	-- stars at random rotations, and random simple (star-shaped) polygons
-	for i = 1, 12 do
+	for _ = 1, 12 do
 		local rr = 2 + rnd() * 60
 		local rot = rnd()
 		local cx, cy = 80 + rnd() - 0.5, 80 + rnd() - 0.5
@@ -850,7 +850,6 @@ do
 		check("random polygon", W, function(sc, rs)
 			polygon(sc, rs, 0xFFFFFFFF, poly)
 		end)
-		local _ = i
 	end
 	-- cut discs: circular segments, half-discs and pie slices
 	for i = 1, 12 do
@@ -877,6 +876,7 @@ end
 
 local f2Hash = 0
 do
+	seed = 4004
 	local W = 72
 	type Scene = { name: string, sc: Raster.Scene, rs: RScene, seam: boolean, paths: { Scanline.Path }? }
 	local scenes: { Scene } = {}
@@ -969,7 +969,27 @@ do
 			end, segs, { 36.4, 35.9, 29.3 })
 		end
 	end
-	-- (e) overlapping shapes of different colours, some translucent, over a translucent background
+	-- (e) overlapping translucent stars (polygons only, so the scanline renderer's
+	-- general visibility path runs too)
+	do
+		local s = newScene("overlapping translucent stars", 0xFF203040, false)
+		local paths: { Scanline.Path } = {}
+		for _ = 1, 16 do
+			local cx, cy, r = 8 + rnd() * 56, 8 + rnd() * 56, 4 + rnd() * 20
+			local rot = rnd()
+			local pts = {}
+			for q = 0, 9 do
+				local rr = if q % 2 == 0 then r else r * 0.45
+				table.insert(pts, cx + math.cos(2 * PI * (rot + q / 10)) * rr)
+				table.insert(pts, cy + math.sin(2 * PI * (rot + q / 10)) * rr)
+			end
+			local col = (((rnd() * 0xFFFFFF) // 1) + (if rnd() < 0.5 then 255 else 60 + (rnd() * 180) // 1) * 16777216)
+			polygon(s.sc, s.rs, col, pts)
+			table.insert(paths, { contours = { pts }, color = col })
+		end
+		s.paths = paths
+	end
+	-- (f) overlapping shapes of different colours, some translucent, over a translucent background
 	do
 		local s = newScene("overlapping translucent shapes", 0x80403020, false)
 		for k = 1, 22 do
@@ -1002,11 +1022,15 @@ do
 	end
 	local a = buffer.create(W * W * 4)
 	local b = buffer.create(W * W * 4)
+	local fastPixels, generalPixels = 0, 0
+	local scanFast, scanGeneral = 0, 0
 	for _, s in scenes do
 		-- exact compositing: no seam, every channel correctly rounded
 		Raster.resetStats()
 		Raster.render(s.sc, Raster.bin(s.sc, W, W), a, W, W, 8)
 		local conflicts = Raster.stats.conflicts
+		fastPixels += Raster.stats.disjoint
+		generalPixels += conflicts - Raster.stats.disjoint
 		Raster.renderBrute(s.sc, b, W, W)
 		assert(Pixels.diff(a, b, W * W) == 0, "render != renderBrute (" .. s.name .. ")")
 		local ma, mc = compareRef(a, W, s.rs, 0, 0, W - 1, W - 1)
@@ -1034,9 +1058,19 @@ do
 			local sa, sc2 = compareRef(a, W, s.rs, 0, 0, W - 1, W - 1)
 			report("F2 " .. s.name .. ", Scanline.renderScene (1/255)", math.max(sa, sc2))
 			assert(sa <= F1 and sc2 <= F1 and st.conflicts > 0, "Scanline.renderScene F2: " .. s.name)
+			scanFast += st.disjoint
+			scanGeneral += st.conflicts - st.disjoint
 			f2Hash = (f2Hash * 31 + hashWords(a, W * W)) % 4294967291
 		end
 	end
+	-- both exact-visibility paths ran: the disjoint fast path (seams) and the
+	-- general signed-term path (overlaps, and the fan's centre with 9 shapes)
+	report("F2 conflict pixels resolved by the disjoint fast path", fastPixels)
+	report("F2 conflict pixels resolved by the general path", generalPixels)
+	assert(fastPixels > 500 and generalPixels > 100, "both visibility paths must be exercised")
+	report("F2 scanline conflict pixels, disjoint fast path", scanFast)
+	report("F2 scanline conflict pixels, general path", scanGeneral)
+	assert(scanFast > 300 and scanGeneral > 50, "both scanline visibility paths must be exercised")
 	-- a multi-path scene painted path by path with Scanline.composite conflates (C11)
 	local s = scenes[5] -- polygon split, one colour
 	local acc = Scanline.new(W, W)
@@ -1155,6 +1189,7 @@ end
 ----------------------------------------------------------------------------------
 
 do
+	seed = 6006
 	local th = Saturn.halvingThresholds(6) -- levels 0..5, boundaries at 2, 4, 8, 16, 32
 	local eta = 1.25
 	-- S1: after every update t_(L-1) <= x < t_L * eta (never undersampled)
@@ -1173,19 +1208,18 @@ do
 	end
 	-- S2: sequences confined to one band [t_k, t_k * eta) change the level at most
 	-- once; sequences in an interval that straddles no band never reverse
-	for trial = 1, 3000 do
+	for _ = 1, 3000 do
 		local k = 1 + (rnd() * #th) // 1
 		local s2 = Saturn.selector(th, eta, (rnd() * (#th + 1)) // 1)
 		local changes = 0
 		local prev = -1
-		for step = 1, 200 do
+		for _ = 1, 200 do
 			local x = th[k] * (1 + (eta - 1) * rnd() * 0.999999)
 			local L = Saturn.select(s2, x)
 			if prev >= 0 and L ~= prev then
 				changes += 1
 			end
 			prev = L
-			local _ = step
 		end
 		assert(changes == 0, "S2: level changed inside a band after the first update")
 		-- any interval of multiplicative width below eta straddles no band
@@ -1203,7 +1237,6 @@ do
 			end
 			prev = L
 		end
-		local _ = trial
 	end
 	-- X1: C1 continuity of the opacities (dense sampling); one moves at a time
 	local N = 20000
@@ -1298,7 +1331,7 @@ do
 	Raster.render(sc, Raster.bin(sc, S, S), img, S, S, 8)
 	report("demo scene 96 shapes 256^2: conflict pixels", Raster.stats.conflicts)
 	checkHash("raster flawless demo", hashWords(img, S * S), 1754726396)
-	checkHash("F2 scenes", f2Hash, 2478953521)
+	checkHash("F2 scenes", f2Hash, 3407701184)
 	checkHash("LOD levels", lodHash, 3236752937)
 end
 
