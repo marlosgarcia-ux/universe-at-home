@@ -7,7 +7,9 @@
       "$className": "ReplicatedStorage",
       "Universe": {
         "$className": "Folder",
-        "MyMath": { "$path": "src/MyMath.luau" }
+        "MyMath": { "$path": "src/MyMath.luau" },
+        "Pixels": { "$path": "src/Pixels.luau" },
+        "Liquid": { "$path": "src/Liquid.luau" }
       },
       "Gallery": { "$path": "gallery/shared" }
     },

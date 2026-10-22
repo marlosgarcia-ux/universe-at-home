@@ -171,21 +171,32 @@ Jobs.sheetHeights = {
 		params.IgnoreWater = true
 		local n, half, spacing = p.n, p.half, p.spacing
 		local out = buffer.create(n * n * 4)
-		local misses = 0
-		local down = Vector3.new(0, -400, 0)
+		local misses, buried = 0, 0
+		local down = Vector3.new(0, -600, 0)
+		local last = p.baseY - 4
 		for j = 0, n - 1 do
 			for i = 0, n - 1 do
 				local x = p.cx + (i - half) * spacing
 				local z = p.cz + (j - half) * spacing
-				local hit = Workspace:Raycast(Vector3.new(x, p.top, z), down, params)
-				local h = if hit then hit.Position.Y - p.baseY else -1000
-				if not hit then
+				local hit = Workspace:Raycast(Vector3.new(x, 500, z), down, params)
+				local h: number
+				if hit then
+					h = hit.Position.Y
+					-- shells only on grass: elsewhere the sheet dips under the ground
+					local m = hit.Material
+					if m ~= Enum.Material.Grass and m ~= Enum.Material.LeafyGrass then
+						h -= 3
+						buried += 1
+					end
+					last = h
+				else
+					h = last - 3
 					misses += 1
 				end
 				buffer.writef32(out, (j * n + i) * 4, h)
 			end
 		end
-		return { cx = p.cx, cz = p.cz, baseY = p.baseY, heights = out, misses = misses, stamp = p.stamp }
+		return { cx = p.cx, cz = p.cz, heights = out, misses = misses, buried = buried, stamp = p.stamp }
 	end,
 }
 
@@ -1207,15 +1218,19 @@ export type SheetArrays = {
 export type BuiltSheet = {
 	mesh: EditableMesh,
 	vertexIds: { number },
-	yRange: number,
+	extent: number, -- pins at +-extent in X and Z
+	yRange: number, -- pins at +-yRange in Y
+	partY: number, -- world Y of the MeshPart; vertex Y = world height - partY
 	mode: string,
 }
 
--- The ring 1 sheet: vertices at y = 0 (heights set later with setSheetHeights), UVs
--- 0..1 per quad (one mask repeat per quad, no reliance on texture wrapping), white
--- vertex colours whose alpha carries the ring crossfades, two degenerate triangles at
--- y = +-yRange that pin the bounding box.
-function GrassMesh.buildSheet(assetService: AssetService, s: SheetArrays, yRange: number): (BuiltSheet?, string?)
+-- The ring 1 sheet, world-anchored: its MeshPart never moves (CFrame.new(0, partY, 0)
+-- plus the wind sway) and re-centring only rewrites vertex positions, so heights and
+-- placement can never be out of step for a frame. UVs 0..1 per quad (one mask repeat
+-- per quad, no reliance on texture wrapping), white vertex colours whose alpha carries
+-- the ring crossfades, and two degenerate triangles at (+-extent, +-yRange, +-extent)
+-- that pin the bounding box (centred on the local origin, see the placement rule).
+function GrassMesh.buildSheet(assetService: AssetService, s: SheetArrays, extent: number, yRange: number, partY: number): (BuiltSheet?, string?)
 	local mesh = assetService:CreateEditableMesh()
 	if not mesh then
 		return nil, "CreateEditableMesh returned nil (editable budget)"
@@ -1270,34 +1285,35 @@ function GrassMesh.buildSheet(assetService: AssetService, s: SheetArrays, yRange
 	end
 	-- bounding-box pins (zero-area triangles)
 	local pinOk = pcall(function()
-		local lo = mesh:AddVertex(Vector3.new(0, -yRange, 0))
-		local lo2 = mesh:AddVertex(Vector3.new(0, -yRange, 0.001))
-		local hi = mesh:AddVertex(Vector3.new(0, yRange, 0))
-		local hi2 = mesh:AddVertex(Vector3.new(0, yRange, 0.001))
+		local lo = mesh:AddVertex(Vector3.new(-extent, -yRange, -extent))
+		local lo2 = mesh:AddVertex(Vector3.new(-extent, -yRange, -extent + 0.001))
+		local hi = mesh:AddVertex(Vector3.new(extent, yRange, extent))
+		local hi2 = mesh:AddVertex(Vector3.new(extent, yRange, extent - 0.001))
 		mesh:AddTriangle(lo, lo2, lo)
 		mesh:AddTriangle(hi, hi2, hi)
 	end)
 	if not pinOk then
 		mode = "batch, no bounding-box pins"
 	end
-	return { mesh = mesh, vertexIds = vIds, yRange = yRange, mode = mode }, nil
+	return { mesh = mesh, vertexIds = vIds, extent = extent, yRange = yRange, partY = partY, mode = mode }, nil
 end
 
--- heights: f32 buffer, one per sheet vertex, relative to the sheet's base height.
-function GrassMesh.setSheetHeights(b: BuiltSheet, s: SheetArrays, heights: buffer)
+-- heights: f32 buffer of absolute world heights, one per sheet vertex; (cx, cz) the
+-- world position of the sheet's centre vertex.
+function GrassMesh.setSheetHeights(b: BuiltSheet, s: SheetArrays, heights: buffer, cx: number, cz: number)
 	local count = s.n * s.n
 	local values = table.create(count)
-	local r = b.yRange - 0.5
+	local lo, hi = -b.yRange + 0.5, b.yRange - 0.5
 	for i = 1, count do
-		local h = buffer.readf32(heights, (i - 1) * 4)
+		local h = buffer.readf32(heights, (i - 1) * 4) - b.partY
 		if h ~= h then
-			h = 0
-		elseif h > r then
-			h = r
-		elseif h < -r then
-			h = -r
+			h = lo
+		elseif h > hi then
+			h = hi
+		elseif h < lo then
+			h = lo
 		end
-		values[i] = Vector3.new(s.vx[i], h, s.vz[i])
+		values[i] = Vector3.new(cx + s.vx[i], h, cz + s.vz[i])
 	end
 	local ok = pcall(function()
 		b.mesh:BatchSetValues(b.vertexIds, values)
@@ -11829,6 +11845,861 @@ return LiquidMatte
       </Item>
       <Item class="ModuleScript" referent="34">
         <Properties>
+          <string name="Name">LiquidTime</string>
+          <string name="Source"><![CDATA[--!native
+--!optimize 2
+-- universe-at-home :: LiquidTime (ALLAN X1: extrapolation in time, texture dead reckoning)
+--
+-- Animated textures (water, fire, caustics) as per-leaf liquid cells that evolve the leaves'
+-- feature bytes in time. A cell's state has a closed form at any future tick, so a client
+-- renders ahead and keeps the texture moving between server updates (dead reckoning). The
+-- server sends inputs and time stamps, never pixels; a late input is applied by rolling the
+-- affected leaves back to a checkpoint and replaying, after which client and server hold the
+-- same bits. docs/LIQUID.md "Applications results" holds the proofs and measurements.
+--
+-- THE MODEL (deterministic ops only: + - * / comparisons, floor, integer % and //, hashes).
+--
+-- Ticks are integers t >= 0. Leaf l (0-based) has C channels; per (l, c): base, amp, and a
+-- persistent offset off (0 at t = 0). Gains: g1 = 2^-k_l, g2 = 2^-(k_l + 1), a = 1 - g.
+-- Target during tick t (epoch E = t // P):
+--   b = base + off + amp * drive(l, c, E)
+--   drive "hash": hash2(l * C + c, E, seed) / 2^32 * 2 - 1
+--   drive "flow": valueNoise2(cx / scale + E vx, cy / scale + E vy, seed + 101 c) * 2 - 1
+-- One tick from t to t + 1, after applying the events stamped t (in (tick, seq, sub) order):
+--   x2 = x2 + (x1 - x2) g2;  x1 = x1 + (b - x1) g1          (order 2; order 1 keeps x1 only)
+-- Output feature: x2 (order 2) or x1 (order 1); byte = clamp(floor(v + 0.5), 0, 255).
+-- Initial state: x1 = x2 = b at t = 0 (rest). Events have tick >= 1.
+-- Events: kick (x1 = x1 + v; x2 follows smoothly), offset (off = v from that tick on),
+-- splash (x, y, r, v): a kick of v (1 - d^2 / r^2) into every leaf whose centre lies at
+-- distance d < r, expanded in leaf order (sub = leaf + 1).
+--
+-- CANONICAL EVALUATION (what makes every device agree bit for bit). A leaf's commit points
+-- are the epoch boundaries and its event ticks. Its state is only ever stored at commit
+-- points, after that tick's events, and moves between consecutive ones in closed form:
+--   A1 = POW(a1, n), A2 = POW(a2, n), e1 = x1 - b, e2 = x2 - b
+--   x1' = b + e1 A1;   x2' = b + e2 A2 - e1 (A1 - A2)          (exact for g1 = 2 g2)
+-- POW(a, n) multiplies a^(2^j) (j = 0, 1, ...; by repeated squaring) over the set bits of
+-- n in increasing j, and flushes any factor or product below 2^-200 to 0 (no subnormals).
+-- A query at tick t jumps from the last commit point <= t without storing anything, so the
+-- answer depends only on the events and t, never on when or how often a device asked.
+--
+-- MESSAGES (little-endian; values are fixed point, value = i32 / 256):
+--   kick / offset:  u8 kind (1 / 2), u32 tick, u32 seq, u32 leaf, u8 channel, i32 value
+--   splash:         u8 3, u32 tick, u32 seq, u16 x, u16 y, u16 r, u8 channel, i32 value
+--   horizon:        u8 4, u32 tick   (no later message carries a tick below it)
+
+local MyMath = require("./MyMath")
+
+local LiquidTime = {}
+
+local hash2 = MyMath.hash2
+local valueNoise2 = MyMath.valueNoise2
+local floor = math.floor
+local TINY = 2 ^ -200
+local JMAX = 32 -- ticks below 2^32
+
+export type Event = {
+	tick: number,
+	seq: number,
+	sub: number,
+	kind: number, -- 1 kick, 2 offset
+	leaf: number,
+	ch: number,
+	value: number,
+}
+
+export type Message = {
+	kind: number, -- 1 kick, 2 offset, 3 splash, 4 horizon
+	tick: number,
+	seq: number,
+	leaf: number,
+	ch: number,
+	value: number,
+	x: number,
+	y: number,
+	r: number,
+}
+
+export type Spec = {
+	leaves: number,
+	channels: number,
+	epoch: number, -- ticks per drive epoch (P)
+	seed: number,
+	order: number?, -- 1 or 2 (default 2)
+	height: number, -- texture rows (for the rows to re-render)
+	k: { number }, -- per leaf: first-neuron gain exponent, 0..30
+	y0: { number }, -- per leaf: first row of its footprint
+	rows: { number }, -- per leaf: footprint height in rows
+	cx: { number }, -- per leaf: centre x (texture pixels)
+	cy: { number }, -- per leaf: centre y
+	base: { number }, -- per (leaf, channel): l * C + c + 1
+	amp: { number },
+	drive: string?, -- "hash" (default) or "flow"
+	flowScale: number?,
+	flowVx: number?,
+	flowVy: number?,
+}
+
+export type World = {
+	L: number,
+	C: number,
+	P: number,
+	seed: number,
+	order: number,
+	H: number,
+	k: { number },
+	y0: { number },
+	rows: { number },
+	cx: { number },
+	cy: { number },
+	base: { number },
+	amp: { number },
+	flow: boolean,
+	scale: number,
+	vx: number,
+	vy: number,
+	-- canonical cursor per leaf (state after the events of tick tc)
+	tc: { number },
+	x1: { number },
+	x2: { number },
+	off: { number },
+	evNext: { number },
+	ev: { { Event } },
+	-- rollback checkpoint per leaf (a commit point below the horizon)
+	ckT: { number },
+	ckX1: { number },
+	ckX2: { number },
+	ckOff: { number },
+	ckEv: { number },
+	horizon: number,
+	-- dirty tracking (calendar)
+	snap: { number },
+	wakeAt: { number },
+	heap: { number },
+	heapN: number,
+	lastDirty: number,
+	-- statistics
+	rollbacks: number,
+	replays: number,
+	jumps: number,
+	evaluations: number,
+}
+
+-- POW tables: pw[k + 1] = { a^(2^j) for j = 0..JMAX - 1 } with a = 1 - 2^-k, flushed below TINY.
+local PW: { { number } } = {}
+for k = 0, 31 do
+	local a = 1
+	local g = 1
+	for _ = 1, k do
+		g *= 0.5
+	end
+	a = 1 - g
+	local t = table.create(JMAX, 0)
+	local v = a
+	for j = 1, JMAX do
+		if v < TINY then
+			v = 0
+		end
+		t[j] = v
+		v = v * v
+	end
+	PW[k + 1] = t
+end
+
+local function pow(k: number, n: number): number
+	local t = PW[k + 1]
+	local r = 1
+	local j = 1
+	while n > 0 do
+		if n % 2 == 1 then
+			r *= t[j]
+			if r < TINY then
+				return 0
+			end
+		end
+		n = n // 2
+		j += 1
+	end
+	return r
+end
+LiquidTime.pow = pow
+
+local function gain(k: number): number
+	local g = 1
+	for _ = 1, k do
+		g *= 0.5
+	end
+	return g
+end
+
+function LiquidTime.new(spec: Spec): World
+	local L, C = spec.leaves, spec.channels
+	assert(L >= 1 and C >= 1 and spec.epoch >= 1, "need leaves, channels and an epoch")
+	local order = spec.order or 2
+	assert(order == 1 or order == 2, "order is 1 or 2")
+	local W: World = {
+		L = L,
+		C = C,
+		P = spec.epoch,
+		seed = spec.seed,
+		order = order,
+		H = spec.height,
+		k = spec.k,
+		y0 = spec.y0,
+		rows = spec.rows,
+		cx = spec.cx,
+		cy = spec.cy,
+		base = spec.base,
+		amp = spec.amp,
+		flow = spec.drive == "flow",
+		scale = spec.flowScale or 64,
+		vx = spec.flowVx or 0.37,
+		vy = spec.flowVy or 0.11,
+		tc = table.create(L, 0),
+		x1 = table.create(L * C, 0),
+		x2 = table.create(L * C, 0),
+		off = table.create(L * C, 0),
+		evNext = table.create(L, 1),
+		ev = {} :: { { Event } },
+		ckT = table.create(L, 0),
+		ckX1 = table.create(L * C, 0),
+		ckX2 = table.create(L * C, 0),
+		ckOff = table.create(L * C, 0),
+		ckEv = table.create(L, 1),
+		horizon = 1,
+		snap = table.create(L * C, 0),
+		wakeAt = table.create(L, -1),
+		heap = {},
+		heapN = 0,
+		lastDirty = -1,
+		rollbacks = 0,
+		replays = 0,
+		jumps = 0,
+		evaluations = 0,
+	}
+	for l = 0, L - 1 do
+		W.ev[l + 1] = {}
+		assert(W.k[l + 1] >= 0 and W.k[l + 1] <= 30, "gain exponent in 0..30")
+	end
+	LiquidTime.reset(W)
+	return W
+end
+
+local function drive(W: World, l: number, c: number, E: number): number
+	if W.flow then
+		return valueNoise2(W.cx[l + 1] / W.scale + E * W.vx, W.cy[l + 1] / W.scale + E * W.vy, W.seed + 101 * c) * 2 - 1
+	end
+	return hash2(l * W.C + c, E, W.seed) / 4294967296 * 2 - 1
+end
+
+-- Target of (l, c) during epoch E with the offset currently at the cursor.
+local function target(W: World, l: number, c: number, E: number): number
+	local i = l * W.C + c + 1
+	return W.base[i] + W.off[i] + W.amp[i] * drive(W, l, c, E)
+end
+LiquidTime.target = target
+
+-- Puts every leaf at rest at t = 0 (keeps the received events, forgets the cursors).
+function LiquidTime.reset(W: World)
+	local C = W.C
+	for l = 0, W.L - 1 do
+		W.tc[l + 1] = 0
+		W.evNext[l + 1] = 1
+		W.ckT[l + 1] = 0
+		W.ckEv[l + 1] = 1
+		for c = 0, C - 1 do
+			local i = l * C + c + 1
+			W.off[i] = 0
+			local b = target(W, l, c, 0)
+			W.x1[i], W.x2[i] = b, b
+			W.ckX1[i], W.ckX2[i], W.ckOff[i] = b, b, 0
+		end
+	end
+end
+
+local function applyEvent(W: World, e: Event)
+	local i = e.leaf * W.C + e.ch + 1
+	if e.kind == 1 then
+		W.x1[i] += e.value
+		if W.order == 1 then
+			W.x2[i] = W.x1[i]
+		end
+	else
+		W.off[i] = e.value
+	end
+end
+
+-- Moves leaf l's cursor through every commit point <= T (canonical).
+local function advance(W: World, l: number, T: number)
+	local C, P = W.C, W.P
+	local k = W.k[l + 1]
+	local evs = W.ev[l + 1]
+	local nev = #evs
+	local tc = W.tc[l + 1]
+	local en = W.evNext[l + 1]
+	local x1, x2 = W.x1, W.x2
+	while true do
+		local E = tc // P
+		local nt = (E + 1) * P
+		if en <= nev and evs[en].tick < nt then
+			nt = evs[en].tick
+		end
+		if nt > T then
+			break
+		end
+		local n = nt - tc
+		local A1 = pow(k, n)
+		local A2 = pow(k + 1, n)
+		for c = 0, C - 1 do
+			local i = l * C + c + 1
+			local b = target(W, l, c, E)
+			local e1 = x1[i] - b
+			x1[i] = b + e1 * A1
+			if W.order == 2 then
+				local e2 = x2[i] - b
+				x2[i] = b + e2 * A2 - e1 * (A1 - A2)
+			else
+				x2[i] = x1[i]
+			end
+		end
+		W.jumps += 1
+		tc = nt
+		while en <= nev and evs[en].tick == nt do
+			applyEvent(W, evs[en])
+			en += 1
+		end
+		if nt < W.horizon then
+			W.ckT[l + 1] = nt
+			W.ckEv[l + 1] = en
+			for c = 0, C - 1 do
+				local i = l * C + c + 1
+				W.ckX1[i], W.ckX2[i], W.ckOff[i] = x1[i], x2[i], W.off[i]
+			end
+		end
+	end
+	W.tc[l + 1] = tc
+	W.evNext[l + 1] = en
+end
+LiquidTime.advance = advance
+
+-- Canonical values of leaf l at tick T (advances the cursor; the result does not depend on
+-- earlier queries). Writes the output feature of each channel to out[c + 1] and returns out.
+-- With `states`, also writes x1 and x2 (out[C + c + 1], out[2C + c + 1]).
+function LiquidTime.valuesAt(W: World, l: number, T: number, out: { number }, states: boolean?): { number }
+	advance(W, l, T)
+	W.evaluations += 1
+	local C = W.C
+	local tc = W.tc[l + 1]
+	local n = T - tc
+	local k = W.k[l + 1]
+	local A1 = pow(k, n)
+	local A2 = pow(k + 1, n)
+	local E = tc // W.P
+	for c = 0, C - 1 do
+		local i = l * C + c + 1
+		local b = target(W, l, c, E)
+		local e1 = W.x1[i] - b
+		local v1 = b + e1 * A1
+		local v2 = v1
+		if W.order == 2 then
+			v2 = b + (W.x2[i] - b) * A2 - e1 * (A1 - A2)
+		end
+		out[c + 1] = v2
+		if states then
+			out[C + c + 1] = v1
+			out[2 * C + c + 1] = v2
+		end
+	end
+	return out
+end
+
+function LiquidTime.byte(v: number): number
+	local q = floor(v + 0.5)
+	return if q < 0 then 0 elseif q > 255 then 255 else q
+end
+
+----------------------------------------------------------------------------------------
+-- inputs, rollback, horizon
+----------------------------------------------------------------------------------------
+
+local function eventBefore(a: Event, b: Event): boolean
+	if a.tick ~= b.tick then
+		return a.tick < b.tick
+	end
+	if a.seq ~= b.seq then
+		return a.seq < b.seq
+	end
+	return a.sub < b.sub
+end
+
+-- Rolls leaf l back so that an event stamped `tick` will be replayed: to its checkpoint when
+-- that lies before the tick, else to t = 0 (a protocol violation: an event below the horizon).
+local function rollback(W: World, l: number, tick: number)
+	W.rollbacks += 1
+	local C = W.C
+	if W.ckT[l + 1] < tick then
+		W.tc[l + 1] = W.ckT[l + 1]
+		W.evNext[l + 1] = W.ckEv[l + 1]
+		for c = 0, C - 1 do
+			local i = l * C + c + 1
+			W.x1[i], W.x2[i], W.off[i] = W.ckX1[i], W.ckX2[i], W.ckOff[i]
+		end
+	else
+		W.replays += 1
+		W.tc[l + 1] = 0
+		W.evNext[l + 1] = 1
+		W.ckT[l + 1] = 0
+		W.ckEv[l + 1] = 1
+		for c = 0, C - 1 do
+			local i = l * C + c + 1
+			W.off[i] = 0
+			local b = target(W, l, c, 0)
+			W.x1[i], W.x2[i] = b, b
+			W.ckX1[i], W.ckX2[i], W.ckOff[i] = b, b, 0
+		end
+	end
+end
+
+local heapPush: (W: World, key: number) -> ()
+
+-- Adds one event (idempotent: an event already held is ignored). Late events roll the leaf
+-- back; the calendar re-checks the leaf at the next dirty() call.
+function LiquidTime.receive(W: World, e: Event)
+	assert(e.tick >= 1, "events start at tick 1")
+	local l = e.leaf
+	local evs = W.ev[l + 1]
+	local n = #evs
+	local p = n + 1
+	while p > 1 and eventBefore(e, evs[p - 1]) do
+		p -= 1
+	end
+	if p > 1 then
+		local q = evs[p - 1]
+		if q.tick == e.tick and q.seq == e.seq and q.sub == e.sub then
+			return -- duplicate
+		end
+	end
+	table.insert(evs, p, e)
+	if W.tc[l + 1] >= e.tick then
+		rollback(W, l, e.tick)
+	elseif p < W.evNext[l + 1] then
+		W.evNext[l + 1] += 1 -- cannot happen for tick > tc; kept for safety
+	end
+	if W.lastDirty >= 0 then
+		local wake = if e.tick > W.lastDirty + 1 then e.tick else W.lastDirty + 1
+		if W.wakeAt[l + 1] < 0 or wake < W.wakeAt[l + 1] then
+			W.wakeAt[l + 1] = wake
+			heapPush(W, wake * 1048576 + l)
+		end
+	end
+end
+
+-- Expands a splash into kicks, in leaf order.
+function LiquidTime.splash(W: World, tick: number, seq: number, x: number, y: number, r: number, ch: number, v: number): number
+	local n = 0
+	local r2 = r * r
+	for l = 0, W.L - 1 do
+		local dx, dy = W.cx[l + 1] - x, W.cy[l + 1] - y
+		local d2 = dx * dx + dy * dy
+		if d2 < r2 then
+			n += 1
+			LiquidTime.receive(W, { tick = tick, seq = seq, sub = l + 1, kind = 1, leaf = l, ch = ch, value = v * (1 - d2 / r2) })
+		end
+	end
+	return n
+end
+
+function LiquidTime.setHorizon(W: World, H: number)
+	if H > W.horizon then
+		W.horizon = H
+	end
+end
+
+----------------------------------------------------------------------------------------
+-- messages (inputs and time stamps; never pixels)
+----------------------------------------------------------------------------------------
+
+function LiquidTime.encode(m: Message): buffer
+	if m.kind == 4 then
+		local b = buffer.create(5)
+		buffer.writeu8(b, 0, 4)
+		buffer.writeu32(b, 1, m.tick)
+		return b
+	end
+	local q = floor(m.value * 256 + 0.5)
+	assert(q >= -2147483648 and q <= 2147483647, "value out of range")
+	if m.kind == 3 then
+		local b = buffer.create(20)
+		buffer.writeu8(b, 0, 3)
+		buffer.writeu32(b, 1, m.tick)
+		buffer.writeu32(b, 5, m.seq)
+		buffer.writeu16(b, 9, m.x)
+		buffer.writeu16(b, 11, m.y)
+		buffer.writeu16(b, 13, m.r)
+		buffer.writeu8(b, 15, m.ch)
+		buffer.writei32(b, 16, q)
+		return b
+	end
+	local b = buffer.create(18)
+	buffer.writeu8(b, 0, m.kind)
+	buffer.writeu32(b, 1, m.tick)
+	buffer.writeu32(b, 5, m.seq)
+	buffer.writeu32(b, 9, m.leaf)
+	buffer.writeu8(b, 13, m.ch)
+	buffer.writei32(b, 14, q)
+	return b
+end
+
+function LiquidTime.decode(b: buffer): Message
+	local kind = buffer.readu8(b, 0)
+	local m: Message = { kind = kind, tick = buffer.readu32(b, 1), seq = 0, leaf = 0, ch = 0, value = 0, x = 0, y = 0, r = 0 }
+	if kind == 3 then
+		m.seq = buffer.readu32(b, 5)
+		m.x = buffer.readu16(b, 9)
+		m.y = buffer.readu16(b, 11)
+		m.r = buffer.readu16(b, 13)
+		m.ch = buffer.readu8(b, 15)
+		m.value = buffer.readi32(b, 16) / 256
+	elseif kind == 1 or kind == 2 then
+		m.seq = buffer.readu32(b, 5)
+		m.leaf = buffer.readu32(b, 9)
+		m.ch = buffer.readu8(b, 13)
+		m.value = buffer.readi32(b, 14) / 256
+	end
+	return m
+end
+
+-- Applies one decoded message to a world (server and clients run the same code).
+function LiquidTime.handle(W: World, m: Message)
+	if m.kind == 4 then
+		LiquidTime.setHorizon(W, m.tick)
+	elseif m.kind == 3 then
+		LiquidTime.splash(W, m.tick, m.seq, m.x, m.y, m.r, m.ch, m.value)
+	else
+		LiquidTime.receive(W, { tick = m.tick, seq = m.seq, sub = 0, kind = m.kind, leaf = m.leaf, ch = m.ch, value = m.value })
+	end
+end
+
+----------------------------------------------------------------------------------------
+-- reference: tick-by-tick evolution of every cell (the dynamics written literally)
+----------------------------------------------------------------------------------------
+
+-- Returns per (l, c) the output feature at tick T, stepping every tick from 0 with the
+-- events of W (which this does not modify).
+function LiquidTime.stepReference(W: World, T: number): { number }
+	local L, C, P = W.L, W.C, W.P
+	local x1 = table.create(L * C, 0)
+	local x2 = table.create(L * C, 0)
+	local off = table.create(L * C, 0)
+	local idx = table.create(L, 1)
+	for l = 0, L - 1 do
+		for c = 0, C - 1 do
+			local i = l * C + c + 1
+			local b = W.base[i] + W.amp[i] * drive(W, l, c, 0)
+			x1[i], x2[i] = b, b
+		end
+	end
+	for t = 0, T - 1 do
+		local E = t // P
+		for l = 0, L - 1 do
+			local evs = W.ev[l + 1]
+			local j = idx[l + 1]
+			while j <= #evs and evs[j].tick == t do
+				local e = evs[j]
+				local i = l * C + e.ch + 1
+				if e.kind == 1 then
+					x1[i] += e.value
+				else
+					off[i] = e.value
+				end
+				j += 1
+			end
+			idx[l + 1] = j
+			local g1, g2 = gain(W.k[l + 1]), gain(W.k[l + 1] + 1)
+			for c = 0, C - 1 do
+				local i = l * C + c + 1
+				local b = W.base[i] + off[i] + W.amp[i] * drive(W, l, c, E)
+				if W.order == 2 then
+					x2[i] = x2[i] + (x1[i] - x2[i]) * g2
+				end
+				x1[i] = x1[i] + (b - x1[i]) * g1
+			end
+		end
+	end
+	-- events stamped T itself
+	for l = 0, L - 1 do
+		local evs = W.ev[l + 1]
+		local j = idx[l + 1]
+		while j <= #evs and evs[j].tick == T do
+			local e = evs[j]
+			local i = l * C + e.ch + 1
+			if e.kind == 1 then
+				x1[i] += e.value
+			else
+				off[i] = e.value
+			end
+			j += 1
+		end
+	end
+	local out = table.create(L * C, 0)
+	for i = 1, L * C do
+		out[i] = if W.order == 2 then x2[i] else x1[i]
+	end
+	return out
+end
+
+----------------------------------------------------------------------------------------
+-- dirty leaves and rows: a wake-up calendar against brute force
+----------------------------------------------------------------------------------------
+
+-- min-heap of keys tick * 2^20 + leaf (exact integers below 2^52)
+heapPush = function(W: World, key: number)
+	local h = W.heap
+	local n = W.heapN + 1
+	W.heapN = n
+	h[n] = key
+	while n > 1 do
+		local p = n // 2
+		if h[p] <= key then
+			break
+		end
+		h[n] = h[p]
+		n = p
+	end
+	h[n] = key
+end
+
+local function heapPop(W: World): number
+	local h = W.heap
+	local top = h[1]
+	local n = W.heapN
+	local last = h[n]
+	h[n] = nil
+	n -= 1
+	W.heapN = n
+	if n > 0 then
+		local i = 1
+		while true do
+			local c = i * 2
+			if c > n then
+				break
+			end
+			if c < n and h[c + 1] < h[c] then
+				c += 1
+			end
+			if h[c] >= last then
+				break
+			end
+			h[i] = h[c]
+			i = c
+		end
+		h[i] = last
+	end
+	return top
+end
+
+local SAFE = 1 - 2 ^ -30 -- shrinks the tolerance used for wake times (rounding slack)
+
+-- Next tick at which leaf l must be looked at again, given its values `v` at tick t (the
+-- cursor is at the last commit point <= t). Uses two proved bounds per channel (docs):
+--   settled: |x2(t + n) - x2(t)| <= |e1| + |e2| for all n until the next commit point;
+--   speed:   |x2(t + n) - x2(t)| <= n g2 (2 |e1| + |e2|)   (order 1: n g1 |e1|).
+local function nextWake(W: World, l: number, t: number, eps: number, v: { number }): number
+	local C, P = W.C, W.P
+	local tc = W.tc[l + 1]
+	local E = tc // P
+	local nc = (E + 1) * P
+	local evs = W.ev[l + 1]
+	local en = W.evNext[l + 1]
+	if en <= #evs and evs[en].tick < nc then
+		nc = evs[en].tick
+	end
+	local k = W.k[l + 1]
+	local n = t - tc
+	local A1 = pow(k, n)
+	local A2 = pow(k + 1, n)
+	local g = if W.order == 2 then gain(k + 1) else gain(k)
+	local wake = nc
+	local tol = eps * SAFE
+	for c = 0, C - 1 do
+		local i = l * C + c + 1
+		local b = target(W, l, c, E)
+		local e1 = (W.x1[i] - b) * A1
+		local e2 = if W.order == 2 then (W.x2[i] - b) * A2 - (W.x1[i] - b) * (A1 - A2) else e1
+		local a1, a2 = math.abs(e1), math.abs(e2)
+		local d0 = math.abs(v[c + 1] - W.snap[i])
+		local reach = if W.order == 2 then a1 + a2 else a1
+		if d0 + reach * (1 + 2 ^ -30) > tol then
+			local speed = (if W.order == 2 then 2 * a1 + a2 else a1) * g * (1 + 2 ^ -30)
+			local m = if speed > 0 then floor((tol - d0) / speed) + 1 else nc - t
+			if m < 1 then
+				m = 1
+			end
+			if t + m < wake then
+				wake = t + m
+			end
+		end
+	end
+	if wake <= t then
+		wake = t + 1
+	end
+	return wake
+end
+
+-- Starts dirty tracking at tick t: every leaf's snapshot is its value at t.
+function LiquidTime.track(W: World, t: number, eps: number)
+	W.heap = {}
+	W.heapN = 0
+	local v = table.create(W.C, 0)
+	for l = 0, W.L - 1 do
+		LiquidTime.valuesAt(W, l, t, v)
+		for c = 0, W.C - 1 do
+			W.snap[l * W.C + c + 1] = v[c + 1]
+		end
+		local wake = nextWake(W, l, t, eps, v)
+		W.wakeAt[l + 1] = wake
+		heapPush(W, wake * 1048576 + l)
+	end
+	W.lastDirty = t
+end
+
+local function addRows(marks: buffer, H: number, y0: number, rows: number)
+	local a = if y0 < 0 then 0 else y0
+	local b = y0 + rows - 1
+	if b > H - 1 then
+		b = H - 1
+	end
+	if b >= a then
+		buffer.fill(marks, a, 1, b - a + 1)
+	end
+end
+
+local function rowRanges(marks: buffer, H: number): { number }
+	local out = {}
+	local y = 0
+	while y < H do
+		if buffer.readu8(marks, y) == 1 then
+			local a = y
+			while y < H and buffer.readu8(marks, y) == 1 do
+				y += 1
+			end
+			table.insert(out, a)
+			table.insert(out, y - 1)
+		else
+			y += 1
+		end
+	end
+	return out
+end
+
+-- Leaves whose output moved more than eps (any channel) since they were last reported, at
+-- tick t >= the previous call, and the merged row ranges {a1, b1, a2, b2, ...} to re-render.
+-- Reported leaves take their value at t as the new snapshot. Cost follows the wake-ups.
+function LiquidTime.dirty(W: World, t: number, eps: number): ({ number }, { number })
+	local leaves = {}
+	local marks = buffer.create(W.H)
+	local v = table.create(W.C, 0)
+	local C = W.C
+	local limit = (t + 1) * 1048576
+	while W.heapN > 0 and W.heap[1] < limit do
+		local key = heapPop(W)
+		local l = key % 1048576
+		local tw = (key - l) / 1048576
+		if W.wakeAt[l + 1] ~= tw then
+			continue -- stale entry
+		end
+		LiquidTime.valuesAt(W, l, t, v)
+		local moved = false
+		for c = 0, C - 1 do
+			if math.abs(v[c + 1] - W.snap[l * C + c + 1]) > eps then
+				moved = true
+			end
+		end
+		if moved then
+			for c = 0, C - 1 do
+				W.snap[l * C + c + 1] = v[c + 1]
+			end
+			table.insert(leaves, l)
+			addRows(marks, W.H, W.y0[l + 1], W.rows[l + 1])
+		end
+		local wake = nextWake(W, l, t, eps, v)
+		W.wakeAt[l + 1] = wake
+		heapPush(W, wake * 1048576 + l)
+	end
+	W.lastDirty = t
+	table.sort(leaves)
+	return leaves, rowRanges(marks, W.H)
+end
+
+-- The same answer by checking every leaf (snapshots kept in `snap`, owned by the caller).
+function LiquidTime.dirtyBrute(W: World, t: number, eps: number, snap: { number }): ({ number }, { number })
+	local leaves = {}
+	local marks = buffer.create(W.H)
+	local v = table.create(W.C, 0)
+	local C = W.C
+	for l = 0, W.L - 1 do
+		LiquidTime.valuesAt(W, l, t, v)
+		local moved = false
+		for c = 0, C - 1 do
+			if math.abs(v[c + 1] - snap[l * C + c + 1]) > eps then
+				moved = true
+			end
+		end
+		if moved then
+			for c = 0, C - 1 do
+				snap[l * C + c + 1] = v[c + 1]
+			end
+			table.insert(leaves, l)
+			addRows(marks, W.H, W.y0[l + 1], W.rows[l + 1])
+		end
+	end
+	return leaves, rowRanges(marks, W.H)
+end
+
+----------------------------------------------------------------------------------------
+-- bounds and checksums
+----------------------------------------------------------------------------------------
+
+-- Largest change a single late input can make to the output of an order-2 cell, `lat` ticks
+-- after its time stamp (docs: the response of the cell to the input alone, by linearity):
+--   kick v:   |v| (a2^lat - a1^lat)          offset change d: |d| (1 + a1^lat - 2 a2^lat)
+-- (order 1: kick |v| a1^lat, offset |d| (1 - a1^lat)). Real arithmetic; add rounding slack.
+function LiquidTime.driftBound(kind: number, v: number, k: number, lat: number, order: number?): number
+	local A1, A2 = pow(k, lat), pow(k + 1, lat)
+	local m = math.abs(v)
+	if (order or 2) == 1 then
+		return if kind == 1 then m * A1 else m * (1 - A1)
+	end
+	if kind == 1 then
+		return m * (A2 - A1)
+	end
+	return m * (1 + A1 - 2 * A2)
+end
+
+-- Checksum of every leaf's state at tick T (f64 bits of x1 and x2): equal checksums mean
+-- equal bits.
+function LiquidTime.hashState(W: World, T: number): number
+	local h = 0x811C9DC5
+	local C = W.C
+	local v = table.create(3 * C, 0)
+	local b = buffer.create(8)
+	for l = 0, W.L - 1 do
+		LiquidTime.valuesAt(W, l, T, v, true)
+		for j = C + 1, 3 * C do
+			buffer.writef64(b, 0, v[j])
+			h = MyMath.hash32(bit32.bxor(h, buffer.readu32(b, 0)))
+			h = MyMath.hash32(bit32.bxor(h, buffer.readu32(b, 4)))
+		end
+	end
+	return h
+end
+
+return LiquidTime
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="35">
+        <Properties>
           <string name="Name">MyMath</string>
           <string name="Source"><![CDATA[--!native
 --!optimize 2
@@ -12340,7 +13211,7 @@ return MyMath
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="35">
+      <Item class="ModuleScript" referent="36">
         <Properties>
           <string name="Name">Pixels</string>
           <string name="Source"><![CDATA[--!native
@@ -12629,7 +13500,7 @@ return Pixels
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="36">
+      <Item class="ModuleScript" referent="37">
         <Properties>
           <string name="Name">Saturn</string>
           <string name="Source"><![CDATA[--!native
@@ -12856,11 +13727,11 @@ return Saturn
 ]]></string>
         </Properties>
       </Item>
-      <Item class="Folder" referent="37">
+      <Item class="Folder" referent="38">
         <Properties>
           <string name="Name">compute</string>
         </Properties>
-        <Item class="ModuleScript" referent="38">
+        <Item class="ModuleScript" referent="39">
           <Properties>
             <string name="Name">Coverage</string>
             <string name="Source"><![CDATA[--!native
@@ -13724,7 +14595,7 @@ return Coverage
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="39">
+        <Item class="ModuleScript" referent="40">
           <Properties>
             <string name="Name">Distance</string>
             <string name="Source"><![CDATA[--!native
@@ -14093,7 +14964,7 @@ return Distance
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="40">
+        <Item class="ModuleScript" referent="41">
           <Properties>
             <string name="Name">Expr</string>
             <string name="Source"><![CDATA[--!native
@@ -14671,7 +15542,7 @@ return Expr
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="41">
+        <Item class="ModuleScript" referent="42">
           <Properties>
             <string name="Name">Filter</string>
             <string name="Source"><![CDATA[--!native
@@ -15110,7 +15981,7 @@ return Filter
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="42">
+        <Item class="ModuleScript" referent="43">
           <Properties>
             <string name="Name">Raster</string>
             <string name="Source"><![CDATA[--!native
@@ -16830,7 +17701,7 @@ return Raster
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="43">
+        <Item class="ModuleScript" referent="44">
           <Properties>
             <string name="Name">Rows</string>
             <string name="Source"><![CDATA[--!native
@@ -16954,7 +17825,7 @@ return Rows
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="44">
+        <Item class="ModuleScript" referent="45">
           <Properties>
             <string name="Name">Scanline</string>
             <string name="Source"><![CDATA[--!native
@@ -17922,7 +18793,7 @@ return Scanline
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="45">
+        <Item class="ModuleScript" referent="46">
           <Properties>
             <string name="Name">Tiles</string>
             <string name="Source"><![CDATA[--!native
@@ -18221,7 +19092,7 @@ return Tiles
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="46">
+        <Item class="ModuleScript" referent="47">
           <Properties>
             <string name="Name">Trace</string>
             <string name="Source"><![CDATA[--!native
@@ -18399,7 +19270,7 @@ return Trace
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="47">
+        <Item class="ModuleScript" referent="48">
           <Properties>
             <string name="Name">Visibility</string>
             <string name="Source"><![CDATA[--!native
@@ -18968,15 +19839,15 @@ return Visibility
       </Item>
     </Item>
   </Item>
-  <Item class="ServerScriptService" referent="48">
+  <Item class="ServerScriptService" referent="49">
     <Properties>
       <string name="Name">ServerScriptService</string>
     </Properties>
-    <Item class="Folder" referent="49">
+    <Item class="Folder" referent="50">
       <Properties>
         <string name="Name">Server</string>
       </Properties>
-      <Item class="ModuleScript" referent="50">
+      <Item class="ModuleScript" referent="51">
         <Properties>
           <string name="Name">Bake</string>
           <string name="Source"><![CDATA[--!strict
@@ -19036,7 +19907,7 @@ return Bake
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="51">
+      <Item class="ModuleScript" referent="52">
         <Properties>
           <string name="Name">Environment</string>
           <string name="Source"><![CDATA[--!strict
@@ -19162,7 +20033,7 @@ return Environment
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="52">
+      <Item class="ModuleScript" referent="53">
         <Properties>
           <string name="Name">GrassBaker</string>
           <string name="Source"><![CDATA[--!strict
@@ -19292,7 +20163,7 @@ return GrassBaker
 ]]></string>
         </Properties>
       </Item>
-      <Item class="Script" referent="53">
+      <Item class="Script" referent="54">
         <Properties>
           <string name="Name">Main</string>
           <token name="RunContext">0</token>
@@ -19602,7 +20473,7 @@ end)
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="54">
+      <Item class="ModuleScript" referent="55">
         <Properties>
           <string name="Name">Rocks</string>
           <string name="Source"><![CDATA[--!strict
@@ -19812,7 +20683,7 @@ return Rocks
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="55">
+      <Item class="ModuleScript" referent="56">
         <Properties>
           <string name="Name">ServerJobs</string>
           <string name="Source"><![CDATA[--!strict
@@ -20018,7 +20889,7 @@ return Jobs
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="56">
+      <Item class="ModuleScript" referent="57">
         <Properties>
           <string name="Name">SkyBaker</string>
           <string name="Source"><![CDATA[--!strict
@@ -20095,7 +20966,7 @@ return SkyBaker
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="57">
+      <Item class="ModuleScript" referent="58">
         <Properties>
           <string name="Name">TerrainBuilder</string>
           <string name="Source"><![CDATA[--!strict
@@ -20321,16 +21192,16 @@ return TerrainBuilder
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="58">
+    <Item class="Folder" referent="59">
       <Properties>
         <string name="Name">Workers</string>
       </Properties>
-      <Item class="Actor" referent="59">
+      <Item class="Actor" referent="60">
         <Properties>
           <string name="Name">ServerWorker</string>
           <bool name="NeedsPivotMigration">false</bool>
         </Properties>
-        <Item class="Script" referent="60">
+        <Item class="Script" referent="61">
           <Properties>
             <string name="Name">Worker</string>
             <bool name="Disabled">true</bool>
@@ -20358,21 +21229,21 @@ WorkerMain.run(actor, jobs :: any)
       </Item>
     </Item>
   </Item>
-  <Item class="StarterPlayer" referent="61">
+  <Item class="StarterPlayer" referent="62">
     <Properties>
       <string name="Name">StarterPlayer</string>
       <float name="CameraMaxZoomDistance">600</float>
       <float name="CharacterWalkSpeed">20</float>
     </Properties>
-    <Item class="StarterPlayerScripts" referent="62">
+    <Item class="StarterPlayerScripts" referent="63">
       <Properties>
         <string name="Name">StarterPlayerScripts</string>
       </Properties>
-      <Item class="Folder" referent="63">
+      <Item class="Folder" referent="64">
         <Properties>
           <string name="Name">Client</string>
         </Properties>
-        <Item class="ModuleScript" referent="64">
+        <Item class="ModuleScript" referent="65">
           <Properties>
             <string name="Name">ClientActors</string>
             <string name="Source"><![CDATA[--!strict
@@ -20465,7 +21336,7 @@ return ClientActors
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="65">
+        <Item class="ModuleScript" referent="66">
           <Properties>
             <string name="Name">Grass</string>
             <string name="Source"><![CDATA[--!strict
@@ -20503,6 +21374,14 @@ local AssetService = game:GetService("AssetService")
 local Demo = ReplicatedStorage:WaitForChild("Demo")
 local GrassGen = require(Demo:WaitForChild("GrassGen"))
 local GrassMesh = require(Demo:WaitForChild("GrassMesh"))
+
+-- Ring 1 sheet placement (GrassMesh.buildSheet): the MeshPart never moves, it sits at
+-- (0, SHEET_PART_Y, 0); vertices carry world X and Z and heights relative to SHEET_PART_Y.
+-- The bounding-box pins must cover the whole world (1024 studs) plus the sheet half-width,
+-- and the vertical range the terrain (heights 6..256) plus the shell stack on top of it.
+local SHEET_PART_Y = 128
+local SHEET_Y_RANGE = 150
+local SHEET_EXTENT = 640
 local Rings = require(Demo:WaitForChild("Rings"))
 local WorkerPool = require(Demo:WaitForChild("WorkerPool"))
 local Status = require(Demo:WaitForChild("Status"))
@@ -20722,7 +21601,7 @@ local function sendWind(st: State)
 		local g = st.cfg
 		for k, p in st.shellParts do
 			table.insert(parts, p)
-			table.insert(base, CFrame.new(center))
+			table.insert(base, CFrame.new(0, SHEET_PART_Y, 0))
 			table.insert(offsets, Vector3.new(0, 0.14 + (k - 1) / math.max(1, K - 1) * g.shellHeight, 0))
 			table.insert(kind, k)
 		end
@@ -20800,11 +21679,11 @@ local function requestSheet(st: State, p: Vector3)
 		if not ok or type(res) ~= "table" or not built then
 			return
 		end
-		GrassMesh.setSheetHeights(built, sheet, res.heights)
+		GrassMesh.setSheetHeights(built, sheet, res.heights, res.cx, res.cz)
 		st.sheetCenter = Vector3.new(res.cx, res.baseY, res.cz)
 		st.windDirty = true
 		for _, part in st.shellParts do
-			part.CFrame = CFrame.new(st.sheetCenter :: Vector3)
+			part.CFrame = CFrame.new(0, SHEET_PART_Y, 0)
 		end
 	end
 	if pool then
@@ -21049,7 +21928,7 @@ local function buildShells(st: State, reg: any): (boolean, string)
 	local K = g.shellCount
 	local sheet = GrassGen.sheet(g.ring0, g.ring1, g.shellRepeat, g.fadeWidth, g.fadeWidth + 4)
 	st.sheet = sheet
-	local built, why = GrassMesh.buildSheet(AssetService, sheet :: any, 64)
+	local built, why = GrassMesh.buildSheet(AssetService, sheet :: any, SHEET_EXTENT, SHEET_Y_RANGE, SHEET_PART_Y)
 	if not built then
 		return false, tostring(why)
 	end
@@ -21274,7 +22153,7 @@ return Grass
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="66">
+        <Item class="ModuleScript" referent="67">
           <Properties>
             <string name="Name">Hud</string>
             <string name="Source"><![CDATA[--!strict
@@ -21605,7 +22484,7 @@ return Hud
 ]]></string>
           </Properties>
         </Item>
-        <Item class="LocalScript" referent="67">
+        <Item class="LocalScript" referent="68">
           <Properties>
             <string name="Name">Main</string>
             <string name="Source"><![CDATA[--!strict
@@ -21911,7 +22790,7 @@ end)
       </Item>
     </Item>
   </Item>
-  <Item class="Workspace" referent="68">
+  <Item class="Workspace" referent="69">
     <Properties>
       <string name="Name">Workspace</string>
       <float name="FallenPartsDestroyHeight">-500</float>
@@ -21919,7 +22798,7 @@ end)
       <bool name="NeedsPivotMigration">false</bool>
       <bool name="StreamingEnabled">false</bool>
     </Properties>
-    <Item class="Terrain" referent="69">
+    <Item class="Terrain" referent="70">
       <Properties>
         <string name="Name">Terrain</string>
         <bool name="Decoration">true</bool>
@@ -21934,7 +22813,7 @@ end)
         <float name="WaterWaveSize">0.12</float>
         <float name="WaterWaveSpeed">9</float>
       </Properties>
-      <Item class="Clouds" referent="70">
+      <Item class="Clouds" referent="71">
         <Properties>
           <string name="Name">Clouds</string>
           <Color3 name="Color">

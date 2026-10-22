@@ -95,3 +95,23 @@ if want("green") then
 	dump("matte", m, 256, 256)
 	dump("cutout", c, 256, 256)
 end
+
+if want("allan") then
+	local Liquid = require("../src/Liquid")
+	local Models = require("../gallery/shared/AlnModels")
+	for _, name in Models.names do
+		local blob = Models.load(name)
+		local model, tree = Liquid.decode(blob)
+		local plan = Liquid.prepare(model, tree, Models.scale(name))
+		for level = 0, (if name == "ui_flat_256" then 2 else 0) do
+			local w, h = Liquid.outputSize(plan, level)
+			local out = buffer.create(w * h * 4)
+			local stats
+			timed("allan " .. name .. " level " .. level, function()
+				stats = Liquid.render(plan, tree, out, w, { level = level })
+			end)
+			print(string.format("NOTE allan %s level %d: %d bytes of model, %d events for %d rows", name, level, Models.bytes(name), stats.segments, stats.rows))
+			dump("allan_" .. name .. "_L" .. level, out, w, h)
+		end
+	end
+end

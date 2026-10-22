@@ -4,7 +4,7 @@ local Panels = PanelsFactory(MyMathReal)
 local t0 = os.clock()
 local frames = 0
 local function allWritten()
-	if #images < 16 then -- plasma, badge, 64 px level, marble, 3 green-screen images, 9 tiles
+	if #images < 21 then -- plasma, badge, 64 px level, marble, 3 green-screen images, 5 ALLAN images, 9 tiles
 		return false
 	end
 	for _, im in images do
@@ -46,8 +46,9 @@ end
 check(#warnings == 0, "no warnings (no stage reported an error)")
 check(allWritten(), "every pixel row of every image was written at least once")
 
--- creation order is deterministic: plasma, badge 512, badge 64, marble, green, matte, cut-out, 9 tiles
-local expectSizes = { 192, 512, 64, 256, 256, 256, 256, 384, 384, 384, 384, 384, 384, 384, 384, 384 }
+-- creation order is deterministic: plasma, badge 512, badge 64, marble, green, matte, cut-out,
+-- ALLAN logo, ALLAN UI levels 0 to 2, ALLAN marble, then the 9 tiles
+local expectSizes = { 192, 512, 64, 256, 256, 256, 256, 256, 256, 128, 64, 64, 384, 384, 384, 384, 384, 384, 384, 384, 384 }
 check(#images == #expectSizes, "created exactly " .. #expectSizes .. " images, got " .. #images)
 for i, sz in expectSizes do
 	if images[i] then
@@ -75,10 +76,26 @@ Panels.keyMatte(g, 256, 256, m, c)
 check(hashOf(images[5]) == Panels.hashBuffer(g), "green-screen image equals a direct render")
 check(hashOf(images[6]) == Panels.hashBuffer(m), "matte image equals a direct render")
 check(hashOf(images[7]) == Panels.hashBuffer(c), "cut-out image equals a direct render")
+-- ALLAN images must equal a direct, un-banded render of the same model
+local function allanDirect(name, level, size)
+	local model, tree = LiquidReal.decode(ModelsReal.load(name))
+	local plan = LiquidReal.prepare(model, tree, ModelsReal.scale(name))
+	local w, h = LiquidReal.outputSize(plan, level)
+	assert(w == size and h == size, "unexpected ALLAN output size " .. w .. "x" .. h)
+	local out = buffer.create(w * h * 4)
+	LiquidReal.render(plan, tree, out, w, { level = level })
+	return Panels.hashBuffer(out)
+end
+check(hashOf(images[8]) == allanDirect("sdf_logo_256", 0, 256), "ALLAN logo equals a direct render (banded upload)")
+check(hashOf(images[9]) == allanDirect("ui_flat_256", 0, 256), "ALLAN UI level 0 equals a direct render")
+check(hashOf(images[10]) == allanDirect("ui_flat_256", 1, 128), "ALLAN UI level 1 equals a direct render")
+check(hashOf(images[11]) == allanDirect("ui_flat_256", 2, 64), "ALLAN UI level 2 equals a direct render")
+check(hashOf(images[12]) == allanDirect("marble_64", 0, 64), "ALLAN marble equals a direct render")
+
 local tile = buffer.create(384 * 384 * 4)
 for i = 0, 8 do
 	Panels.renderMandelbrotTile(tile, 384, i % 3, i // 3, 3)
-	check(hashOf(images[8 + i]) == Panels.hashBuffer(tile), "mandelbrot tile " .. (i + 1) .. " equals a direct render")
+	check(hashOf(images[13 + i]) == Panels.hashBuffer(tile), "mandelbrot tile " .. (i + 1) .. " equals a direct render")
 end
 
 -- the plasma image must have been rewritten every frame
@@ -101,7 +118,7 @@ for _, inst in allInstances do
 end
 print(string.format("ImageLabels %d, Decals %d", labels, decals))
 check(decals == 6, "the cube wears 6 decals")
-check(labels == 3 + 1 + 1 + 1 + 9 + 4, "expected ImageLabel count " .. labels)
+check(labels == 3 + 1 + 1 + 1 + 9 + 4 + 1 + 4, "expected ImageLabel count " .. labels)
 
 print(failures == 0 and "ALL OK" or (failures .. " FAILURES"))
 if failures > 0 then

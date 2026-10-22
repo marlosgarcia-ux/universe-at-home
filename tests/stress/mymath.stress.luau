@@ -370,14 +370,30 @@ H.suite("allocate: budget respected, valid sizes, close to the exhaustive optimu
 		recurse(1, 0)
 		local mine = benefit(demands, if useWeights then weights else nil, got)
 		H.check(mine <= best + 1e-6, "greedy beat the exhaustive optimum: %.3f vs %.3f", mine, best)
+		-- Guarantee for concave benefits (the gain per added texel of a surface never rises as
+		-- its size grows): greedy by gain per texel is within the gain of ONE size step of the
+		-- optimum, because the fractional relaxation it solves exactly is an upper bound and
+		-- differs from the greedy result by at most the first step that did not fit.
+		local maxStepGain = 0
+		for i = 1, n do
+			local w = if useWeights then weights[i] else 1
+			local prev = 0
+			for l = 1, #sizes do
+				local cur = min(sizes[l] * sizes[l], demands[i])
+				maxStepGain = max(maxStepGain, w * (cur - prev))
+				prev = cur
+			end
+		end
+		H.check(mine >= best - maxStepGain - 1e-6, "greedy %.2f is more than one step gain (%.2f) below the optimum %.2f", mine, maxStepGain, best)
 		if best > 0 then
 			worstRatio = min(worstRatio, mine / best)
 		end
 		H.digest(used)
 		H.tick()
 	end
-	print(string.format("      allocate worst greedy / optimal benefit ratio over the sample: %.4f", worstRatio))
-	H.check(worstRatio > 0.6, "greedy fell to %.3f of the optimum", worstRatio)
+	-- a measurement, not a pass criterion: with 4x steps in texel count the ratio can be low
+	print(string.format("      FINDING allocate: worst greedy / optimal benefit ratio over %d cases: %.3f", H.n(400), worstRatio))
+	H.check(worstRatio > 0.3, "greedy fell to %.3f of the optimum", worstRatio)
 end)
 
 H.runAll("mymath.stress")

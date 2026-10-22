@@ -8,6 +8,8 @@
 local realRequire = require
 local MyMathReal = realRequire("../src/MyMath")
 local PanelsFactory = realRequire("../gallery/shared/Panels")
+local LiquidReal = realRequire("../src/Liquid")
+local ModelsReal = realRequire("../gallery/shared/AlnModels")
 
 local warnings = {}
 function warn(...)
@@ -141,8 +143,12 @@ local services = {
 		},
 	},
 	ReplicatedStorage = (function()
-		local universe = { MyMath = { __module = MyMathReal } }
-		local gallery = { Panels = { __module = PanelsFactory } }
+		local universe = {
+			MyMath = { __module = MyMathReal },
+			Pixels = { __module = realRequire("../src/Pixels") },
+			Liquid = { __module = LiquidReal },
+		}
+		local gallery = { Panels = { __module = PanelsFactory }, AlnModels = { __module = ModelsReal } }
 		function universe:WaitForChild(n)
 			return assert(self[n], "Universe has no child " .. tostring(n))
 		end

@@ -30,6 +30,19 @@ ReplicatedStorage:WaitForChild("Gallery"):WaitForChild("Panels")
 local MyMath: any = require(ReplicatedStorage.Universe.MyMath)
 local Panels: any = (require(ReplicatedStorage.Gallery.Panels) :: any)(MyMath)
 
+-- ALLAN (the liquid network renderer) and its embedded models are optional for the gallery:
+-- if they fail to load, only the two ALLAN cards say so.
+local allanOk, allanErr = (pcall :: any)(function()
+	ReplicatedStorage:WaitForChild("Universe"):WaitForChild("Liquid")
+	ReplicatedStorage:WaitForChild("Gallery"):WaitForChild("AlnModels")
+	return {
+		Liquid = require(ReplicatedStorage.Universe.Liquid),
+		Models = require(ReplicatedStorage.Gallery.AlnModels),
+	}
+end)
+local Liquid: any = if allanOk then allanErr.Liquid else nil
+local AlnModels: any = if allanOk then allanErr.Models else nil
+
 local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui") :: PlayerGui
 
 ----------------------------------------------------------------------------------------
@@ -321,15 +334,17 @@ end
 -- Cards
 ----------------------------------------------------------------------------------------
 
-local sceneCard = makeCard(1, "Vector badge  512 x 512", "Exact-area anti-aliased shapes. Tiles that no edge touches are copy-filled; only edge tiles run per-pixel math.")
-local plasmaCard = makeCard(2, "Live plasma  192 x 192", "Rewritten every frame with WritePixelsBuffer: the compute and upload time below is measured here, live.")
-local marbleCard = makeCard(3, "Procedural marble  256 x 256", "Deterministic fractal noise: every client computes the same bytes. Fills in as the scheduler allows.")
-local mandelCard = makeCard(4, "Beyond 1024:  1152 x 1152 canvas", "Nine 384 x 384 tiles, each its own EditableImage. No single image may exceed 1024, the canvas does.")
-local hardCard = makeCard(5, "LOD: hard switch", "Zooms in and out. At the midpoint it swaps the 64 px level for the 512 px level: watch the sharpness jump.")
-local fadeCard = makeCard(6, "LOD: two-phase fade", "Same two images, same zoom. The fine level fades in over the coarse one, then the coarse one fades out beneath it.")
-local greenCard = makeCard(7, "Green screen  256 x 256", "A portrait with 1 px hair strands and a glass bubble, plus sensor noise.")
-local matteCard = makeCard(8, "Matte (alpha)  256 x 256", "Soft chroma key. The glass bubble comes out grey: partly transparent, not cut out.")
-local cutCard = makeCard(9, "Cut-out on a new backdrop", "Foreground colour recovered by removing the green fringe, then composited over the sunset.")
+local allanCard = makeCard(1, "ALLAN: a liquid network draws this", "A 15.9 KB model, not pixels: 16.5x smaller than raw RGBA. Against the original: 43.0 dB, worst error 12 of 255 (measured by the trainer). Decoded here, in Luau.")
+local levelsCard = makeCard(2, "ALLAN: one model, any level", "Top: one 44.8 KB model at levels 0, 1, 2, no downsampling pass. Bottom right: a 3 KB model stored at 32 x 32, rendered at 64 x 64.")
+local sceneCard = makeCard(3, "Vector badge  512 x 512", "Exact-area anti-aliased shapes. Tiles that no edge touches are copy-filled; only edge tiles run per-pixel math.")
+local plasmaCard = makeCard(4, "Live plasma  192 x 192", "Rewritten every frame with WritePixelsBuffer: the compute and upload time below is measured here, live.")
+local marbleCard = makeCard(5, "Procedural marble  256 x 256", "Deterministic fractal noise: every client computes the same bytes. Fills in as the scheduler allows.")
+local mandelCard = makeCard(6, "Beyond 1024:  1152 x 1152 canvas", "Nine 384 x 384 tiles, each its own EditableImage. No single image may exceed 1024, the canvas does.")
+local hardCard = makeCard(7, "LOD: hard switch", "Zooms in and out. At the midpoint it swaps the 64 px level for the 512 px level: watch the sharpness jump.")
+local fadeCard = makeCard(8, "LOD: two-phase fade", "Same two images, same zoom. The fine level fades in over the coarse one, then the coarse one fades out beneath it.")
+local greenCard = makeCard(9, "Green screen  256 x 256", "A portrait with 1 px hair strands and a glass bubble, plus sensor noise.")
+local matteCard = makeCard(10, "Matte (alpha)  256 x 256", "Soft chroma key. The glass bubble comes out grey: partly transparent, not cut out.")
+local cutCard = makeCard(11, "Cut-out on a new backdrop", "Foreground colour recovered by removing the green fringe, then composited over the sunset.")
 
 ----------------------------------------------------------------------------------------
 -- Panel jobs
@@ -427,6 +442,86 @@ spawnJob("green screen", function(job)
 	matteCard.info.Text = took
 	cutCard.info.Text = took
 	wear(Enum.NormalId.Top, cut)
+end)
+
+-- ALLAN: decode a model, render it in bands so the scheduler can spread the work over frames
+local function allanFail(message: string)
+	allanCard.info.Text = message
+	levelsCard.info.Text = message
+	reportError("ALLAN", message)
+end
+
+spawnJob("ALLAN", function(job)
+	if not Liquid or not AlnModels then
+		allanFail("ALLAN module did not load: " .. tostring(allanErr))
+		return
+	end
+	-- renders one level of a model into an EditableImage, 32 output rows at a time
+	local function render(plan: any, tree: any, level: number, img: EditableImage, w: number, h: number): any
+		local out = buffer.create(w * h * 4)
+		local stats = Liquid.newStats()
+		for y0 = 0, h - 1, 32 do
+			local rows = math.min(32, h - y0)
+			Liquid.render(plan, tree, out, w, { level = level, x = 0, y = y0, w = w, h = rows, dy = y0, stats = stats })
+			uploadRows(img, out, w, y0, y0 + rows)
+			checkpoint()
+		end
+		return stats
+	end
+	local function load(name: string): (any, any, any)
+		local model, tree = Liquid.decode(AlnModels.load(name))
+		return model, tree, Liquid.prepare(model, tree, AlnModels.scale(name))
+	end
+
+	-- the logo, large
+	local logoImg = createImage(256, 256, "ALLAN logo")
+	if not logoImg then
+		allanFail("could not create the image")
+		return
+	end
+	imageLabel(allanCard.body, logoImg, UDim2.fromOffset(288, 288))
+	local _, logoTree, logoPlan = load("sdf_logo_256")
+	local before = cpuMs(job)
+	local stats = render(logoPlan, logoTree, 0, logoImg, 256, 256)
+	allanCard.info.Text = string.format(
+		"%d B model vs %d B raw  |  %.0f ms CPU  |  %d events, %d rows",
+		AlnModels.bytes("sdf_logo_256"),
+		262144,
+		cpuMs(job) - before,
+		stats.segments,
+		stats.rows
+	)
+
+	-- one UI model at levels 0, 1, 2, and the marble, in a 2 x 2 grid
+	local cells = {
+		{ name = "ui_flat_256", level = 0, size = 256, x = 0, y = 0, caption = "level 0  256 px" },
+		{ name = "ui_flat_256", level = 1, size = 128, x = 144, y = 0, caption = "level 1  128 px" },
+		{ name = "ui_flat_256", level = 2, size = 64, x = 0, y = 144, caption = "level 2  64 px" },
+		{ name = "marble_64", level = 0, size = 64, x = 144, y = 144, caption = "marble  64 px" },
+	}
+	local total, done = 0, 0
+	for _, cell in cells do
+		local img = createImage(cell.size, cell.size, "ALLAN " .. cell.caption)
+		if not img then
+			levelsCard.info.Text = "out of editable memory at " .. cell.caption
+			return
+		end
+		local l = imageLabel(levelsCard.body, img, UDim2.fromOffset(144, 144), UDim2.fromOffset(cell.x, cell.y))
+		l.ZIndex = 1
+		local cap = text(levelsCard.body, cell.caption, 11, UDim2.fromOffset(cell.x + 4, cell.y + 4), UDim2.fromOffset(136, 14), true, Color3.fromRGB(255, 255, 255))
+		cap.BackgroundTransparency = 0.45
+		cap.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+		cap.AutomaticSize = Enum.AutomaticSize.X
+		cap.Size = UDim2.fromOffset(0, 14)
+		cap.ZIndex = 2
+		local _, tree, plan = load(cell.name)
+		local t0 = cpuMs(job)
+		render(plan, tree, cell.level, img, cell.size, cell.size)
+		total += cpuMs(job) - t0
+		done += 1
+		levelsCard.info.Text = string.format("%d of 4 images  |  %.0f ms CPU so far", done, total)
+	end
+	levelsCard.info.Text = string.format("4 images from 2 models (%d B + %d B)  |  %.0f ms CPU", AlnModels.bytes("ui_flat_256"), AlnModels.bytes("marble_64"), total)
 end)
 
 -- 4. nine tiles

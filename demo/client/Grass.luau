@@ -33,6 +33,14 @@ local AssetService = game:GetService("AssetService")
 local Demo = ReplicatedStorage:WaitForChild("Demo")
 local GrassGen = require(Demo:WaitForChild("GrassGen"))
 local GrassMesh = require(Demo:WaitForChild("GrassMesh"))
+
+-- Ring 1 sheet placement (GrassMesh.buildSheet): the MeshPart never moves, it sits at
+-- (0, SHEET_PART_Y, 0); vertices carry world X and Z and heights relative to SHEET_PART_Y.
+-- The bounding-box pins must cover the whole world (1024 studs) plus the sheet half-width,
+-- and the vertical range the terrain (heights 6..256) plus the shell stack on top of it.
+local SHEET_PART_Y = 128
+local SHEET_Y_RANGE = 150
+local SHEET_EXTENT = 640
 local Rings = require(Demo:WaitForChild("Rings"))
 local WorkerPool = require(Demo:WaitForChild("WorkerPool"))
 local Status = require(Demo:WaitForChild("Status"))
@@ -252,7 +260,7 @@ local function sendWind(st: State)
 		local g = st.cfg
 		for k, p in st.shellParts do
 			table.insert(parts, p)
-			table.insert(base, CFrame.new(center))
+			table.insert(base, CFrame.new(0, SHEET_PART_Y, 0))
 			table.insert(offsets, Vector3.new(0, 0.14 + (k - 1) / math.max(1, K - 1) * g.shellHeight, 0))
 			table.insert(kind, k)
 		end
@@ -330,11 +338,11 @@ local function requestSheet(st: State, p: Vector3)
 		if not ok or type(res) ~= "table" or not built then
 			return
 		end
-		GrassMesh.setSheetHeights(built, sheet, res.heights)
+		GrassMesh.setSheetHeights(built, sheet, res.heights, res.cx, res.cz)
 		st.sheetCenter = Vector3.new(res.cx, res.baseY, res.cz)
 		st.windDirty = true
 		for _, part in st.shellParts do
-			part.CFrame = CFrame.new(st.sheetCenter :: Vector3)
+			part.CFrame = CFrame.new(0, SHEET_PART_Y, 0)
 		end
 	end
 	if pool then
@@ -579,7 +587,7 @@ local function buildShells(st: State, reg: any): (boolean, string)
 	local K = g.shellCount
 	local sheet = GrassGen.sheet(g.ring0, g.ring1, g.shellRepeat, g.fadeWidth, g.fadeWidth + 4)
 	st.sheet = sheet
-	local built, why = GrassMesh.buildSheet(AssetService, sheet :: any, 64)
+	local built, why = GrassMesh.buildSheet(AssetService, sheet :: any, SHEET_EXTENT, SHEET_Y_RANGE, SHEET_PART_Y)
 	if not built then
 		return false, tostring(why)
 	end

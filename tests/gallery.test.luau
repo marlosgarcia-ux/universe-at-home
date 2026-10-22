@@ -247,4 +247,46 @@ do
 	end)
 end
 
+-- 8. Embedded ALLAN models: exact decode, banded render equals full render, identical hashes -----
+do
+	local Liquid = require("../src/Liquid")
+	local Models = require("../gallery/shared/AlnModels")
+	local expectBytes = { sdf_logo_256 = 15880, ui_flat_256 = 44773, marble_64 = 2968 }
+	local seed = 99
+	local function nextInt(n: number): number
+		seed = MyMath.hash32(seed + 0x9E3779B9)
+		return seed % n
+	end
+	local digest = 0
+	for _, name in Models.names do
+		local blob = Models.load(name)
+		assert(buffer.len(blob) == expectBytes[name] and Models.bytes(name) == expectBytes[name], name .. ": decoded size")
+		assert(buffer.readu8(blob, 0) == 0x41 and buffer.readu8(blob, 1) == 0x4C and buffer.readu8(blob, 2) == 0x4E, name .. ": ALN magic")
+		local model, tree = Liquid.decode(blob)
+		local plan = Liquid.prepare(model, tree, Models.scale(name))
+		for level = 0, 2 do
+			local w, h = Liquid.outputSize(plan, level)
+			if w < 8 then
+				continue
+			end
+			local full = buffer.create(w * h * 4)
+			Liquid.render(plan, tree, full, w, { level = level })
+			local fullHash = Panels.hashBuffer(full)
+			-- the same image drawn in bands of random heights, as the gallery does
+			for _ = 1, 4 do
+				local banded = buffer.create(w * h * 4)
+				local y0 = 0
+				while y0 < h do
+					local rows = math.min(1 + nextInt(40), h - y0)
+					Liquid.render(plan, tree, banded, w, { level = level, x = 0, y = y0, w = w, h = rows, dy = y0 })
+					y0 += rows
+				end
+				assert(Panels.hashBuffer(banded) == fullHash, string.format("%s level %d: banded render differs from the full render", name, level))
+			end
+			digest = MyMath.hash32(bit32.bxor(digest, fullHash))
+		end
+	end
+	assert(digest == 3985889576, "ALLAN render digest " .. digest)
+end
+
 print("gallery tests passed")
