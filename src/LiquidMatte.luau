@@ -28,36 +28,49 @@
 --    of their Dq and of |Dq step| between consecutive samples.
 --
 -- 3. PARAMETERS (params, all in Dq units, each overridable):
---      t0  = max(16, ceil(5 noiseD / 4) + 8)    background ceiling
---      tau = max(24, noiseStep + 8, 3 t0 / 2)   edge step: a neighbour step >= tau is hard
+--      t0  = max(16, floor(3 noiseD / 4) + 8)   background ceiling (refinement removes the
+--                                               outliers this lets through)
+--      tau = max(24, noiseStep + 8, t0)         edge step: a neighbour step >= tau is hard
 --      t1  = max(4 t0, t0 + 64)                 ratio floor (mode "ratio"), ramp top ("ramp")
---      radius 2, kMax 3, clip 3.
+--      radius 2, kMax 2, clip 3, headroom m = 64 (alpha units).
 --
--- 4. RAW MATTE u (bytes). Mode "ratio" (default), with W(p) the (2 radius + 1)^2 window:
---      Dq(p) <= t0                          -> 0                (background)
---      no q in W(p) with Dq(q) <= t0        -> 255              (interior)
---      otherwise (edge band)                -> floor(255 * (Dq / F) * min(1, (Dq - t0) / t0) + 0.5)
---                                              F = max(t1, max of Dq over W(p))
---    For an anti-aliased pixel C = c F + (1 - c) K the metric is a norm, so Dq(C) = c Dq(F)
---    and the ratio recovers the coverage c whatever the foreground colour (local unmixing).
---    Mode "ramp": u = clamp(floor(255 (Dq - t0) / (t1 - t0) + 0.5), 0, 255).
---    Then clip: u <= clip -> 0, u >= 255 - clip -> 255.
+-- 4. EXTENDED MATTE e, stored as e + 256 in a u16 (stored values 0..2047). It is not
+--    clamped to 0..255: smoothing happens before the one final clamp, so noise averages out
+--    instead of being biased by the clamp, and confident plateaus sit beyond the visible
+--    range by a headroom m (default 64) so smoothing tails are absorbed by that clamp.
+--    Mode "ratio" (default), with W(p) the (2 radius + 1)^2 window clipped to the image:
+--      Dq(p) <= t0                          -> -m               (background plateau)
+--      no q in W(p) with Dq(q) <= t0        -> 255 + m          (interior plateau)
+--      otherwise (edge band), with t = (Dq / F) min(1, (Dq - t0) / t0):
+--                                              255 + m if t >= 1, else floor(255 t + 0.5)
+--         M = max of Dq over W(p); F = max(t1, mean of the Dq(q), q in W(p), Dq(q) >= M - noiseD)
+--    For an anti-aliased pixel C = c Fg + (1 - c) K the metric is a norm, so Dq(C) = c Dq(Fg)
+--    up to rounding, and the ratio recovers the coverage c whatever the foreground colour
+--    (local unmixing). On clean images noiseD = 0 and F = M exactly; under noise F is the
+--    mean of the window's samples within one noise radius of M, so noisy foreground pixels
+--    average 255 instead of sitting below it (the maximum of noisy samples is biased high).
+--    Speck rule: an edge-band pixel with e <= speck (default 64) whose four neighbours all
+--    have Dq <= t0 (or lie outside the image) is set to -m: a lone pixel barely above the
+--    background ceiling is noise, and dropping it before smoothing saves its transients.
+--    Mode "ramp": e = -m if Dq <= t0, 255 + m if Dq >= t1, else floor(255 (Dq - t0) / (t1 - t0) + 0.5).
 --
--- 5. FLOOD (optional). Passable pixels have u < 255. Passable pixels not 4-connected to the
---    border through passable pixels are protected: u := 255, and despill skips them.
+-- 5. FLOOD (optional). Passable pixels have e < 255. Passable pixels not 4-connected to the
+--    border through passable pixels are protected: e := 255 + m, and despill skips them.
 --
 -- 6. LIQUID REFINEMENT (refine). Gain of a neighbour pair with step s = |Dq(p) - Dq(q)|:
 --      g(s) = 1 if s >= tau, else 2^-k, k = ceil(kMax (tau - s) / tau)   (exact powers of 2)
---    One pass over a line with input v_x (bytes) and pair steps s_x between x and the pixel
---    before it in the pass direction:
+--    One pass over a line with inputs v_x and pair steps s_x between x and the pixel before
+--    it in the pass direction:
 --      h_0 = v_0;   h_x = v_x if s_x >= tau, else h_{x-1} + (v_x - h_{x-1}) * g(s_x),
 --      then if |v_x - h_x| < 1/64: h_x = v_x                            (snap)
---    Horizontal stage: passes left to right (hL) and right to left (hR) on u,
---      H = clip(floor((hL + hR) * 0.5 + 0.5)).
+--    Horizontal stage: passes left to right (hL) and right to left (hR) on e,
+--      H = floor((hL + hR) * 0.5 + 0.5)                     (on stored values, unclamped)
 --    Vertical stage: passes top to bottom (hU) and bottom to top (hD) on H,
---      A = clip(floor((hU + hD) * 0.5 + 0.5)).
+--      z = floor((hU + hD) * 0.5 + 0.5) - 256,  A = 0 if z <= clip, 255 if z >= 255 - clip,
+--      else z. (The step is translation-equivariant, so the offset only fixes the storage.)
 --    The event-driven path skips pixels whose state already equals their input (the step is
---    then the identity), four bytes at a time, so its cost follows the transients only.
+--    then the identity), several pixels per compare, so its cost follows the transients.
+--    Without refinement A is the same clamp applied to e.
 --
 -- 7. COMPOSE. a = A (times the source alpha, rounded, if the source is not opaque).
 --      a = 255: the source pixel; a = 0: transparent, colour from step 8;
@@ -107,6 +120,8 @@ export type Options = {
 	kMax: number?,
 	radius: number?,
 	clip: number?,
+	headroom: number?, -- plateau headroom m in alpha units (default 64)
+	speck: number?, -- isolated band pixels with e <= speck join the background (default 64, -1 off)
 	mode: string?, -- "ratio" (default) or "ramp"
 	flood: boolean?, -- protect key-coloured regions not connected to the border
 	refine: boolean?, -- liquid refinement (default true)
@@ -123,6 +138,8 @@ export type Params = {
 	kMax: number,
 	radius: number,
 	clip: number,
+	headroom: number,
+	speck: number,
 	mode: string,
 	flood: boolean,
 	refine: boolean,
@@ -138,6 +155,14 @@ export type Field = {
 	rowRun: { number }, -- [y + 1] = first run index of row y; [h + 1] = runs + 1
 	opaque: boolean, -- every source alpha is 255
 	distinct: number, -- pixels whose colour differed from the previous pixel (Dq computed)
+}
+
+-- Per-row sorted, disjoint closed intervals [a, b] (flat, row by row). For an extended matte
+-- they are its literal pixels: the row is constant on each gap between them.
+export type Intervals = {
+	a: { number },
+	b: { number },
+	first: { number }, -- [y + 1] = index of row y's first interval; [h + 1] = count + 1
 }
 
 export type Info = {
@@ -314,13 +339,13 @@ end
 
 function LiquidMatte.params(key: Key, opts: Options?): Params
 	local o: Options = opts or {}
-	local t0 = o.t0 or math.max(16, (5 * key.noiseD + 3) // 4 + 8)
-	local tau = o.tau or math.max(24, key.noiseStep + 8, (3 * t0) // 2)
+	local t0 = o.t0 or math.max(16, (3 * key.noiseD) // 4 + 8)
+	local tau = o.tau or math.max(24, key.noiseStep + 8, t0)
 	local t1 = o.t1 or math.max(4 * t0, t0 + 64)
 	local mode = o.mode or "ratio"
 	assert(mode == "ratio" or mode == "ramp", "mode must be ratio or ramp")
 	assert(t1 > t0 and tau >= 1, "need t1 > t0 and tau >= 1")
-	local kMax = o.kMax or 3
+	local kMax = o.kMax or 2
 	assert(kMax >= 0 and kMax <= 30, "kMax in 0..30")
 	return {
 		key = key,
@@ -330,6 +355,8 @@ function LiquidMatte.params(key: Key, opts: Options?): Params
 		kMax = kMax,
 		radius = o.radius or 2,
 		clip = o.clip or 3,
+		headroom = o.headroom or 64,
+		speck = o.speck or 64,
 		mode = mode,
 		flood = o.flood == true,
 		refine = o.refine ~= false,
@@ -359,10 +386,11 @@ function LiquidMatte.distanceField(img: buffer, w: number, h: number, key: Key, 
 		local inRun = false
 		local prev = -1
 		local d = 0
-		local o = y * w * 4
-		local o2 = y * w * 2
-		for x = 0, w - 1 do
-			local p = readu32(img, o)
+		local rowPx = y * w * 4
+		local rowDq = y * w * 2
+		local x = 0
+		while x < w do
+			local p = readu32(img, rowPx + x * 4)
 			if p ~= prev then
 				prev = p
 				distinct += 1
@@ -377,7 +405,20 @@ function LiquidMatte.distanceField(img: buffer, w: number, h: number, key: Key, 
 				local dcr = 128 * dr - 107 * dg - 21 * db
 				d = floor(sqrt(4 * (dcb * dcb + dcr * dcr) + wy * dy * dy) * 0.015625)
 			end
-			writeu16(dq, o2, d)
+			-- the run of pixels equal to p
+			local x2 = x + 1
+			while x2 < w and readu32(img, rowPx + x2 * 4) == p do
+				x2 += 1
+			end
+			local len = x2 - x
+			if len == 1 then
+				writeu16(dq, rowDq + x * 2, d)
+			else
+				fillSpan(dq, rowDq + x * 2, len // 2, d * 65537)
+				if len % 2 == 1 then
+					writeu16(dq, rowDq + (x2 - 1) * 2, d)
+				end
+			end
 			if d <= t0 then
 				if not inRun then
 					nRuns += 1
@@ -388,8 +429,7 @@ function LiquidMatte.distanceField(img: buffer, w: number, h: number, key: Key, 
 				runB[nRuns] = x - 1
 				inRun = false
 			end
-			o += 4
-			o2 += 2
+			x = x2
 		end
 		if inRun then
 			runB[nRuns] = w - 1
@@ -400,24 +440,30 @@ function LiquidMatte.distanceField(img: buffer, w: number, h: number, key: Key, 
 end
 
 ----------------------------------------------------------------------------------------
--- 5. raw matte
+-- 5. raw (extended) matte
 ----------------------------------------------------------------------------------------
 
-local function clipByte(v: number, clip: number): number
-	if v <= clip then
+local OFF = 256 -- stored = e + OFF
+LiquidMatte.OFFSET = OFF
+
+-- Final alpha byte of a stored extended value (header rule 6, last line).
+local function toByte(s: number, clip: number): number
+	local z = s - OFF
+	if z <= clip then
 		return 0
-	elseif v >= 255 - clip then
+	elseif z >= 255 - clip then
 		return 255
 	end
-	return v
+	return z
 end
+LiquidMatte.toByte = toByte
 
--- Ratio value of one edge-band pixel (header rule 4), before clipping.
-local function ratioValue(dq: buffer, w: number, h: number, x: number, y: number, radius: number, t0: number, t1: number): number
+-- Extended value of one edge-band pixel (header rule 4).
+local function ratioValue(dq: buffer, w: number, h: number, x: number, y: number, radius: number, t0: number, t1: number, delta: number, plateau: number): number
 	local d = buffer.readu16(dq, (y * w + x) * 2)
 	local x0, x1 = math.max(0, x - radius), math.min(w - 1, x + radius)
 	local y0, y1 = math.max(0, y - radius), math.min(h - 1, y + radius)
-	local mx = t1
+	local mx = 0
 	for yy = y0, y1 do
 		local base = yy * w
 		for xx = x0, x1 do
@@ -427,17 +473,36 @@ local function ratioValue(dq: buffer, w: number, h: number, x: number, y: number
 			end
 		end
 	end
+	local sum, cnt = 0, 0
+	local cut = mx - delta
+	for yy = y0, y1 do
+		local base = yy * w
+		for xx = x0, x1 do
+			local q = buffer.readu16(dq, (base + xx) * 2)
+			if q >= cut then
+				sum += q
+				cnt += 1
+			end
+		end
+	end
+	local F = sum / cnt
+	if F < t1 then
+		F = t1
+	end
 	local ramp = (d - t0) / t0
 	if ramp > 1 then
 		ramp = 1
 	end
-	return floor(255 * (d / mx) * ramp + 0.5)
+	local t = (d / F) * ramp
+	if t >= 1 then
+		return plateau -- fully covered: joins the interior plateau
+	end
+	return floor(255 * t + 0.5) + OFF
 end
 
--- Merges sorted, possibly overlapping closed intervals (flat pairs) into `out`.
+-- Merges closed intervals (flat pairs, any order, may overlap) into sorted disjoint ones.
 local function mergeIntervals(src: { number }, n: number, out: { number }): number
-	-- insertion sort by start (lists are short: a few runs per row)
-	for i = 3, n * 2 - 1, 2 do
+	for i = 3, n * 2 - 1, 2 do -- insertion sort by start: a few runs per row
 		local a, b = src[i], src[i + 1]
 		local j = i - 2
 		while j >= 1 and src[j] > a do
@@ -462,72 +527,178 @@ local function mergeIntervals(src: { number }, n: number, out: { number }): numb
 	return m
 end
 
--- Raw matte u (bytes) from the distance field; returns u and the edge-band pixel count.
-function LiquidMatte.rawMatte(field: Field, w: number, h: number, P: Params, uBuf: buffer?): (buffer, number)
-	local u = uBuf or buffer.create(w * h)
+-- Extended matte e (u16 per pixel, header rule 4) from the distance field. Returns e, the
+-- number of edge-band pixels (the only ones that read a window) and the literal intervals:
+-- every value change of a row lies inside or next to one of them.
+function LiquidMatte.rawMatte(field: Field, w: number, h: number, P: Params, eBuf: buffer?): (buffer, number, Intervals)
+	local e = eBuf or buffer.create(w * h * 2 + 8)
 	local dq = field.dq
-	local t0, t1, clip = P.t0, P.t1, P.clip
+	local t0, t1 = P.t0, P.t1
+	local bgS, fgS = OFF - P.headroom, OFF + 255 + P.headroom
 	local band = 0
+	local La: { number } = {}
+	local Lb: { number } = {}
+	local Lfirst: { number } = table.create(h + 1, 0)
+	local nL = 0
 	if P.mode == "ramp" then
 		local span = t1 - t0
-		for i = 0, w * h - 1 do
-			local d = buffer.readu16(dq, i * 2)
-			local v
-			if d <= t0 then
-				v = 0
-			elseif d >= t1 then
-				v = 255
-			else
-				v = clipByte(floor(255 * (d - t0) / span + 0.5), clip)
+		for y = 0, h - 1 do
+			Lfirst[y + 1] = nL + 1
+			local prevLit = false
+			for x = 0, w - 1 do
+				local i = y * w + x
+				local d = buffer.readu16(dq, i * 2)
+				local v = bgS
+				local lit = false
+				if d >= t1 then
+					v = fgS
+				elseif d > t0 then
+					v = floor(255 * (d - t0) / span + 0.5) + OFF
+					lit = true
+				end
+				-- a plateau change between neighbours is marked literal too
+				if not lit and x > 0 and buffer.readu16(e, (i - 1) * 2) ~= v then
+					lit = true
+				end
+				if lit then
+					if prevLit then
+						Lb[nL] = x
+					else
+						nL += 1
+						La[nL] = x
+						Lb[nL] = x
+					end
+				end
+				prevLit = lit
+				buffer.writeu16(e, i * 2, v)
 			end
-			buffer.writeu8(u, i, v)
 		end
-		return u, 0
+		Lfirst[h + 1] = nL + 1
+		return e, 0, { a = La, b = Lb, first = Lfirst }
 	end
 	local r = P.radius
+	local delta = P.key.noiseD
+	local speck = P.speck + OFF
 	local runA, runB, rowRun = field.runA, field.runB, field.rowRun
-	local scratch: { number } = {}
+	local readu16 = buffer.readu16
+	local sub: { number } = {}
 	local merged: { number } = {}
+	local fgWord, bgWord = fgS * 65537, bgS * 65537
 	for y = 0, h - 1 do
 		local base = y * w
-		buffer.fill(u, base, 255, w)
-		-- background runs of this row -> 0
-		for k = rowRun[y + 1], rowRun[y + 2] - 1 do
-			buffer.fill(u, base + runA[k], 0, runB[k] - runA[k] + 1)
+		Lfirst[y + 1] = nL + 1
+		-- interior plateau everywhere, then background runs, then the edge band
+		fillSpan(e, base * 2, w // 2, fgWord)
+		if w % 2 == 1 then
+			buffer.writeu16(e, (base + w - 1) * 2, fgS)
 		end
-		-- union of the background runs of rows y - r .. y + r, dilated by r
-		local n = 0
-		for yy = math.max(0, y - r), math.min(h - 1, y + r) do
-			for k = rowRun[yy + 1], rowRun[yy + 2] - 1 do
-				n += 1
-				scratch[n * 2 - 1] = math.max(0, runA[k] - r)
-				scratch[n * 2] = math.min(w - 1, runB[k] + r)
+		local k0, k1 = rowRun[y + 1], rowRun[y + 2] - 1
+		for k = k0, k1 do
+			local a, len = runA[k], runB[k] - runA[k] + 1
+			if len >= 2 then
+				fillSpan(e, (base + a) * 2, len // 2, bgWord)
+			end
+			if len % 2 == 1 then
+				buffer.writeu16(e, (base + runB[k]) * 2, bgS)
 			end
 		end
-		if n > 0 then
-			local m = mergeIntervals(scratch, n, merged)
-			for j = 1, m do
-				for x = merged[j * 2 - 1], merged[j * 2] do
-					if buffer.readu16(dq, (base + x) * 2) > t0 then
-						band += 1
-						buffer.writeu8(u, base + x, clipByte(ratioValue(dq, w, h, x, y, r, t0, t1), clip))
+		-- every gap between background runs is non-background; its band part lies within
+		-- r of a background run of rows y - r .. y + r (binary search per row)
+		local ya, yb = math.max(0, y - r), math.min(h - 1, y + r)
+		local gStart = 0
+		for k = k0, k1 + 1 do
+			local gEnd = if k <= k1 then runA[k] - 1 else w - 1
+			if gStart <= gEnd then
+				local n = 0
+				local lo, hi = gStart - r, gEnd + r
+				for yy = ya, yb do
+					local a1 = rowRun[yy + 2] - 1
+					local L, H = rowRun[yy + 1], a1
+					while L <= H do
+						local mid = (L + H) // 2
+						if runB[mid] < lo then
+							L = mid + 1
+						else
+							H = mid - 1
+						end
+					end
+					while L <= a1 and runA[L] <= hi do
+						n += 1
+						local s0 = runA[L] - r
+						local s1 = runB[L] + r
+						sub[n * 2 - 1] = if s0 < gStart then gStart else s0
+						sub[n * 2] = if s1 > gEnd then gEnd else s1
+						L += 1
+					end
+				end
+				if n > 0 then
+					local m = mergeIntervals(sub, n, merged)
+					for j = 1, m do
+						nL += 1
+						La[nL] = merged[j * 2 - 1]
+						Lb[nL] = merged[j * 2]
+						for x = merged[j * 2 - 1], merged[j * 2] do
+							band += 1
+							local v = ratioValue(dq, w, h, x, y, r, t0, t1, delta, fgS)
+							if
+								v <= speck
+								and (x == 0 or readu16(dq, (base + x - 1) * 2) <= t0)
+								and (x == w - 1 or readu16(dq, (base + x + 1) * 2) <= t0)
+								and (y == 0 or readu16(dq, (base + x - w) * 2) <= t0)
+								and (y == h - 1 or readu16(dq, (base + x + w) * 2) <= t0)
+							then
+								v = bgS -- an isolated weak pixel is a speck of noise
+							end
+							buffer.writeu16(e, (base + x) * 2, v)
+						end
 					end
 				end
 			end
+			if k <= k1 then
+				gStart = runB[k] + 1
+			end
 		end
 	end
-	return u, band
+	Lfirst[h + 1] = nL + 1
+	return e, band, { a = La, b = Lb, first = Lfirst }
+end
+
+-- Alpha bytes from an extended plane (header rule 6, last line), runs of 0 and 255 four at
+-- a time.
+function LiquidMatte.toAlpha(e: buffer, n: number, clip: number, out: buffer?): buffer
+	local A = out or buffer.create(n)
+	local readu32, readu16 = buffer.readu32, buffer.readu16
+	local i = 0
+	while i < n do
+		if i + 3 < n then
+			local w1 = readu32(e, i * 2)
+			if w1 == readu32(e, i * 2 + 4) and w1 % 65537 == 0 then -- four equal values
+				local j = i + 4
+				while j + 1 < n and readu32(e, j * 2) == w1 do
+					j += 2
+				end
+				buffer.fill(A, i, toByte(w1 // 65537, clip), j - i)
+				i = j
+				continue
+			end
+		end
+		buffer.writeu8(A, i, toByte(readu16(e, i * 2), clip))
+		i += 1
+	end
+	return A
 end
 
 ----------------------------------------------------------------------------------------
 -- 6. flood from the border (4-connected, run based)
 ----------------------------------------------------------------------------------------
 
--- Sets u := 255 on passable pixels (u < 255) that the border cannot reach through
+-- Sets e := 255 + m on passable pixels (e < 255) that the border cannot reach through
 -- passable pixels, and marks them in the returned mask (1 = protected). Cost follows the
 -- number of passable runs, not pixels.
-function LiquidMatte.floodProtect(u: buffer, w: number, h: number): (buffer, number)
-	local readu8 = buffer.readu8
+function LiquidMatte.floodProtect(e: buffer, w: number, h: number, headroom: number): (buffer, number)
+	local T = OFF + 255 -- stored values >= T are opaque
+	local fgS = T + headroom
+	local readu16 = buffer.readu16
 	local readu32 = buffer.readu32
 	local RA: { number } = {}
 	local RB: { number } = {}
@@ -538,11 +709,15 @@ function LiquidMatte.floodProtect(u: buffer, w: number, h: number): (buffer, num
 		local base = y * w
 		local x = 0
 		while x < w do
-			-- skip opaque pixels, four at a time
-			while x + 3 < w and readu32(u, base + x) == 0xFFFFFFFF do
-				x += 4
+			while x + 1 < w do -- opaque pairs of equal values
+				local wv = readu32(e, (base + x) * 2)
+				if wv % 65537 == 0 and wv // 65537 >= T then
+					x += 2
+				else
+					break
+				end
 			end
-			while x < w and readu8(u, base + x) == 255 do
+			while x < w and readu16(e, (base + x) * 2) >= T do
 				x += 1
 			end
 			if x >= w then
@@ -550,10 +725,15 @@ function LiquidMatte.floodProtect(u: buffer, w: number, h: number): (buffer, num
 			end
 			local a = x
 			while true do
-				while x + 3 < w and readu32(u, base + x) == 0 do
-					x += 4
+				while x + 1 < w do -- passable pairs of equal values
+					local wv = readu32(e, (base + x) * 2)
+					if wv % 65537 == 0 and wv // 65537 < T then
+						x += 2
+					else
+						break
+					end
 				end
-				if x < w and readu8(u, base + x) < 255 then
+				if x < w and readu16(e, (base + x) * 2) < T then
 					x += 1
 				else
 					break
@@ -566,27 +746,21 @@ function LiquidMatte.floodProtect(u: buffer, w: number, h: number): (buffer, num
 	end
 	rowStart[h + 1] = n + 1
 	local seen = buffer.create(n + 1)
-	local stack: { number } = {}
-	local top = 0
-	local function visit(k: number)
-		if buffer.readu8(seen, k) == 0 then
-			buffer.writeu8(seen, k, 1)
-			top += 1
-			stack[top] = k
-		end
-	end
-	for y = 0, h - 1 do
-		for k = rowStart[y + 1], rowStart[y + 2] - 1 do
-			if y == 0 or y == h - 1 or RA[k] == 0 or RB[k] == w - 1 then
-				visit(k)
-			end
-		end
-	end
-	-- row of each run (runs are stored row by row)
 	local rowOf = table.create(n, 0)
 	for y = 0, h - 1 do
 		for k = rowStart[y + 1], rowStart[y + 2] - 1 do
 			rowOf[k] = y
+		end
+	end
+	local stack: { number } = {}
+	local top = 0
+	for y = 0, h - 1 do
+		for k = rowStart[y + 1], rowStart[y + 2] - 1 do
+			if y == 0 or y == h - 1 or RA[k] == 0 or RB[k] == w - 1 then
+				buffer.writeu8(seen, k, 1)
+				top += 1
+				stack[top] = k
+			end
 		end
 	end
 	while top > 0 do
@@ -598,8 +772,8 @@ function LiquidMatte.floodProtect(u: buffer, w: number, h: number): (buffer, num
 			local yy = y + dy
 			if yy >= 0 and yy < h then
 				local lo, hi = rowStart[yy + 1], rowStart[yy + 2] - 1
-				-- first run whose end >= a (binary search)
-				while lo <= hi do
+				local last = hi
+				while lo <= hi do -- first run of row yy ending at or after a
 					local mid = (lo + hi) // 2
 					if RB[mid] < a then
 						lo = mid + 1
@@ -608,9 +782,12 @@ function LiquidMatte.floodProtect(u: buffer, w: number, h: number): (buffer, num
 					end
 				end
 				local j = lo
-				local last = rowStart[yy + 2] - 1
 				while j <= last and RA[j] <= b do
-					visit(j)
+					if buffer.readu8(seen, j) == 0 then
+						buffer.writeu8(seen, j, 1)
+						top += 1
+						stack[top] = j
+					end
 					j += 1
 				end
 			end
@@ -622,8 +799,11 @@ function LiquidMatte.floodProtect(u: buffer, w: number, h: number): (buffer, num
 		for k = rowStart[y + 1], rowStart[y + 2] - 1 do
 			if buffer.readu8(seen, k) == 0 then
 				local len = RB[k] - RA[k] + 1
-				buffer.fill(u, y * w + RA[k], 255, len)
-				buffer.fill(mask, y * w + RA[k], 1, len)
+				local at = y * w + RA[k]
+				for x = 0, len - 1 do
+					buffer.writeu16(e, (at + x) * 2, fgS)
+				end
+				buffer.fill(mask, at, 1, len)
 				count += len
 			end
 		end
@@ -649,58 +829,59 @@ function LiquidMatte.gainTable(tau: number, kMax: number): { number }
 	return GT
 end
 
--- The definition, one pixel at a time (no skipping). Used by the tests as the reference.
-function LiquidMatte.refineReference(u: buffer, dq: buffer, w: number, h: number, tau: number, kMax: number, clip: number): buffer
+-- The definition, one pixel at a time with no skipping (the tests' reference). e is the
+-- extended matte (u16), the result the alpha bytes.
+function LiquidMatte.refineReference(e: buffer, dq: buffer, w: number, h: number, tau: number, kMax: number, clip: number): buffer
 	local GT = LiquidMatte.gainTable(tau, kMax)
 	local function step(hs: number, v: number, s: number): number
 		if s >= tau then
 			return v
 		end
 		hs = hs + (v - hs) * GT[s + 1]
-		local e = v - hs
-		if e < SNAP and e > -SNAP then
+		local d = v - hs
+		if d < SNAP and d > -SNAP then
 			hs = v
 		end
 		return hs
 	end
 	local n = w * h
-	local Hb = buffer.create(n)
+	local Hb = buffer.create(n * 2)
 	local hl = table.create(w, 0)
 	for y = 0, h - 1 do
 		local base = y * w
-		local hs = buffer.readu8(u, base)
+		local hs = buffer.readu16(e, base * 2)
 		hl[1] = hs
 		for x = 1, w - 1 do
 			local s = math.abs(buffer.readu16(dq, (base + x) * 2) - buffer.readu16(dq, (base + x - 1) * 2))
-			hs = step(hs, buffer.readu8(u, base + x), s)
+			hs = step(hs, buffer.readu16(e, (base + x) * 2), s)
 			hl[x + 1] = hs
 		end
-		hs = buffer.readu8(u, base + w - 1)
-		buffer.writeu8(Hb, base + w - 1, clipByte(floor((hl[w] + hs) * 0.5 + 0.5), clip))
+		hs = buffer.readu16(e, (base + w - 1) * 2)
+		buffer.writeu16(Hb, (base + w - 1) * 2, floor((hl[w] + hs) * 0.5 + 0.5))
 		for x = w - 2, 0, -1 do
 			local s = math.abs(buffer.readu16(dq, (base + x) * 2) - buffer.readu16(dq, (base + x + 1) * 2))
-			hs = step(hs, buffer.readu8(u, base + x), s)
-			buffer.writeu8(Hb, base + x, clipByte(floor((hl[x + 1] + hs) * 0.5 + 0.5), clip))
+			hs = step(hs, buffer.readu16(e, (base + x) * 2), s)
+			buffer.writeu16(Hb, (base + x) * 2, floor((hl[x + 1] + hs) * 0.5 + 0.5))
 		end
 	end
 	local A = buffer.create(n)
 	local hu = table.create(h, 0)
 	for x = 0, w - 1 do
-		local hs = buffer.readu8(Hb, x)
+		local hs = buffer.readu16(Hb, x * 2)
 		hu[1] = hs
 		for y = 1, h - 1 do
 			local i = y * w + x
 			local s = math.abs(buffer.readu16(dq, i * 2) - buffer.readu16(dq, (i - w) * 2))
-			hs = step(hs, buffer.readu8(Hb, i), s)
+			hs = step(hs, buffer.readu16(Hb, i * 2), s)
 			hu[y + 1] = hs
 		end
-		hs = buffer.readu8(Hb, (h - 1) * w + x)
-		buffer.writeu8(A, (h - 1) * w + x, clipByte(floor((hu[h] + hs) * 0.5 + 0.5), clip))
+		hs = buffer.readu16(Hb, ((h - 1) * w + x) * 2)
+		buffer.writeu8(A, (h - 1) * w + x, toByte(floor((hu[h] + hs) * 0.5 + 0.5), clip))
 		for y = h - 2, 0, -1 do
 			local i = y * w + x
 			local s = math.abs(buffer.readu16(dq, i * 2) - buffer.readu16(dq, (i + w) * 2))
-			hs = step(hs, buffer.readu8(Hb, i), s)
-			buffer.writeu8(A, i, clipByte(floor((hu[y + 1] + hs) * 0.5 + 0.5), clip))
+			hs = step(hs, buffer.readu16(Hb, i * 2), s)
+			buffer.writeu8(A, i, toByte(floor((hu[y + 1] + hs) * 0.5 + 0.5), clip))
 		end
 	end
 	return A
@@ -708,45 +889,32 @@ end
 
 local STRIP = 64
 
--- Makes a byte plane clip-closed in place (every value 0, 255 or inside (clip, 255 - clip)).
--- rawMatte output already is; refine and refineReference agree bit for bit on such inputs.
-function LiquidMatte.clipPlane(u: buffer, n: number, clip: number)
-	for i = 0, n - 1 do
-		local v = buffer.readu8(u, i)
-		if v > 0 and v <= clip then
-			buffer.writeu8(u, i, 0)
-		elseif v < 255 and v >= 255 - clip then
-			buffer.writeu8(u, i, 255)
-		end
-	end
-end
-
--- Event-driven refinement: the same bits as refineReference for a clip-closed u. Returns A
--- and the number of transient steps (states left off their input after the step).
-function LiquidMatte.refine(u: buffer, dq: buffer, w: number, h: number, tau: number, kMax: number, clip: number, out: buffer?): (buffer, number)
+-- Event-driven refinement: the same bits as refineReference. Returns the alpha bytes and
+-- the number of transient steps (states left off their input after a step).
+function LiquidMatte.refine(e: buffer, dq: buffer, w: number, h: number, tau: number, kMax: number, clip: number, out: buffer?): (buffer, number)
 	local GT = LiquidMatte.gainTable(tau, kMax)
 	local readu8, readu16, readu32 = buffer.readu8, buffer.readu16, buffer.readu32
-	local writeu8 = buffer.writeu8
+	local writeu8, writeu16 = buffer.writeu8, buffer.writeu16
 	local n = w * h
 	local transients = 0
-	local cl, ch = clip, 255 - clip
-	-- horizontal stage: Hb = clip(round((hL + hR) / 2))
-	local Hb = buffer.create(n + 4)
-	buffer.copy(Hb, 0, u, 0, n)
+	local cl, ch = clip + OFF, 255 - clip + OFF -- thresholds on stored values
+	-- horizontal stage: Hb = round((hL + hR) / 2), extended values
+	local Hb = buffer.create(n * 2 + 8)
+	buffer.copy(Hb, 0, e, 0, n * 2)
 	local rowL = table.create(w, 0)
 	local markL = buffer.create(w + 8)
 	for y = 0, h - 1 do
 		local base = y * w
 		local touched = false
-		local hs = readu8(u, base)
+		local hs = readu16(e, base * 2)
 		local x = 1
 		while x < w do
-			local v = readu8(u, base + x)
+			local v = readu16(e, (base + x) * 2)
 			if hs == v then
 				x += 1
-				local word = v * WORD1
-				while x + 3 < w and readu32(u, base + x) == word do
-					x += 4
+				local word = v * 65537
+				while x + 1 < w and readu32(e, (base + x) * 2) == word do
+					x += 2
 				end
 			else
 				local s = readu16(dq, (base + x) * 2) - readu16(dq, (base + x - 1) * 2)
@@ -757,8 +925,8 @@ function LiquidMatte.refine(u: buffer, dq: buffer, w: number, h: number, tau: nu
 					hs = v
 				else
 					hs = hs + (v - hs) * GT[s + 1]
-					local e = v - hs
-					if e < SNAP and e > -SNAP then
+					local d = v - hs
+					if d < SNAP and d > -SNAP then
 						hs = v
 					end
 				end
@@ -774,22 +942,21 @@ function LiquidMatte.refine(u: buffer, dq: buffer, w: number, h: number, tau: nu
 				x += 1
 			end
 		end
-		-- right to left, combined with the left pass
-		hs = readu8(u, base + w - 1)
+		hs = readu16(e, (base + w - 1) * 2)
 		x = w - 1
 		while x >= 0 do
-			local v = readu8(u, base + x)
+			local v = readu16(e, (base + x) * 2)
 			local ml = if touched then readu8(markL, x) else 0
 			if hs == v and ml == 0 then
 				x -= 1
-				local word = v * WORD1
+				local word = v * 65537
 				if touched then
-					while x >= 3 and readu32(u, base + x - 3) == word and readu32(markL, x - 3) == 0 do
-						x -= 4
+					while x >= 1 and readu32(e, (base + x - 1) * 2) == word and readu16(markL, x - 1) == 0 do
+						x -= 2
 					end
 				else
-					while x >= 3 and readu32(u, base + x - 3) == word do
-						x -= 4
+					while x >= 1 and readu32(e, (base + x - 1) * 2) == word do
+						x -= 2
 					end
 				end
 			else
@@ -802,8 +969,8 @@ function LiquidMatte.refine(u: buffer, dq: buffer, w: number, h: number, tau: nu
 						hs = v
 					else
 						hs = hs + (v - hs) * GT[s + 1]
-						local e = v - hs
-						if e < SNAP and e > -SNAP then
+						local d = v - hs
+						if d < SNAP and d > -SNAP then
 							hs = v
 						end
 					end
@@ -813,21 +980,14 @@ function LiquidMatte.refine(u: buffer, dq: buffer, w: number, h: number, tau: nu
 				end
 				local hlv = if ml == 1 then rowL[x + 1] else v
 				if hlv ~= v or hs ~= v then
-					local o = floor((hlv + hs) * 0.5 + 0.5)
-					if o <= cl then
-						o = 0
-					elseif o >= ch then
-						o = 255
-					end
-					writeu8(Hb, base + x, o)
+					writeu16(Hb, (base + x) * 2, floor((hlv + hs) * 0.5 + 0.5))
 				end
 				x -= 1
 			end
 		end
 	end
-	-- vertical stage in strips of STRIP columns
-	local A = out or buffer.create(n)
-	buffer.copy(A, 0, Hb, 0, n)
+	-- vertical stage in strips of STRIP columns; A starts as the alpha of Hb
+	local A = LiquidMatte.toAlpha(Hb, n, clip, out)
 	local store = buffer.create(STRIP * h * 8)
 	local markU = buffer.create(STRIP * h + 8)
 	local hU = table.create(STRIP, 0)
@@ -836,21 +996,25 @@ function LiquidMatte.refine(u: buffer, dq: buffer, w: number, h: number, tau: nu
 		local x1 = math.min(x0 + STRIP, w)
 		buffer.fill(markU, 0, 0)
 		for x = x0, x1 - 1 do
-			hU[x - x0 + 1] = readu8(Hb, x)
+			hU[x - x0 + 1] = readu16(Hb, x * 2)
 			writeu8(conv, x - x0, 1)
 		end
-		-- top to bottom
-		for y = 1, h - 1 do
+		for y = 1, h - 1 do -- top to bottom
 			local rb = y * w
 			local rp = rb - w
 			local mrow = y * STRIP
 			local x = x0
 			while x < x1 do
 				local j = x - x0
-				if x + 3 < x1 and readu32(conv, j) == WORD1 and readu32(Hb, rb + x) == readu32(Hb, rp + x) then
+				if
+					x + 3 < x1
+					and readu32(conv, j) == WORD1
+					and readu32(Hb, (rb + x) * 2) == readu32(Hb, (rp + x) * 2)
+					and readu32(Hb, (rb + x) * 2 + 4) == readu32(Hb, (rp + x) * 2 + 4)
+				then
 					x += 4
 				else
-					local v = readu8(Hb, rb + x)
+					local v = readu16(Hb, (rb + x) * 2)
 					local hs = hU[j + 1]
 					if hs ~= v then
 						local s = readu16(dq, (rb + x) * 2) - readu16(dq, (rp + x) * 2)
@@ -861,8 +1025,8 @@ function LiquidMatte.refine(u: buffer, dq: buffer, w: number, h: number, tau: nu
 							hs = v
 						else
 							hs = hs + (v - hs) * GT[s + 1]
-							local e = v - hs
-							if e < SNAP and e > -SNAP then
+							local d = v - hs
+							if d < SNAP and d > -SNAP then
 								hs = v
 							end
 						end
@@ -880,27 +1044,21 @@ function LiquidMatte.refine(u: buffer, dq: buffer, w: number, h: number, tau: nu
 				end
 			end
 		end
-		-- bottom to top, combined with the downward pass
-		do
+		do -- bottom row: the upward pass starts at rest
 			local rb = (h - 1) * w
 			local mrow = (h - 1) * STRIP
 			for x = x0, x1 - 1 do
 				local j = x - x0
-				local v = readu8(Hb, rb + x)
+				local v = readu16(Hb, (rb + x) * 2)
 				hU[j + 1] = v
 				writeu8(conv, j, 1)
 				if readu8(markU, mrow + j) == 1 then
 					local o = floor((buffer.readf64(store, (mrow + j) * 8) + v) * 0.5 + 0.5)
-					if o <= cl then
-						o = 0
-					elseif o >= ch then
-						o = 255
-					end
-					writeu8(A, rb + x, o)
+					writeu8(A, rb + x, if o <= cl then 0 elseif o >= ch then 255 else o - OFF)
 				end
 			end
 		end
-		for y = h - 2, 0, -1 do
+		for y = h - 2, 0, -1 do -- bottom to top, combined with the downward pass
 			local rb = y * w
 			local rn = rb + w
 			local mrow = y * STRIP
@@ -910,12 +1068,13 @@ function LiquidMatte.refine(u: buffer, dq: buffer, w: number, h: number, tau: nu
 				if
 					x + 3 < x1
 					and readu32(conv, j) == WORD1
-					and readu32(Hb, rb + x) == readu32(Hb, rn + x)
 					and readu32(markU, mrow + j) == 0
+					and readu32(Hb, (rb + x) * 2) == readu32(Hb, (rn + x) * 2)
+					and readu32(Hb, (rb + x) * 2 + 4) == readu32(Hb, (rn + x) * 2 + 4)
 				then
 					x += 4
 				else
-					local v = readu8(Hb, rb + x)
+					local v = readu16(Hb, (rb + x) * 2)
 					local hs = hU[j + 1]
 					if hs ~= v then
 						local s = readu16(dq, (rb + x) * 2) - readu16(dq, (rn + x) * 2)
@@ -926,8 +1085,8 @@ function LiquidMatte.refine(u: buffer, dq: buffer, w: number, h: number, tau: nu
 							hs = v
 						else
 							hs = hs + (v - hs) * GT[s + 1]
-							local e = v - hs
-							if e < SNAP and e > -SNAP then
+							local d = v - hs
+							if d < SNAP and d > -SNAP then
 								hs = v
 							end
 						end
@@ -941,17 +1100,364 @@ function LiquidMatte.refine(u: buffer, dq: buffer, w: number, h: number, tau: nu
 					if mu == 1 or hs ~= v then
 						local hu = if mu == 1 then buffer.readf64(store, (mrow + j) * 8) else v
 						local o = floor((hu + hs) * 0.5 + 0.5)
-						if o <= cl then
-							o = 0
-						elseif o >= ch then
-							o = 255
-						end
-						writeu8(A, rb + x, o)
+						writeu8(A, rb + x, if o <= cl then 0 elseif o >= ch then 255 else o - OFF)
 					end
 					x += 1
 				end
 			end
 		end
+	end
+	return A, transients
+end
+
+-- Appends [a, b] to a row-ordered interval list, merging with the previous interval when
+-- they touch. Returns the new count.
+local function pushInterval(A: { number }, B: { number }, n: number, rowFirst: number, a: number, b: number): number
+	if n >= rowFirst and a <= B[n] + 1 then
+		if b > B[n] then
+			B[n] = b
+		end
+		return n
+	end
+	n += 1
+	A[n] = a
+	B[n] = b
+	return n
+end
+
+-- Event-driven refinement on the row structure of e: `lit` lists, per row, intervals outside
+-- which the row is constant between consecutive intervals (rawMatte returns them). The same
+-- bits as refineReference; the work follows segments, changes between rows and transients,
+-- not pixels. Returns the alpha bytes and the number of transient steps.
+function LiquidMatte.refineRuns(e: buffer, dq: buffer, w: number, h: number, tau: number, kMax: number, clip: number, lit: Intervals, out: buffer?): (buffer, number)
+	local GT = LiquidMatte.gainTable(tau, kMax)
+	local readu16 = buffer.readu16
+	local writeu16 = buffer.writeu16
+	local La, Lb, Lfirst = lit.a, lit.b, lit.first
+	local n = w * h
+	local transients = 0
+	local Hb = buffer.create(n * 2 + 8)
+	buffer.copy(Hb, 0, e, 0, n * 2)
+	-- H literal intervals: the e literals plus the transient stretches of each gap
+	local HA: { number } = {}
+	local HB: { number } = {}
+	local Hfirst: { number } = table.create(h + 1, 0)
+	local nH = 0
+	local rowL = table.create(w, 0)
+	local stampL = buffer.create(w * 4) -- u32 per column: y + 1 where rowL holds this row's hL
+	local gl: { number } = {} -- per gap: number of left-pass transient pixels at its start
+	local gr: { number } = {} -- per gap: number of right-pass transient pixels at its end
+
+	local function stepH(hs: number, v: number, i: number, j: number): number
+		local s = readu16(dq, i * 2) - readu16(dq, j * 2)
+		if s < 0 then
+			s = -s
+		end
+		if s >= tau then
+			return v
+		end
+		hs = hs + (v - hs) * GT[s + 1]
+		local d = v - hs
+		if d < SNAP and d > -SNAP then
+			hs = v
+		end
+		return hs
+	end
+
+	for y = 0, h - 1 do
+		local base = y * w
+		local i0, i1 = Lfirst[y + 1], Lfirst[y + 2] - 1
+		local stamp = y + 1
+		-- left to right
+		local hs = readu16(e, base * 2)
+		local x = 1
+		local k = i0
+		local g = 0 -- gap index: gap g lies left of literal i0 + g
+		while x < w do
+			if k <= i1 and x >= La[k] then
+				for xx = x, Lb[k] do
+					local v = readu16(e, (base + xx) * 2)
+					if hs ~= v then
+						hs = stepH(hs, v, base + xx, base + xx - 1)
+						if hs ~= v then
+							rowL[xx + 1] = hs
+							buffer.writeu32(stampL, xx * 4, stamp)
+							transients += 1
+						end
+					end
+				end
+				x = Lb[k] + 1
+				k += 1
+				g += 1
+			else
+				local gb = if k <= i1 then La[k] - 1 else w - 1
+				local v = readu16(e, (base + x) * 2)
+				local xs = x
+				while x <= gb and hs ~= v do
+					hs = stepH(hs, v, base + x, base + x - 1)
+					if hs ~= v then
+						rowL[x + 1] = hs
+						buffer.writeu32(stampL, x * 4, stamp)
+						transients += 1
+					end
+					x += 1
+				end
+				-- the transient pixels are the first ones of the gap, up to the one at rest
+				gl[g + 1] = if hs == v then x - xs - 1 else x - xs
+				if gl[g + 1] < 0 then
+					gl[g + 1] = 0
+				end
+				gr[g + 1] = 0
+				x = gb + 1
+				if k > i1 then
+					break
+				end
+			end
+		end
+		-- right to left, combined with the left pass
+		hs = readu16(e, (base + w - 1) * 2)
+		x = w - 1
+		k = i1
+		g = i1 - i0 + 1 -- the last gap (right of the last literal)
+		while x >= 0 do
+			if k >= i0 and x <= Lb[k] then
+				for xx = x, La[k], -1 do
+					local v = readu16(e, (base + xx) * 2)
+					if hs ~= v then
+						hs = stepH(hs, v, base + xx, base + xx + 1)
+						if hs ~= v then
+							transients += 1
+						end
+					end
+					local hl = if buffer.readu32(stampL, xx * 4) == stamp then rowL[xx + 1] else v
+					if hl ~= v or hs ~= v then
+						writeu16(Hb, (base + xx) * 2, floor((hl + hs) * 0.5 + 0.5))
+					end
+				end
+				x = La[k] - 1
+				k -= 1
+				g -= 1
+			else
+				local ga = if k >= i0 then Lb[k] + 1 else 0
+				local v = readu16(e, (base + x) * 2)
+				local xs = x
+				while x >= ga and hs ~= v do
+					hs = stepH(hs, v, base + x, base + x + 1)
+					if hs ~= v then
+						transients += 1
+					end
+					local hl = if buffer.readu32(stampL, x * 4) == stamp then rowL[x + 1] else v
+					writeu16(Hb, (base + x) * 2, floor((hl + hs) * 0.5 + 0.5))
+					x -= 1
+				end
+				gr[g + 1] = if hs == v then xs - x - 1 else xs - x
+				if gr[g + 1] < 0 then
+					gr[g + 1] = 0
+				end
+				-- the rest of the gap has hR = v; combine the left stretch inside it
+				local lend = ga + (gl[g + 1] or 0) - 1
+				if lend > x then
+					lend = x
+				end
+				for xx = ga, lend do
+					local hl = rowL[xx + 1]
+					if hl ~= v then
+						writeu16(Hb, (base + xx) * 2, floor((hl + v) * 0.5 + 0.5))
+					end
+				end
+				x = ga - 1
+				g -= 1
+			end
+		end
+		-- H literal intervals of the row, in order: gap stretches and literals
+		Hfirst[y + 1] = nH + 1
+		local rf = nH + 1
+		local ga = 0
+		for kk = i0, i1 + 1 do
+			local gg = kk - i0 -- gap index left of literal kk
+			local gb = if kk <= i1 then La[kk] - 1 else w - 1
+			if ga <= gb then
+				local nl, nr = gl[gg + 1] or 0, gr[gg + 1] or 0
+				if nl > 0 then
+					nH = pushInterval(HA, HB, nH, rf, ga, ga + nl - 1)
+				end
+				if nr > 0 then
+					nH = pushInterval(HA, HB, nH, rf, gb - nr + 1, gb)
+				end
+			end
+			if kk <= i1 then
+				nH = pushInterval(HA, HB, nH, rf, La[kk], Lb[kk])
+				ga = Lb[kk] + 1
+			end
+			gl[gg + 1] = 0
+			gr[gg + 1] = 0
+		end
+	end
+	Hfirst[h + 1] = nH + 1
+
+	-- A starts as the clamp of H: constant gaps are filled, literals done per pixel
+	local A = out or buffer.create(n)
+	for y = 0, h - 1 do
+		local base = y * w
+		local x = 0
+		for kk = Hfirst[y + 1], Hfirst[y + 2] do
+			local a = if kk < Hfirst[y + 2] then HA[kk] else w
+			if a > x then
+				buffer.fill(A, base + x, toByte(readu16(Hb, (base + x) * 2), clip), a - x)
+			end
+			if kk < Hfirst[y + 2] then
+				for xx = a, HB[kk] do
+					buffer.writeu8(A, base + xx, toByte(readu16(Hb, (base + xx) * 2), clip))
+				end
+				x = HB[kk] + 1
+			end
+		end
+	end
+
+	-- change sets C_y (y >= 1): columns where H(y) may differ from H(y - 1)
+	local CA: { number } = {}
+	local CB: { number } = {}
+	local Cfirst: { number } = table.create(h + 1, 0)
+	local nC = 0
+	Cfirst[1] = 1
+	for y = 1, h - 1 do
+		Cfirst[y + 1] = nC + 1
+		local rf = nC + 1
+		local p = 0
+		local k1, e1 = Hfirst[y], Hfirst[y + 1] - 1 -- row y - 1
+		local k2, e2 = Hfirst[y + 1], Hfirst[y + 2] - 1 -- row y
+		local bPrev, bCur = (y - 1) * w, y * w
+		while p < w do
+			local lit1 = k1 <= e1 and p >= HA[k1]
+			local end1 = if lit1 then HB[k1] elseif k1 <= e1 then HA[k1] - 1 else w - 1
+			local lit2 = k2 <= e2 and p >= HA[k2]
+			local end2 = if lit2 then HB[k2] elseif k2 <= e2 then HA[k2] - 1 else w - 1
+			local q = if end1 < end2 then end1 else end2
+			if lit1 or lit2 or readu16(Hb, (bPrev + p) * 2) ~= readu16(Hb, (bCur + p) * 2) then
+				nC = pushInterval(CA, CB, nC, rf, p, q)
+			end
+			p = q + 1
+			if lit1 and p > HB[k1] then
+				k1 += 1
+			end
+			if lit2 and p > HB[k2] then
+				k2 += 1
+			end
+		end
+	end
+	Cfirst[h + 1] = nC + 1
+
+	-- top to bottom: column states, active columns, transients recorded per row
+	local hU = table.create(w, 0)
+	for x = 0, w - 1 do
+		hU[x + 1] = readu16(Hb, x * 2)
+	end
+	local stampU = buffer.create(w * 4)
+	local act: { number } = {}
+	local nAct = 0
+	local nxt: { number } = {}
+	local UX: { number } = {}
+	local UV: { number } = {}
+	local Ufirst: { number } = table.create(h + 1, 0)
+	local nU = 0
+	Ufirst[1] = 1
+	for y = 1, h - 1 do
+		Ufirst[y + 1] = nU + 1
+		local rb = y * w
+		local stamp = y + 1
+		local nNxt = 0
+		local function processU(x: number)
+			buffer.writeu32(stampU, x * 4, stamp)
+			local v = readu16(Hb, (rb + x) * 2)
+			local hs = hU[x + 1]
+			if hs ~= v then
+				hs = stepH(hs, v, rb + x, rb + x - w)
+				hU[x + 1] = hs
+				if hs ~= v then
+					transients += 1
+					nU += 1
+					UX[nU] = x
+					UV[nU] = hs
+					nNxt += 1
+					nxt[nNxt] = x
+				end
+			end
+		end
+		for kk = Cfirst[y + 1], Cfirst[y + 2] - 1 do
+			for x = CA[kk], CB[kk] do
+				processU(x)
+			end
+		end
+		for j = 1, nAct do
+			local x = act[j]
+			if buffer.readu32(stampU, x * 4) ~= stamp then
+				processU(x)
+			end
+		end
+		act, nxt = nxt, act
+		nAct = nNxt
+	end
+	Ufirst[h + 1] = nU + 1
+
+	-- bottom to top, combined with the downward pass
+	local hD = table.create(w, 0)
+	local rbLast = (h - 1) * w
+	for x = 0, w - 1 do
+		hD[x + 1] = readu16(Hb, (rbLast + x) * 2)
+	end
+	local stampD = buffer.create(w * 4)
+	local stampT = buffer.create(w * 4) -- columns with a downward transient at this row
+	local tv = table.create(w, 0)
+	local cl, ch = clip + OFF, 255 - clip + OFF
+	nAct = 0
+	for y = h - 1, 0, -1 do
+		local rb = y * w
+		local stamp = y + 1
+		local nNxt = 0
+		for j = Ufirst[y + 1], Ufirst[y + 2] - 1 do
+			buffer.writeu32(stampT, UX[j] * 4, stamp)
+			tv[UX[j] + 1] = UV[j]
+		end
+		local function processD(x: number)
+			buffer.writeu32(stampD, x * 4, stamp)
+			local v = readu16(Hb, (rb + x) * 2)
+			local hs = hD[x + 1]
+			if hs ~= v then
+				hs = stepH(hs, v, rb + x, rb + x + w)
+				hD[x + 1] = hs
+				if hs ~= v then
+					transients += 1
+					nNxt += 1
+					nxt[nNxt] = x
+				end
+			end
+			local hu = if buffer.readu32(stampT, x * 4) == stamp then tv[x + 1] else v
+			if hu ~= v or hs ~= v then
+				local o = floor((hu + hs) * 0.5 + 0.5)
+				buffer.writeu8(A, rb + x, if o <= cl then 0 elseif o >= ch then 255 else o - OFF)
+			end
+		end
+		if y < h - 1 then
+			for kk = Cfirst[y + 2], Cfirst[y + 3] - 1 do -- changes between rows y and y + 1
+				for x = CA[kk], CB[kk] do
+					processD(x)
+				end
+			end
+		end
+		for j = 1, nAct do
+			local x = act[j]
+			if buffer.readu32(stampD, x * 4) ~= stamp then
+				processD(x)
+			end
+		end
+		for j = Ufirst[y + 1], Ufirst[y + 2] - 1 do
+			local x = UX[j]
+			if buffer.readu32(stampD, x * 4) ~= stamp then
+				processD(x)
+			end
+		end
+		act, nxt = nxt, act
+		nAct = nNxt
 	end
 	return A, transients
 end
@@ -1174,16 +1680,18 @@ function LiquidMatte.matte(img: buffer, w: number, h: number, opts: Options?, ou
 	local key = LiquidMatte.detectKey(img, w, h, o.wy, o.key)
 	local P = LiquidMatte.params(key, o)
 	local field = LiquidMatte.distanceField(img, w, h, key, P.t0)
-	local u, band = LiquidMatte.rawMatte(field, w, h, P)
+	local e, band, lit = LiquidMatte.rawMatte(field, w, h, P)
 	local protect: buffer? = nil
 	local protectedCount = 0
 	if P.flood then
-		protect, protectedCount = LiquidMatte.floodProtect(u, w, h)
+		protect, protectedCount = LiquidMatte.floodProtect(e, w, h, P.headroom)
 	end
-	local A = u
+	local A: buffer
 	local transients = 0
 	if P.refine then
-		A, transients = LiquidMatte.refine(u, field.dq, w, h, P.tau, P.kMax, P.clip)
+		A, transients = LiquidMatte.refineRuns(e, field.dq, w, h, P.tau, P.kMax, P.clip, lit)
+	else
+		A = LiquidMatte.toAlpha(e, w * h, P.clip)
 	end
 	local dst, partial = LiquidMatte.compose(img, w, h, A, P, field.opaque, protect, out)
 	if P.bleed then

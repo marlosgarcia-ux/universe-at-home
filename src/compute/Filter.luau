@@ -19,7 +19,11 @@
 --                  summed-area table. Any footprint in O(1) (variable blur, LOD).
 --   areaResample   the reference resampler: exact area average at any ratio with
 --                  integer weights and exact rational rounding, separable, about
---                  4x faster than satResample. Artifact-free downscaling for LOD.
+--                  4x faster than satResample. Artifact-free downscaling for LOD:
+--                  the exact (C9), flawless path for OPAQUE raster content.
+--   areaResampleAlpha  the same for straight-alpha content: alpha-weighted
+--                  (premultiplied) exact box filter, correctly rounded; equals
+--                  areaResample byte for byte on opaque images.
 --   normalMap      height field to tangent-space normal map by central differences.
 --
 -- Edges clamp to the border pixel. Deterministic ops only.
@@ -324,6 +328,75 @@ function Filter.areaResample(src: buffer, w: number, h: number, dw: number, dh: 
 				orow + i * 4,
 				(2 * s0 + T) // T2 + ((2 * s1 + T) // T2) * 256 + ((2 * s2 + T) // T2) * 65536 + ((2 * s3 + T) // T2) * 16777216
 			)
+		end
+		wj += cy[j]
+	end
+	return out
+end
+
+-- Exact box filter of STRAIGHT-ALPHA content at any ratio: the area average of the
+-- image's appearance, i.e. colours averaged with alpha weights (premultiplied), so
+-- a transparent pixel's colour never tints the result. areaResample averages each
+-- channel independently, which is the same thing only for opaque images (alpha
+-- 255 everywhere: then both give identical bytes). Integer weights as in
+-- areaResample: SA = sum of alpha * weight and SC = sum of colour * alpha * weight
+-- are exact integers (below 255 * 255 * w * h < 2^53), the output alpha is
+-- round-half-up of SA / (w h) and the output colour round-half-up of SC / SA (0
+-- where SA = 0): the correctly rounded exact box filter, identical everywhere.
+function Filter.areaResampleAlpha(src: buffer, w: number, h: number, dw: number, dh: number, dst: buffer?): buffer
+	local out = dst or buffer.create(dw * dh * 4)
+	local fx, cx, wx = areaWeights(w, dw)
+	local fy, cy, wy = areaWeights(h, dh)
+	local mid = buffer.create(dw * h * 16) -- u32 x 4: r*a, g*a, b*a, a sums (below 65025 w)
+	for y = 0, h - 1 do
+		local srow = y * w * 4
+		local o = y * dw * 16
+		local wi = 1
+		for i = 1, dw do
+			local s0, s1, s2, s3 = 0, 0, 0, 0
+			local k = fx[i]
+			for _ = 1, cx[i] do
+				local p = buffer.readu32(src, srow + k * 4)
+				local aw = (p // 16777216) * wx[wi]
+				s0 += (p % 256) * aw
+				s1 += ((p // 256) % 256) * aw
+				s2 += ((p // 65536) % 256) * aw
+				s3 += aw
+				k += 1
+				wi += 1
+			end
+			buffer.writeu32(mid, o, s0)
+			buffer.writeu32(mid, o + 4, s1)
+			buffer.writeu32(mid, o + 8, s2)
+			buffer.writeu32(mid, o + 12, s3)
+			o += 16
+		end
+	end
+	local T = w * h
+	local T2 = 2 * T
+	local wj = 1
+	for j = 1, dh do
+		local orow = (j - 1) * dw * 4
+		for i = 0, dw - 1 do
+			local s0, s1, s2, s3 = 0, 0, 0, 0
+			local k = fy[j]
+			local wk = wj
+			for _ = 1, cy[j] do
+				local o = (k * dw + i) * 16
+				local wt = wy[wk]
+				s0 += buffer.readu32(mid, o) * wt
+				s1 += buffer.readu32(mid, o + 4) * wt
+				s2 += buffer.readu32(mid, o + 8) * wt
+				s3 += buffer.readu32(mid, o + 12) * wt
+				k += 1
+				wk += 1
+			end
+			local px = 0
+			if s3 > 0 then
+				local d = 2 * s3
+				px = (2 * s0 + s3) // d + ((2 * s1 + s3) // d) * 256 + ((2 * s2 + s3) // d) * 65536 + ((2 * s3 + T) // T2) * 16777216
+			end
+			buffer.writeu32(out, orow + i * 4, px)
 		end
 		wj += cy[j]
 	end

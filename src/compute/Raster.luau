@@ -817,10 +817,6 @@ end
 
 local GX: { number } = table.create(64, 0)
 local GY: { number } = table.create(64, 0)
-local HX: { number } = table.create(64, 0)
-local HY: { number } = table.create(64, 0)
-local TRX: { number } = table.create(3, 0)
-local TRY: { number } = table.create(3, 0)
 
 local function addPieces(sc: Scene, s: number, px: number, py: number, w: number)
 	local k = sc.kind[s]
@@ -913,65 +909,15 @@ local function addPieces(sc: Scene, s: number, px: number, py: number, w: number
 		Visibility.disc(Cx, Cy, P3[s] * iw)
 		Visibility.piece()
 	else
-		-- polygon: clip to the pixel, then one convex piece or a signed fan
+		-- polygon: clipped to the pixel by Visibility.polygon (one convex piece or a
+		-- signed fan); p3 is the orientation, so the interior counts +1
 		local V = sc.verts
 		local first, count = P1[s], P2[s]
 		for i = 1, count do
 			GX[i] = (V[first + 2 * i - 2] - px) * iw
 			GY[i] = (V[first + 2 * i - 1] - py) * iw
 		end
-		local m = clipInto(GX, GY, count, HX, HY, 1, 0, 0.5)
-		m = clipInto(HX, HY, m, GX, GY, -1, 0, 0.5)
-		m = clipInto(GX, GY, m, HX, HY, 0, 1, 0.5)
-		m = clipInto(HX, HY, m, GX, GY, 0, -1, 0.5)
-		if m < 3 then
-			return
-		end
-		local A = polyArea(GX, GY, m)
-		if A == 0 then
-			return
-		end
-		if A < 0 then
-			-- make the orientation positive (interior on the left of every edge)
-			local i, j = 1, m
-			while i < j do
-				GX[i], GX[j] = GX[j], GX[i]
-				GY[i], GY[j] = GY[j], GY[i]
-				i += 1
-				j -= 1
-			end
-		end
-		local convex = true
-		local ax, ay = GX[m - 1], GY[m - 1]
-		local bx, by = GX[m], GY[m]
-		for i = 1, m do
-			local cx, cy = GX[i], GY[i]
-			if (bx - ax) * (cy - by) - (by - ay) * (cx - bx) < -1e-12 then
-				convex = false
-				break
-			end
-			ax, ay, bx, by = bx, by, cx, cy
-		end
-		if convex then
-			Visibility.poly(1, GX, GY, m)
-			Visibility.piece()
-		else
-			-- winding number of the closed clip = sum of signed fan triangles
-			local x0, y0 = GX[1], GY[1]
-			for i = 2, m - 1 do
-				local x1, y1, x2, y2 = GX[i], GY[i], GX[i + 1], GY[i + 1]
-				local t = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)
-				if t > 0 then
-					TRX[1], TRY[1], TRX[2], TRY[2], TRX[3], TRY[3] = x0, y0, x1, y1, x2, y2
-					Visibility.poly(1, TRX, TRY, 3)
-					Visibility.piece()
-				elseif t < 0 then
-					TRX[1], TRY[1], TRX[2], TRY[2], TRX[3], TRY[3] = x0, y0, x2, y2, x1, y1
-					Visibility.poly(-1, TRX, TRY, 3)
-					Visibility.piece()
-				end
-			end
-		end
+		Visibility.polygon(GX, GY, count, P3[s])
 	end
 end
 Raster.addPieces = addPieces
@@ -1083,23 +1029,45 @@ local function shadeExact(
 					elseif d <= -REACH then
 						cov = 1
 					else
-						cov = boxArea(px - hw - cx, px + hw - cx, py - hw - cy, py + hw - cy, hx, hy, rad) * iw2
+						local X0, X1, Y0, Y1 = px - hw - cx, px + hw - cx, py - hw - cy, py + hw - cy
+						if Y0 >= rad - hy and Y1 <= hy - rad then
+							-- inside the horizontal band: the box is locally the slab |x| <= hx
+							local lo = if X0 > -hx then X0 else -hx
+							local hi = if X1 < hx then X1 else hx
+							cov = if hi > lo then (hi - lo) * iw else 0
+						elseif X0 >= rad - hx and X1 <= hx - rad then
+							local lo = if Y0 > -hy then Y0 else -hy
+							local hi = if Y1 < hy then Y1 else hy
+							cov = if hi > lo then (hi - lo) * iw else 0
+						else
+							cov = boxArea(X0, X1, Y0, Y1, hx, hy, rad) * iw2
+						end
 						cov = if cov > 1 then 1 else cov
 					end
 				elseif k == SEGMENT then
 					local ax, ay = P1[s], P2[s]
 					local pax, pay = px - ax, py - ay
 					local bax, bay = P3[s], P4[s]
-					local hh = (pax * bax + pay * bay) * P6[s]
-					hh = if hh < 0 then 0 elseif hh > 1 then 1 else hh
+					local i2 = P6[s]
+					local h0 = (pax * bax + pay * bay) * i2
+					local hh = if h0 < 0 then 0 elseif h0 > 1 then 1 else h0
 					local dx, dy = pax - bax * hh, pay - bay * hh
-					local d = (sqrt(dx * dx + dy * dy) - P5[s]) * iw
+					local len = sqrt(dx * dx + dy * dy)
+					local r = P5[s]
+					local d = (len - r) * iw
 					if d >= REACH then
 						cov = 0
 					elseif d <= -REACH then
 						cov = 1
 					else
-						cov = capsuleCoverage(px, py, w, ax, ay, bax, bay, P5[s])
+						-- half extent of the pixel along the axis, in units of the segment
+						local hr = hw * (abs(bax) + abs(bay)) * i2
+						if i2 > 0 and h0 - hr >= 0 and h0 + hr <= 1 and len > 0 and r * iw >= REACH then
+							-- the pixel sees one straight side only (C4, exact)
+							cov = halfPlane(d, dx / len, dy / len)
+						else
+							cov = capsuleCoverage(px, py, w, ax, ay, bax, bay, r)
+						end
 					end
 				elseif k == RING then
 					local cx, cy = P1[s], P2[s]

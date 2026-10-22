@@ -36,7 +36,6 @@
 
 local Pixels = require("../Pixels")
 local MyMath = require("../MyMath")
-local Coverage = require("./Coverage")
 local Visibility = require("./Visibility")
 
 local Scanline = {}
@@ -350,6 +349,443 @@ function Scanline.composite(acc: Accumulator, dst: buffer, color: number): numbe
 		table.clear(r)
 	end
 	return perPixel
+end
+
+----------------------------------------------------------------------------------
+-- Exact multi-path scenes (F2)
+----------------------------------------------------------------------------------
+
+-- A path: one or more closed contours (flat x, y lists; non-zero winding with
+-- values 0 or +-1, e.g. outer contours one way and holes the other) filled with
+-- a straight-alpha RGBA8 colour.
+export type Path = { contours: { { number } }, color: number }
+export type SceneStats = { conflicts: number, floatPixels: number, spans: number }
+
+type Prepared = {
+	edges: { number }, -- x0, y0, x1, y1, dir per edge; y0 < y1; x clamped to [0, W]; sorted by y0
+	nf: number, -- number of floats in edges
+	act: { number }, -- indices (into edges) of active edges
+	nact: number,
+	cursor: number, -- next edge to activate
+	row0: number,
+	row1: number,
+	r: number,
+	g: number,
+	b: number,
+	a: number,
+	color: number,
+	sigma: number, -- orientation of the path (sign of its total signed area)
+	contours: { { number } },
+}
+
+-- Appends edge (x0, y0)-(x1, y1) to e with x split at 0 and W and clamped to [0, W]
+-- (left of 0 it covers every pixel to its right, right of W nothing visible).
+local function prepEdge(e: { number }, x0: number, y0: number, x1: number, y1: number, W: number)
+	if y0 == y1 then
+		return
+	end
+	for _, k in { 0, W } do
+		if (x0 < k) ~= (x1 < k) and x0 ~= k and x1 ~= k then
+			local t = (k - x0) / (x1 - x0)
+			local ym = y0 + (y1 - y0) * t
+			prepEdge(e, x0, y0, k, ym, W)
+			prepEdge(e, k, ym, x1, y1, W)
+			return
+		end
+	end
+	x0 = if x0 < 0 then 0 elseif x0 > W then W else x0
+	x1 = if x1 < 0 then 0 elseif x1 > W then W else x1
+	local dir = 1
+	if y0 > y1 then
+		dir = -1
+		x0, y0, x1, y1 = x1, y1, x0, y0
+	end
+	local n = #e
+	e[n + 1], e[n + 2], e[n + 3], e[n + 4], e[n + 5] = x0, y0, x1, y1, dir
+end
+
+local function prepare(path: Path, W: number, H: number): Prepared
+	local raw: { number } = {}
+	local area = 0
+	local ymin, ymax = math.huge, -math.huge
+	for _, c in path.contours do
+		local n = #c // 2
+		local px, py = c[2 * n - 1], c[2 * n]
+		for i = 1, n do
+			local qx, qy = c[2 * i - 1], c[2 * i]
+			prepEdge(raw, px, py, qx, qy, W)
+			area += px * qy - qx * py
+			if qy < ymin then
+				ymin = qy
+			end
+			if qy > ymax then
+				ymax = qy
+			end
+			px, py = qx, qy
+		end
+	end
+	-- sort edges by y0
+	local ne = #raw // 5
+	local idx = table.create(ne, 0)
+	for i = 1, ne do
+		idx[i] = i
+	end
+	table.sort(idx, function(a: number, b: number): boolean
+		return raw[5 * a - 3] < raw[5 * b - 3]
+	end)
+	local edges = table.create(#raw, 0)
+	for k, i in idx do
+		for j = 1, 5 do
+			edges[5 * (k - 1) + j] = raw[5 * (i - 1) + j]
+		end
+	end
+	local color = path.color
+	local row0 = if ymin > 0 then floor(ymin) else 0
+	local row1 = if ymax < H then ceil(ymax) - 1 else H - 1
+	return {
+		edges = edges,
+		nf = #edges,
+		act = table.create(16, 0),
+		nact = 0,
+		cursor = 1,
+		row0 = row0,
+		row1 = row1,
+		r = color % 256,
+		g = (color // 256) % 256,
+		b = (color // 65536) % 256,
+		a = (color // 16777216) / 255,
+		color = color,
+		sigma = if area >= 0 then 1 else -1,
+		contours = path.contours,
+	}
+end
+
+-- Deposits the part of edge (x0, y0)-(x1, y1) (y0 < y1, x in [0, W]) inside row y
+-- into the row's cells (the per-row body of addLineInside) and records the
+-- touched cell range in R. Returns the new range count.
+local function rowEdge(cells: buffer, y: number, x0: number, y0: number, x1: number, y1: number, dir: number, R: { number }, nr: number): number
+	local top = if y > y0 then y else y0
+	local bot = if y + 1 < y1 then y + 1 else y1
+	if bot <= top then
+		return nr
+	end
+	local dxdy = (x1 - x0) / (y1 - y0)
+	local xt = x0 + (top - y0) * dxdy
+	local xn = x0 + (bot - y0) * dxdy
+	local d = (bot - top) * dir
+	local xa, xb = xt, xn
+	if xa > xb then
+		xa, xb = xb, xa
+	end
+	local x0floor = floor(xa)
+	local x0i, x1i = x0floor, ceil(xb)
+	if x1i <= x0i + 1 then
+		local xmf = 0.5 * (xt + xn) - x0floor
+		local o = x0i * 8
+		buffer.writef64(cells, o, buffer.readf64(cells, o) + d - d * xmf)
+		buffer.writef64(cells, o + 8, buffer.readf64(cells, o + 8) + d * xmf)
+		x1i = x0i + 1
+	else
+		local s = 1 / (xb - xa)
+		local x0f = xa - x0floor
+		local a0 = 0.5 * s * (1 - x0f) * (1 - x0f)
+		local x1f = xb - x1i + 1
+		local am = 0.5 * s * x1f * x1f
+		local o = x0i * 8
+		buffer.writef64(cells, o, buffer.readf64(cells, o) + d * a0)
+		if x1i == x0i + 2 then
+			buffer.writef64(cells, o + 8, buffer.readf64(cells, o + 8) + d * (1 - a0 - am))
+		else
+			local a1 = s * (1.5 - x0f)
+			buffer.writef64(cells, o + 8, buffer.readf64(cells, o + 8) + d * (a1 - a0))
+			local ds = d * s
+			for xi = x0i + 2, x1i - 2 do
+				local oi = xi * 8
+				buffer.writef64(cells, oi, buffer.readf64(cells, oi) + ds)
+			end
+			local a2 = a1 + (x1i - x0i - 3) * s
+			local ol = (x1i - 1) * 8
+			buffer.writef64(cells, ol, buffer.readf64(cells, ol) + d * (1 - a2 - am))
+		end
+		local oe = x1i * 8
+		buffer.writef64(cells, oe, buffer.readf64(cells, oe) + d * am)
+	end
+	R[nr + 1] = x0i
+	R[nr + 2] = x1i
+	return nr + 2
+end
+
+local CTX: { number } = table.create(256, 0)
+local CTY: { number } = table.create(256, 0)
+
+-- Pieces of path P at pixel (x, y) for exact visibility.
+local function pathPieces(P: Prepared, x: number, y: number)
+	local px, py = x + 0.5, y + 0.5
+	for _, c in P.contours do
+		local n = #c // 2
+		for i = 1, n do
+			CTX[i] = c[2 * i - 1] - px
+			CTY[i] = c[2 * i] - py
+		end
+		Visibility.polygon(CTX, CTY, n, P.sigma)
+	end
+end
+
+-- Renders paths (bottom to top) onto dst (width x height RGBA8, straight alpha),
+-- over a background colour if given (else over dst's current content), as the
+-- exact box filter of the source-over composite (F2): every pixel is computed in
+-- floating point from exact coverages and rounded once; pixels where two or more
+-- paths' edges enter use exact visibility. Opaque interiors are span fills.
+function Scanline.renderScene(dst: buffer, width: number, height: number, paths: { Path }, background: number?): SceneStats
+	local W, H = width, height
+	if background then
+		Pixels.fill(dst, background)
+	end
+	local np = #paths
+	local P: { Prepared } = {}
+	for i = 1, np do
+		P[i] = prepare(paths[i], W, H)
+	end
+	local cells = buffer.create((W + 2) * 8)
+	local R: { number } = table.create(64, 0)
+	local rowF = buffer.create(W * 32) -- premultiplied r, g, b (0..255 * a), a (0..1)
+	local snapF = buffer.create(W * 32) -- base below the first edge since the last opaque cover
+	local flag = buffer.create(W) -- 1: rowF holds this pixel's (inexact as a byte) value
+	local nfB = buffer.create(W) -- paths with fractional coverage since the last opaque cover
+	local head = buffer.create(W * 4) -- event list head per pixel (0: none)
+	local conf = buffer.create(W) -- 1: pixel is in the conflict list
+	local EVp: { number } = table.create(256, 0)
+	local EVc: { number } = table.create(256, 0)
+	local EVn: { number } = table.create(256, 0)
+	local CL: { number } = table.create(64, 0)
+	local st: SceneStats = { conflicts = 0, floatPixels = 0, spans = 0 }
+	for y = 0, H - 1 do
+		local rowOut = y * W * 4
+		buffer.fill(flag, 0, 0)
+		buffer.fill(nfB, 0, 0)
+		buffer.fill(head, 0, 0)
+		local nev = 0
+		local ncl = 0
+		local minX, maxX = W, -1
+		for pi = 1, np do
+			local Q = P[pi]
+			if y < Q.row0 or y > Q.row1 then
+				continue
+			end
+			-- activate edges starting above the row's bottom, deposit active ones
+			local E, act = Q.edges, Q.act
+			local nact = Q.nact
+			local cursor = Q.cursor
+			while cursor <= Q.nf and E[cursor + 1] < y + 1 do
+				nact += 1
+				act[nact] = cursor
+				cursor += 5
+			end
+			Q.cursor = cursor
+			local nr = 0
+			local keep = 0
+			for i = 1, nact do
+				local e = act[i]
+				local ey1 = E[e + 3]
+				if ey1 > y then
+					nr = rowEdge(cells, y, E[e], E[e + 1], E[e + 2], ey1, E[e + 4], R, nr)
+				end
+				if ey1 > y + 1 then
+					keep += 1
+					act[keep] = e
+				end
+			end
+			Q.nact = keep
+			if nr == 0 then
+				continue
+			end
+			local cr, cg, cb, ca = Q.r, Q.g, Q.b, Q.a
+			local color = Q.color
+			local opaque = ca >= 1
+			-- composite coverage c of this path at pixel x
+			local function pixel(x: number, c: number)
+				if c < 1e-9 then
+					return
+				end
+				if c > 1 - 1e-9 then
+					c = 1
+				end
+				local sa = c * ca
+				if sa >= 1 then
+					buffer.writeu32(dst, rowOut + x * 4, color)
+					buffer.writeu8(flag, x, 0)
+					buffer.writeu8(nfB, x, 0)
+					buffer.writeu32(head, x * 4, 0)
+					return
+				end
+				local o = x * 32
+				local pr, pg, pb, pa = 0, 0, 0, 0
+				if buffer.readu8(flag, x) == 1 then
+					pr = buffer.readf64(rowF, o)
+					pg = buffer.readf64(rowF, o + 8)
+					pb = buffer.readf64(rowF, o + 16)
+					pa = buffer.readf64(rowF, o + 24)
+				else
+					local p = buffer.readu32(dst, rowOut + x * 4)
+					pa = (p // 16777216) / 255
+					pr = (p % 256) * pa
+					pg = ((p // 256) % 256) * pa
+					pb = ((p // 65536) % 256) * pa
+					buffer.writeu8(flag, x, 1)
+					if x < minX then
+						minX = x
+					end
+					if x > maxX then
+						maxX = x
+					end
+				end
+				local n = buffer.readu8(nfB, x)
+				if c < 1 then
+					if n == 0 then
+						buffer.writef64(snapF, o, pr)
+						buffer.writef64(snapF, o + 8, pg)
+						buffer.writef64(snapF, o + 16, pb)
+						buffer.writef64(snapF, o + 24, pa)
+						buffer.writeu32(head, x * 4, 0)
+					end
+					n += 1
+					buffer.writeu8(nfB, x, if n < 255 then n else 255)
+					if n == 2 and buffer.readu8(conf, x) == 0 then
+						buffer.writeu8(conf, x, 1)
+						ncl += 1
+						CL[ncl] = x
+					end
+				end
+				if n >= 1 then
+					nev += 1
+					EVp[nev] = pi
+					EVc[nev] = c
+					EVn[nev] = buffer.readu32(head, x * 4)
+					buffer.writeu32(head, x * 4, nev)
+				end
+				local ia = 1 - sa
+				buffer.writef64(rowF, o, cr * sa + pr * ia)
+				buffer.writef64(rowF, o + 8, cg * sa + pg * ia)
+				buffer.writef64(rowF, o + 16, cb * sa + pb * ia)
+				buffer.writef64(rowF, o + 24, sa + pa * ia)
+			end
+			local function span(x0: number, x1: number, s: number)
+				local a = if s < 0 then -s else s
+				if a < 1e-9 or x1 <= x0 then
+					return
+				end
+				if a > 1 - 1e-9 and opaque then
+					local n = x1 - x0
+					Pixels.fillSpan(dst, rowOut + x0 * 4, n, color)
+					buffer.fill(flag, x0, 0, n)
+					buffer.fill(nfB, x0, 0, n)
+					buffer.fill(head, x0 * 4, 0, n * 4)
+					st.spans += 1
+					return
+				end
+				if a > 1 then
+					a = 1
+				end
+				for x = x0, x1 - 1 do
+					pixel(x, a)
+				end
+			end
+			-- sort the touched ranges and sweep the running sum
+			for i = 3, nr, 2 do
+				local lo, hi = R[i], R[i + 1]
+				local j = i - 2
+				while j >= 1 and R[j] > lo do
+					R[j + 2], R[j + 3] = R[j], R[j + 1]
+					j -= 2
+				end
+				R[j + 2], R[j + 3] = lo, hi
+			end
+			local sum = 0
+			local pos = 0
+			local i = 1
+			while i <= nr do
+				local lo, hi = R[i], R[i + 1]
+				i += 2
+				while i <= nr and R[i] <= hi + 1 do
+					if R[i + 1] > hi then
+						hi = R[i + 1]
+					end
+					i += 2
+				end
+				if lo > pos and pos < W then
+					span(pos, if lo < W then lo else W, sum)
+				end
+				for x = lo, hi do
+					local o = x * 8
+					sum += buffer.readf64(cells, o)
+					buffer.writef64(cells, o, 0)
+					if x < W then
+						local a = if sum < 0 then -sum else sum
+						pixel(x, if a > 1 then 1 else a)
+					end
+				end
+				if hi + 1 > pos then
+					pos = hi + 1
+				end
+			end
+			if pos < W then
+				span(pos, W, sum)
+			end
+		end
+		-- exact visibility where two or more edges entered
+		for k = 1, ncl do
+			local x = CL[k]
+			buffer.writeu8(conf, x, 0)
+			if buffer.readu8(nfB, x) < 2 then
+				continue
+			end
+			st.conflicts += 1
+			Visibility.reset()
+			local e = buffer.readu32(head, x * 4)
+			while e ~= 0 do
+				local Q = P[EVp[e]]
+				local c = EVc[e]
+				if c >= 1 then
+					Visibility.full(Q.r, Q.g, Q.b, Q.a)
+				else
+					Visibility.begin(Q.r, Q.g, Q.b, Q.a)
+					pathPieces(Q, x, y)
+					Visibility.commit()
+				end
+				e = EVn[e]
+			end
+			local o = x * 32
+			local sr = buffer.readf64(snapF, o)
+			local sg = buffer.readf64(snapF, o + 8)
+			local sb = buffer.readf64(snapF, o + 16)
+			local sa = buffer.readf64(snapF, o + 24)
+			if sa > 0 then
+				sr, sg, sb = sr / sa, sg / sa, sb / sa
+			end
+			local r, g, b, a = Visibility.finish(sr, sg, sb, sa)
+			buffer.writef64(rowF, o, r * a)
+			buffer.writef64(rowF, o + 8, g * a)
+			buffer.writef64(rowF, o + 16, b * a)
+			buffer.writef64(rowF, o + 24, a)
+		end
+		-- round every float pixel once
+		for x = minX, maxX do
+			if buffer.readu8(flag, x) == 1 then
+				st.floatPixels += 1
+				local o = x * 32
+				local a = buffer.readf64(rowF, o + 24)
+				local px = 0
+				if a > 0 then
+					px = (buffer.readf64(rowF, o) / a + 0.5) // 1
+						+ ((buffer.readf64(rowF, o + 8) / a + 0.5) // 1) * 256
+						+ ((buffer.readf64(rowF, o + 16) / a + 0.5) // 1) * 65536
+						+ ((a * 255 + 0.5) // 1) * 16777216
+				end
+				buffer.writeu32(dst, rowOut + x * 4, px)
+			end
+		end
+	end
+	return st
 end
 
 -- Points of an ellipse (cx, cy, rx, ry) as a polygon whose chords deviate from the

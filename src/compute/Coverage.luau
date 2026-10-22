@@ -195,8 +195,15 @@ do
 end
 local HALF_PI = 1.5707963267948966
 
+local A1, A2, A3, A4, A5, A6, A7, A8 = ASIN_C[2], ASIN_C[3], ASIN_C[4], ASIN_C[5], ASIN_C[6], ASIN_C[7], ASIN_C[8], ASIN_C[9]
+
 local function asinSmall(x: number): number
 	local x2 = x * x
+	if x2 <= 0.015625 then
+		-- |x| <= 1/8 (arcs a pixel subtends): nine terms, the first omitted one is
+		-- below 1e-19 relative; unrolled with the same coefficients
+		return x * (1 + x2 * (A1 + x2 * (A2 + x2 * (A3 + x2 * (A4 + x2 * (A5 + x2 * (A6 + x2 * (A7 + x2 * A8))))))))
+	end
 	local s = ASIN_C[ASIN_TERMS]
 	for i = ASIN_TERMS - 1, 1, -1 do
 		s = s * x2 + ASIN_C[i]
@@ -218,7 +225,11 @@ local function dasin(x: number): number
 end
 Coverage.dasin = dasin
 
--- Integral of sqrt(r^2 - t^2) from 0 to t (|t| <= r), deterministic.
+-- Integral of sqrt(r^2 - t^2) from 0 to t (|t| <= r), deterministic. Written to
+-- stay well conditioned as |t| -> r (a vertical tangent of the circle): r^2 - t^2
+-- as (r - t)(r + t) (r - t is exact there), and asin(t / r) as pi/2 - 2 asin(sqrt((r
+-- - t) / 2r)) above r/2, so the two sqrt(r - t) terms cancel analytically instead
+-- of losing sqrt(epsilon) r^2 (about 1e-8 r^2) to rounding.
 local QUARTER_PI = 0.78539816339744831
 local function chordIntegralDet(t: number, r: number): number
 	if t >= r then
@@ -226,7 +237,15 @@ local function chordIntegralDet(t: number, r: number): number
 	elseif t <= -r then
 		return -QUARTER_PI * r * r
 	end
-	return 0.5 * (t * sqrt(r * r - t * t) + r * r * dasin(t / r))
+	local a
+	if t > 0.5 * r then
+		a = HALF_PI - 2 * dasin(sqrt((r - t) / (2 * r)))
+	elseif t < -0.5 * r then
+		a = 2 * dasin(sqrt((r + t) / (2 * r))) - HALF_PI
+	else
+		a = dasin(t / r)
+	end
+	return 0.5 * (t * sqrt((r - t) * (r + t)) + r * r * a)
 end
 
 -- Exact area of the disc (cx, cy, r) inside the rectangle [x0, x1] x [y0, y1],
@@ -394,6 +413,21 @@ local function discBoxArea(cx: number, cy: number, r: number, x0: number, y0: nu
 		return 0
 	end
 	local r2 = r * r
+	if (X0 >= 0 or X1 <= 0) and (Y0 >= 0 or Y1 <= 0) then
+		-- the rectangle lies in one quadrant (every edge pixel of a disc larger than
+		-- the pixel, away from its centre lines): one piece
+		local a, b, c, d = X0, X1, Y0, Y1
+		if X1 <= 0 then
+			a, b = -X1, -X0
+		end
+		if Y1 <= 0 then
+			c, d = -Y1, -Y0
+		end
+		if a + b > c + d then
+			return quadrantArea(c, d, a, b, r, r2)
+		end
+		return quadrantArea(a, b, c, d, r, r2)
+	end
 	-- x pieces: right [ra, rb] (x >= 0) and left mirrored [la, lb] (x <= 0)
 	local ra = if X0 > 0 then X0 else 0
 	local rb = X1
@@ -645,13 +679,23 @@ end
 ----------------------------------------------------------------------------------
 
 -- Integral of sqrt(r^2 - t^2) dt from 0 to t, |t| <= r. Reference only (asin).
+-- Well conditioned at |t| -> r like chordIntegralDet (the plain form loses about
+-- 1e-8 r^2 there: 6.5e-7 measured for r = 30.6 at a vertical tangent).
 local function chordIntegral(t: number, r: number): number
 	if t >= r then
 		return math.pi * r * r * 0.25
 	elseif t <= -r then
 		return -math.pi * r * r * 0.25
 	end
-	return 0.5 * (t * sqrt(r * r - t * t) + r * r * math.asin(t / r))
+	local a
+	if t > 0.5 * r then
+		a = math.pi * 0.5 - 2 * math.asin(sqrt((r - t) / (2 * r)))
+	elseif t < -0.5 * r then
+		a = 2 * math.asin(sqrt((r + t) / (2 * r))) - math.pi * 0.5
+	else
+		a = math.asin(t / r)
+	end
+	return 0.5 * (t * sqrt((r - t) * (r + t)) + r * r * a)
 end
 
 -- Exact area of the disc (cx, cy, r) inside the square [x0, x0 + 1] x [y0, y0 + 1].

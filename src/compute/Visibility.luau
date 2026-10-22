@@ -255,6 +255,76 @@ function Visibility.piece()
 	PDX[nP], PDY[nP], PDR[nP] = wDX, wDY, wDR
 end
 
+-- Pieces of one closed polygon contour (pixel-local coordinates, any size; it is
+-- clipped to the pixel here) whose signed winding number, times sigma, is its
+-- contribution to the shape's indicator (sigma = the shape's orientation, so a
+-- simple polygon of either orientation, or a path whose holes wind the other way,
+-- contributes exactly 1 inside). A convex clip becomes one piece; otherwise the
+-- winding number of the clip is the sum of its fan triangles' signed indicators.
+local GX: { number } = table.create(64, 0)
+local GY: { number } = table.create(64, 0)
+local HX: { number } = table.create(64, 0)
+local HY: { number } = table.create(64, 0)
+local TRX: { number } = table.create(3, 0)
+local TRY: { number } = table.create(3, 0)
+
+function Visibility.polygon(xs: { number }, ys: { number }, n: number, sigma: number)
+	local m = clipInto(xs, ys, n, HX, HY, 1, 0, 0.5)
+	m = clipInto(HX, HY, m, GX, GY, -1, 0, 0.5)
+	m = clipInto(GX, GY, m, HX, HY, 0, 1, 0.5)
+	m = clipInto(HX, HY, m, GX, GY, 0, -1, 0.5)
+	if m < 3 then
+		return
+	end
+	local A = polyArea(GX, GY, m)
+	if A == 0 then
+		return
+	end
+	local sg = sigma
+	if A < 0 then
+		-- reverse to positive orientation; the winding inside the clip is then +1
+		sg = -sigma
+		local i, j = 1, m
+		while i < j do
+			GX[i], GX[j] = GX[j], GX[i]
+			GY[i], GY[j] = GY[j], GY[i]
+			i += 1
+			j -= 1
+		end
+	end
+	local convex = true
+	local ax, ay = GX[m - 1], GY[m - 1]
+	local bx, by = GX[m], GY[m]
+	for i = 1, m do
+		local cx, cy = GX[i], GY[i]
+		if (bx - ax) * (cy - by) - (by - ay) * (cx - bx) < -1e-12 then
+			convex = false
+			break
+		end
+		ax, ay, bx, by = bx, by, cx, cy
+	end
+	if convex then
+		Visibility.poly(sg, GX, GY, m)
+		Visibility.piece()
+		return
+	end
+	-- winding number of the closed clip = sum of signed fan triangles
+	local x0, y0 = GX[1], GY[1]
+	for i = 2, m - 1 do
+		local x1, y1, x2, y2 = GX[i], GY[i], GX[i + 1], GY[i + 1]
+		local t = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)
+		if t > 0 then
+			TRX[1], TRY[1], TRX[2], TRY[2], TRX[3], TRY[3] = x0, y0, x1, y1, x2, y2
+			Visibility.poly(sg, TRX, TRY, 3)
+			Visibility.piece()
+		elseif t < 0 then
+			TRX[1], TRY[1], TRX[2], TRY[2], TRX[3], TRY[3] = x0, y0, x2, y2, x1, y1
+			Visibility.poly(-sg, TRX, TRY, 3)
+			Visibility.piece()
+		end
+	end
+end
+
 -- Region areas ---------------------------------------------------------------------
 
 -- Area of polygon (px, py)[1..m] intersected with discs K[1..k] (power cells).
