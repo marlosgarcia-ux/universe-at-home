@@ -1,21 +1,24 @@
 --!strict
 -- Universe at Home: Planets :: PlanetLod
 --
--- Drives the patch system for the one body the camera is close to (the focus): selects
--- the target cut (Quadtree.select), plans hole-free steps towards it (Quadtree.plan),
--- generates patches on the worker Actors, uploads them through the atlases, and swaps
--- them in with a two-phase fade.
+-- Drives the surface of the one body the camera is close to (the focus): selects the target
+-- cut (Quadtree.select), plans hole-free steps towards it (Quadtree.plan), generates patches
+-- on the worker Actors, uploads their tiles through the atlases, and moves them into the
+-- single mesh with a geomorph.
 --
 --   bootstrap  the six face roots are generated and shown together (the plan needs a
 --              displayed partition to start from)
---   generate   patches the plan asks for, most visible first, into free slots or slots
+--   generate   the patches the plan asks for, most visible first, into free slots or slots
 --              holding cached patches nobody needs (least recently used first)
---   results    applied on the main thread within a time budget (mesh writes), atlas
---              tiles queued on the Uploader; a patch is ready once its atlases flushed
---   swaps      phase 1: the new patches fade in over the old ones, pulled a hair towards
---              the camera so the depth test never lets the old surface win (no
---              z-fighting); phase 2: the old patches disappear behind them. With fades off
---              the swap is instant (the comparison the HUD toggle shows).
+--   results    applied on the main thread: atlas tiles queued on the Uploader; a patch is
+--              ready once all its atlases have flushed. The mesh is not touched until the
+--              patch is shown, which spreads the vertex writes over the swaps
+--   swaps      GEOMORPH. A new patch is shown with its vertices on the surface that was
+--              displayed (a child on its parent's bilinear surface, a parent on the
+--              children's vertices) and they slide to their own heights over
+--              Config.morphSeconds. There is no fade, no overlap and no depth trick: at every
+--              instant the surface is one continuous mesh. (The tile contents switch at the
+--              first frame; a child's tile refines its parent's, so that is a sharpening.)
 --   alpha      the whole mesh fades against the body's impostor when the focus changes
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -23,37 +26,18 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Planets = ReplicatedStorage:WaitForChild("Planets")
 local Quadtree = require(Planets:WaitForChild("Quadtree")) :: any
 local CubeSphere = require(Planets:WaitForChild("CubeSphere")) :: any
-local Layout = require(Planets:WaitForChild("Layout")) :: any
+local TileGen = require(Planets:WaitForChild("TileGen")) :: any
 local WorkerPool = require(Planets:WaitForChild("WorkerPool")) :: any
+local Config = require(Planets:WaitForChild("Config")) :: any
 local MeshPool = require(script.Parent:WaitForChild("MeshPool"))
 local Uploader = require(script.Parent:WaitForChild("Uploader"))
 
-local Config = require(Planets:WaitForChild("Config"))
-
 local PlanetLod = {}
-
-local FADE_SECONDS = 0.35
-local LEVEL_TINTS = {
-	Color3.fromRGB(255, 140, 140),
-	Color3.fromRGB(255, 205, 128),
-	Color3.fromRGB(255, 255, 128),
-	Color3.fromRGB(153, 255, 128),
-	Color3.fromRGB(128, 255, 230),
-	Color3.fromRGB(128, 190, 255),
-	Color3.fromRGB(190, 140, 255),
-	Color3.fromRGB(255, 140, 230),
-}
 
 type Slot = MeshPool.Slot
 
-type Fade = {
-	show: { Slot },
-	hide: { Slot },
-	t: number,
-}
-
 export type Options = {
-	fades: boolean,
+	fades: boolean, -- geomorph on (true) or hard swaps (false)
 	frozen: boolean,
 	greenUp: boolean,
 	tint: boolean,
@@ -79,12 +63,12 @@ export type Lod = {
 	split: { [number]: boolean }?,
 	metric: { [number]: number },
 	target: { number },
-	fades: { Fade },
-	opacity: { [Slot]: number },
-	biased: { [Slot]: boolean },
+	morphing: { Slot },
+	morphAcc: { [Slot]: number },
 	booted: boolean,
 	alpha: number, -- whole-mesh opacity
 	alphaTarget: number,
+	shownAlpha: number,
 	frame: number,
 	lastSelect: number,
 	lastCam: Vector3,
@@ -96,9 +80,11 @@ export type Lod = {
 		genMs: number,
 		swaps: number,
 		evicted: number,
-		rate: number, -- patches per second (smoothed)
+		rate: number,
 		deepest: number,
 		limited: boolean,
+		morphs: number,
+		morphWrites: number,
 	},
 }
 
@@ -121,17 +107,17 @@ function PlanetLod.new(pool: MeshPool.Pool, U: Uploader.Uploader, workers: any):
 		split = nil,
 		metric = {},
 		target = {},
-		fades = {},
-		opacity = {},
-		biased = {},
+		morphing = {},
+		morphAcc = {},
 		booted = false,
 		alpha = 0,
 		alphaTarget = 0,
+		shownAlpha = -1,
 		frame = 0,
 		lastSelect = -100,
 		lastCam = Vector3.new(1e9, 0, 0),
-		opts = { fades = true, frozen = false, greenUp = true, tint = false, splitPx = Config.splitPx, capacity = math.min(Config.capacity, Layout.SLOTS) },
-		stats = { generated = 0, failed = 0, lastError = nil, genMs = 0, swaps = 0, evicted = 0, rate = 0, deepest = 0, limited = false },
+		opts = { fades = true, frozen = false, greenUp = true, tint = false, splitPx = Config.splitPx, capacity = Config.capacity },
+		stats = { generated = 0, failed = 0, lastError = nil, genMs = 0, swaps = 0, evicted = 0, rate = 0, deepest = 0, limited = false, morphs = 0, morphWrites = 0 },
 	}
 end
 
@@ -140,11 +126,7 @@ local function levelOf(key: number): number
 	return L
 end
 
-local function applyVisual(L: Lod, slot: Slot)
-	local o = L.opacity[slot] or 0
-	slot.part.Transparency = 1 - o * L.alpha
-end
-
+-- Frees a slot: forgets its patch and parks its vertices if they were visible.
 local function release(L: Lod, slot: Slot)
 	local key = slot.key
 	if key then
@@ -153,19 +135,21 @@ local function release(L: Lod, slot: Slot)
 			L.slotOf[key] = nil
 		end
 	end
+	if slot.state == "shown" then
+		MeshPool.park(L.pool, slot)
+	end
+	MeshPool.clear(slot)
 	slot.key = nil
 	slot.state = "free"
 	slot.ticket += 1
-	L.opacity[slot] = nil
-	L.biased[slot] = nil
-	slot.part.Transparency = 1
-	slot.part.CFrame = CFrame.new(L.bodyPos)
 end
 
--- Drops every patch (focus change, normal-convention change).
+-- Drops every patch (focus change, convention change).
 function PlanetLod.reset(L: Lod)
 	for _, slot in L.pool.slots do
-		release(L, slot)
+		if slot.state ~= "free" then
+			release(L, slot)
+		end
 	end
 	L.displayed = {}
 	L.ready = {}
@@ -173,9 +157,8 @@ function PlanetLod.reset(L: Lod)
 	L.generating = {}
 	L.wanted = {}
 	L.results = {}
-	L.fades = {}
-	L.opacity = {}
-	L.biased = {}
+	L.morphing = {}
+	L.morphAcc = {}
 	L.split = nil
 	L.booted = false
 	L.lastSelect = -100
@@ -193,35 +176,24 @@ function PlanetLod.setBody(L: Lod, body: any?)
 	L.alpha = 0
 	if body then
 		L.bodyPos = Vector3.new(body.px, body.py, body.pz)
+		MeshPool.place(L.pool, L.bodyPos)
 	end
 end
 
 -- A slot for a new patch: a free one, else the least recently used cached patch that is
--- neither displayed nor wanted. Grows the pool in the background when everything is busy.
+-- neither displayed nor needed by a pending step.
 local function acquire(L: Lod): Slot?
 	local free: Slot? = nil
-	local nFree = 0
 	local best: Slot? = nil
 	for _, slot in L.pool.slots do
 		if slot.state == "free" then
-			nFree += 1
-			if not free then
-				free = slot
-			end
+			free = slot
+			break
 		elseif slot.state == "ready" and slot.key and not L.displayed[slot.key :: number] and not L.wanted[slot.key :: number] then
 			if best == nil or slot.lastUsed < (best :: Slot).lastUsed then
 				best = slot
 			end
 		end
-	end
-	-- grow before free slots run out: cached patches are worth keeping
-	local pool = L.pool
-	if nFree <= 4 and not pool.growing and #pool.slots < Layout.SLOTS and not pool.failed then
-		pool.growing = true
-		task.spawn(function()
-			MeshPool.grow(pool, 8)
-			pool.growing = false
-		end)
 	end
 	if free then
 		return free
@@ -256,7 +228,7 @@ local function submit(L: Lod, key: number): boolean
 		i = i,
 		j = j,
 		greenUp = L.opts.greenUp,
-		tint = false,
+		tint = L.opts.tint,
 	}, function(ok: boolean, result: any, ms: number)
 		L.inflight -= 1
 		L.generating[key] = nil
@@ -275,7 +247,7 @@ local function submit(L: Lod, key: number): boolean
 	return true
 end
 
--- Applies finished jobs within `budget` seconds of main-thread time.
+-- Applies finished jobs: tiles are queued, nothing is written to the mesh.
 local function drainResults(L: Lod, budget: number)
 	local t0 = os.clock()
 	while #L.results > 0 and os.clock() - t0 < budget do
@@ -285,7 +257,7 @@ local function drainResults(L: Lod, budget: number)
 			local key = r.key
 			L.heightLo[key] = r.result.hmin
 			L.heightHi[key] = r.result.hmax
-			MeshPool.assign(L.pool, L.U, s, r.result, function()
+			MeshPool.assign(L.pool, s, r.result, function()
 				if s.ticket == r.ticket then
 					s.state = "ready"
 					s.lastUsed = L.frame
@@ -298,30 +270,18 @@ local function drainResults(L: Lod, budget: number)
 	end
 end
 
-local function showSlot(L: Lod, slot: Slot, opacity: number)
-	slot.state = "shown"
-	slot.lastUsed = L.frame
-	slot.part.CFrame = CFrame.new(L.bodyPos) -- vertices are body-local
-	L.opacity[slot] = opacity
-	if L.opts.tint and slot.key then
-		MeshPool.tint(slot, LEVEL_TINTS[(levelOf(slot.key :: number) % #LEVEL_TINTS) + 1])
-	else
-		MeshPool.tint(slot, Color3.new(1, 1, 1))
+local function startMorph(L: Lod, slot: Slot)
+	if slot.morph then
+		table.insert(L.morphing, slot)
+		L.morphAcc[slot] = 0
+		L.stats.morphs += 1
 	end
-	applyVisual(L, slot)
 end
 
-local function hideSlot(L: Lod, slot: Slot)
-	if slot.state == "shown" then
-		slot.state = "ready"
-	end
-	L.opacity[slot] = 0
-	L.biased[slot] = nil
-	slot.part.Transparency = 1
-	slot.part.CFrame = CFrame.new(L.bodyPos)
-end
-
+-- Moves a displayed set of patches over to a new one (Quadtree swap) with a geomorph when
+-- the mesh is fully visible, else instantly.
 local function startSwap(L: Lod, swap: any)
+	local pool = L.pool
 	local show: { Slot } = {}
 	local hide: { Slot } = {}
 	for _, k in swap.show do
@@ -338,57 +298,95 @@ local function startSwap(L: Lod, swap: any)
 	end
 	Quadtree.apply(L.displayed, swap)
 	L.stats.swaps += 1
-	if L.opts.fades and #hide > 0 and L.alpha > 0.99 then
+	local R = L.body.radius
+	local morph = L.opts.fades and L.alpha > 0.99
+	local shownNew = false
+	if morph and #hide == 1 and #show == 4 and hide[1].result then
+		-- split: each child starts on its parent's surface
+		local parent = hide[1]
+		local pr = parent.result
 		for _, s in show do
-			showSlot(L, s, 0)
-			L.biased[s] = true
+			local _, lev, i, j = CubeSphere.unkey(s.key :: number)
+			local start = MeshPool.startFromParent(pr, i % 2, j % 2, TileGen.skirtDepth(R, lev))
+			MeshPool.show(pool, s, start)
+			startMorph(L, s)
 		end
-		table.insert(L.fades, { show = show, hide = hide, t = 0 })
-	else
+		shownNew = true
+	elseif morph and #show == 1 and #hide >= 2 then
+		-- merge: the coarser parent starts on its children's vertices
+		local s = show[1]
+		local f, lev, pi, pj = CubeSphere.unkey(s.key :: number)
+		local kids: { [number]: any } = {}
+		for _, h in hide do
+			if h.result and h.key then
+				local hf, hl, hi, hj = CubeSphere.unkey(h.key :: number)
+				if hf == f and hl == lev + 1 and hi // 2 == pi and hj // 2 == pj then
+					kids[(hj % 2) * 2 + (hi % 2)] = h.result
+				end
+			end
+		end
+		if next(kids) then
+			local finals = MeshPool.finals(s)
+			MeshPool.show(pool, s, MeshPool.startFromChildren(finals, kids))
+			startMorph(L, s)
+			shownNew = true
+		end
+	end
+	for _, h in hide do
+		MeshPool.park(pool, h)
+		L.morphAcc[h] = nil
+		h.state = "ready"
+	end
+	if not shownNew then
 		for _, s in show do
-			showSlot(L, s, 1)
+			MeshPool.show(pool, s, nil)
 		end
-		for _, s in hide do
-			hideSlot(L, s)
-		end
+	end
+	for _, s in show do
+		s.lastUsed = L.frame
 	end
 end
 
-local function stepFades(L: Lod, dt: number)
-	local i = 1
-	while i <= #L.fades do
-		local fd = L.fades[i]
-		fd.t += dt / FADE_SECONDS
-		local o = math.clamp(fd.t, 0, 1)
-		o = o * o * (3 - 2 * o)
-		for _, s in fd.show do
-			if s.state == "shown" then
-				L.opacity[s] = o
-				applyVisual(L, s)
-			end
-		end
-		if fd.t >= 1 then
-			-- phase 2: the old patches are now fully covered; remove them, then drop the bias
-			for _, s in fd.hide do
-				if s.state == "shown" and not (s.key and L.displayed[s.key :: number]) then
-					hideSlot(L, s)
-				end
-			end
-			for _, s in fd.show do
-				L.biased[s] = nil
-				s.part.CFrame = CFrame.new(L.bodyPos)
-			end
-			table.remove(L.fades, i)
-		else
-			i += 1
-		end
+-- Advances geomorphs, at most Config.morphPerFrame slots per frame (round robin; a slot that
+-- waits catches up by the time it accumulated).
+local function stepMorphs(L: Lod, dt: number)
+	local n = #L.morphing
+	if n == 0 then
+		return
 	end
+	for _, s in L.morphing do
+		L.morphAcc[s] = (L.morphAcc[s] or 0) + dt
+	end
+	local budget = Config.morphPerFrame
+	local keep: { Slot } = {}
+	for idx, s in L.morphing do
+		if s.morph and s.state == "shown" then
+			if budget > 0 then
+				budget -= 1
+				local acc = L.morphAcc[s] or dt
+				L.morphAcc[s] = 0
+				L.stats.morphWrites += 1
+				if MeshPool.stepMorph(s, acc, Config.morphSeconds) then
+					table.insert(keep, s)
+				else
+					L.morphAcc[s] = nil
+				end
+			else
+				table.insert(keep, s)
+			end
+		else
+			L.morphAcc[s] = nil
+		end
+		local _ = idx
+	end
+	L.morphing = keep
 end
 
 -- Per frame. `cam` is the current camera; `budget` the main-thread seconds allowed.
 function PlanetLod.update(L: Lod, cam: Camera, dt: number, budget: number)
 	L.frame += 1
 	local body = L.body
+	local pool = L.pool
 	-- whole-mesh opacity follows alphaTarget (impostor crossfade)
 	local target = if body and L.booted then L.alphaTarget else 0
 	if L.alpha ~= target then
@@ -398,45 +396,25 @@ function PlanetLod.update(L: Lod, cam: Camera, dt: number, budget: number)
 		else
 			L.alpha = math.max(target, L.alpha - step)
 		end
-		for slot, _ in L.opacity do
-			applyVisual(L, slot)
-		end
 	end
-	if not body then
+	if L.alpha ~= L.shownAlpha then
+		L.shownAlpha = L.alpha
+		MeshPool.setOpacity(pool, L.alpha)
+	end
+	if not body or #pool.slots == 0 then
 		return
 	end
 	drainResults(L, budget * 0.5)
-	stepFades(L, dt)
-	-- depth bias for patches fading in: a hair towards the camera
-	local camPos = cam.CFrame.Position
-	for slot, _ in L.biased do
-		local key = slot.key
-		if key then
-			local f, lev, i, j = CubeSphere.unkey(key)
-			local x, y, z = CubeSphere.patchPoint(f, lev, i, j, 0.5, 0.5)
-			local centre = L.bodyPos + Vector3.new(x, y, z) * body.radius
-			local toCam = camPos - centre
-			local d = toCam.Magnitude
-			if d > 1e-3 then
-				slot.part.CFrame = CFrame.new(L.bodyPos + toCam.Unit * (d * 0.0015 + 0.02))
-			end
-		end
-	end
+	stepMorphs(L, dt)
 
-	local pool = L.pool
+	local camPos = cam.CFrame.Position
 	local inUse = 0
 	for _, slot in pool.slots do
 		if slot.state ~= "free" then
 			inUse += 1
 		end
 	end
-	if #pool.slots < 24 and not pool.growing and not pool.failed then
-		pool.growing = true
-		task.spawn(function()
-			MeshPool.grow(pool, 24)
-			pool.growing = false
-		end)
-	end
+	local total = pool.maxSlots
 	local maxInflight = if L.workers.available then math.max(2, L.workers.readyCount * 2) else 1
 
 	-- bootstrap: the six roots, shown together
@@ -456,7 +434,8 @@ function PlanetLod.update(L: Lod, cam: Camera, dt: number, budget: number)
 		if all then
 			for _, k in roots do
 				L.displayed[k] = true
-				showSlot(L, L.slotOf[k], 1)
+				MeshPool.show(pool, L.slotOf[k], nil)
+				L.slotOf[k].lastUsed = L.frame
 			end
 			L.booted = true
 		end
@@ -475,6 +454,7 @@ function PlanetLod.update(L: Lod, cam: Camera, dt: number, budget: number)
 		L.lastCam = camPos
 		local viewport = cam.ViewportSize
 		local look = cam.CFrame.LookVector
+		local reserve = math.max(16, total // 5)
 		local sel = Quadtree.select({
 			x = rel.X,
 			y = rel.Y,
@@ -490,7 +470,7 @@ function PlanetLod.update(L: Lod, cam: Camera, dt: number, budget: number)
 			maxHeight = body.maxHeight,
 			heightLo = L.heightLo,
 			heightHi = L.heightHi,
-			capacity = L.opts.capacity,
+			capacity = math.min(L.opts.capacity, total - reserve),
 			splitPx = L.opts.splitPx,
 			hysteresis = 1.35,
 			maxLevel = if body.id == "terra" then Config.maxLevelTerra else Config.maxLevelOther,
@@ -501,7 +481,7 @@ function PlanetLod.update(L: Lod, cam: Camera, dt: number, budget: number)
 		L.stats.limited = sel.limited
 	end
 
-	local plan = Quadtree.plan(L.displayed, L.ready, L.target, L.metric, Layout.SLOTS - inUse < 32)
+	local plan = Quadtree.plan(L.displayed, L.ready, L.target, L.metric, total - inUse < 32)
 	L.wanted = plan.needed
 	-- generation, most visible first
 	local sent = 0
@@ -520,7 +500,6 @@ function PlanetLod.update(L: Lod, cam: Camera, dt: number, budget: number)
 	for _, swap in plan.swaps do
 		startSwap(L, swap)
 	end
-	-- deepest displayed level, for the HUD
 	local deepest = 0
 	for k in L.displayed do
 		local lev = levelOf(k)
@@ -531,7 +510,7 @@ function PlanetLod.update(L: Lod, cam: Camera, dt: number, budget: number)
 	L.stats.deepest = deepest
 end
 
--- Counts for the HUD.
+-- Counts for the HUD: shown, cached, generating, uploading.
 function PlanetLod.counts(L: Lod): (number, number, number, number)
 	local shown, ready, gen, uploading = 0, 0, 0, 0
 	for _, s in L.pool.slots do
@@ -548,13 +527,10 @@ function PlanetLod.counts(L: Lod): (number, number, number, number)
 	return shown, ready, gen, uploading
 end
 
--- Re-tints every shown patch (debug view of the levels).
+-- Debug tint by level is a tile-generation option now (patches carry the tint in their
+-- colour tiles), so changing it regenerates every patch.
 function PlanetLod.refreshTint(L: Lod)
-	for _, s in L.pool.slots do
-		if s.state == "shown" and s.key then
-			MeshPool.tint(s, if L.opts.tint then LEVEL_TINTS[(levelOf(s.key :: number) % #LEVEL_TINTS) + 1] else Color3.new(1, 1, 1))
-		end
-	end
+	PlanetLod.reset(L)
 end
 
 return PlanetLod

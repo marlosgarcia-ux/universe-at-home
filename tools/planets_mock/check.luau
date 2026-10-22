@@ -28,6 +28,8 @@ ClientF.Parent = playerScripts
 for _, n in { "Uploader", "MeshPool", "PlanetLod", "Impostors", "Sky", "CloudLayer", "Flight", "Hud", "Workers" } do
 	moduleInstance(ClientF, n, { wrapped = n })
 end
+local CfgReal = realRequire("../planets/shared/Config")
+CfgReal.atlasSets = 1 -- the main flight uses one set (faster); the sets and limits tests build their own pools
 local mainScript = makeClass("LocalScript")
 mainScript.Name = "Main"
 mainScript.Parent = ClientF
@@ -89,6 +91,7 @@ end
 -- the LocalScript runs
 task.spawn(__defs["Main"], mainScript, mockRequire)
 local Hud = mockRequire(ClientF.Hud)
+local MeshPool = mockRequire(ClientF.MeshPool)
 local D = Hud.debug
 
 -- 1. start-up: workers (serial here: no Actors run in the CLI), every stage, caches
@@ -212,27 +215,56 @@ local function partition(set)
 	return true, "ok"
 end
 
+-- lets a morph in progress finish so shown vertices equal their generation
+local function settle()
+	for _ = 1, 140 do
+		frame(1 / 60)
+		if #D.lod.morphing == 0 and #D.lod.results == 0 then
+			break
+		end
+	end
+	run(4)
+end
+
 local function inspect(label)
+	settle()
 	local L = D.lod
 	local ok, why = partition(L.displayed)
 	check(ok, label .. ": displayed patches partition the sphere (" .. why .. ")")
-	-- every displayed patch is held by a shown slot whose part is placed on the body
+	-- every displayed patch is held by a shown slot; every part sits on the body
 	local shown, bad = 0, 0
 	local body = L.body
+	local c = v3(body.px, body.py, body.pz)
 	for k in L.displayed do
 		local s = L.slotOf[k]
 		if not s or s.state ~= "shown" or s.key ~= k then
 			bad += 1
 		else
 			shown += 1
-			local p = s.part.CFrame.Position
-			local c = v3(body.px, body.py, body.pz)
-			if not L.biased[s] and (p - c).Magnitude > 1e-6 then
-				bad += 1
+		end
+	end
+	for _, chunk in D.pool.chunks do
+		if (chunk.part.CFrame.Position - c).Magnitude > 1e-6 then
+			bad += 1
+		end
+	end
+	check(bad == 0 and shown > 0, label .. ": " .. shown .. " displayed patches are shown slots, every mesh part on the body (" .. bad .. " wrong)")
+	-- every slot that is not shown is parked at the centre
+	local parkedOk, parkedN = true, 0
+	for _, s in D.pool.slots do
+		if s.state ~= "shown" then
+			parkedN += 1
+			local mesh = s.chunk.mesh
+			for v = 1, MeshPool.VS, 37 do
+				local p = mesh.pos[s.vIds[v]]
+				local q = D.pool.park[v]
+				if (p - q).Magnitude > 1e-9 then
+					parkedOk = false
+				end
 			end
 		end
 	end
-	check(bad == 0 and shown > 0, label .. ": " .. shown .. " displayed patches are shown slots on the body (" .. bad .. " wrong)")
+	check(parkedOk, label .. ": " .. parkedN .. " slots that are not shown are parked at the body's centre")
 	-- byte-exact: a shown slot's colour tile and vertices equal a fresh generation
 	local sample = nil
 	for _, s in D.pool.slots do
@@ -245,8 +277,8 @@ local function inspect(label)
 	end
 	if sample then
 		local f, lev, i, j = CubeSphere.unkey(sample.key)
-		local ref = TileGen.generate({ body = body.id, face = f, level = lev, i = i, j = j, greenUp = L.opts.greenUp })
-		local atlas = D.pool.color
+		local ref = TileGen.generate({ body = body.id, face = f, level = lev, i = i, j = j, greenUp = L.opts.greenUp, tint = L.opts.tint })
+		local atlas = sample.set.color
 		local T = Layout.TILE
 		local same = true
 		for row = 0, T - 1 do
@@ -259,7 +291,7 @@ local function inspect(label)
 			end
 		end
 		check(same, string.format("%s: colour atlas tile of patch L%d (%d,%d) equals its generation", label, lev, i, j))
-		local nrm = D.pool.normal
+		local nrm = sample.set.normal
 		local sameN = true
 		for row = 0, T - 1, 7 do
 			for col = 0, T - 1, 7 do
@@ -271,17 +303,18 @@ local function inspect(label)
 			end
 		end
 		check(sameN, label .. ": normal atlas tile equals its generation")
-		local mesh = sample.mesh
+		local mesh = sample.chunk.mesh
 		local worst = 0
-		for v = 0, Layout.VERTS - 1 do
+		for v = 0, MeshPool.VS - 1 do
 			local p = mesh.pos[sample.vIds[v + 1]]
 			worst = math.max(worst, math.abs(p.X - buffer.readf32(ref.positions, v * 12)), math.abs(p.Y - buffer.readf32(ref.positions, v * 12 + 4)), math.abs(p.Z - buffer.readf32(ref.positions, v * 12 + 8)))
 		end
 		check(worst < 1e-3, string.format("%s: mesh vertices equal the generated positions (%.1e)", label, worst))
 		-- UVs land inside the slot's tile
 		local inside = true
+		local base = (sample.tile - sample.chunk.first) * MeshPool.VS
 		for v = 0, Layout.GRID_VERTS - 1 do
-			local uv = mesh.uv[sample.uvIds[v + 1]]
+			local uv = mesh.uv[sample.chunk.uvIds[base + v + 1]]
 			local u = uv.X * Layout.ATLAS
 			local w = (if D.pool.flipV then 1 - uv.Y else uv.Y) * Layout.ATLAS
 			if u < sample.tx * T + 1.5 - 1e-6 or u > sample.tx * T + 62.5 + 1e-6 or w < sample.ty * T + 1.5 - 1e-6 or w > sample.ty * T + 62.5 + 1e-6 then
@@ -308,6 +341,65 @@ local approachShown = inspect("approach")
 check(D.lod.alpha >= 1, "mesh fully faded in over the impostor")
 uploaderRule("approach")
 
+-- one mesh per atlas set, the surface in a single EditableMesh
+check(#D.pool.sets == 1 and #D.pool.chunks == 1 and D.pool.chunks[1].count == 256, string.format("one atlas set is ONE mesh part holding 256 slots (%d sets, %d parts)", #D.pool.sets, #D.pool.chunks))
+check(D.pool.chunks[1].mesh.verts == 256 * MeshPool.VS + 6, "the single mesh has " .. D.pool.chunks[1].mesh.verts .. " vertices")
+check(D.pool.chunks[1].part.Transparency == 0, "the surface part is opaque once the mesh is fully faded in")
+
+-- geomorph continuity: a child's starting positions lie on its parent's surface exactly at
+-- shared grid points, and close to its own final surface elsewhere
+do
+	local TileGenR = TileGen
+	local bodyId = "terra"
+	local parentSpec = { body = bodyId, face = 5, level = 5, i = 14, j = 16 }
+	local parent = TileGenR.generate(parentSpec)
+	local G = Layout.GRID
+	for _, q in { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } } do
+		local qx, qy = q[1], q[2]
+		local child = TileGenR.generate({ body = bodyId, face = 5, level = 6, i = 2 * 14 + qx, j = 2 * 16 + qy })
+		local start = MeshPool.startFromParent(parent, qx, qy, TileGenR.skirtDepth(Bodies.get(bodyId).radius, 6))
+		local exact, worstShared, worstOwn = true, 0, 0
+		for vj = 0, G do
+			for vi = 0, G do
+				local s = start[vj * (G + 1) + vi + 1]
+				local cp = v3(buffer.readf32(child.positions, (vj * (G + 1) + vi) * 12), buffer.readf32(child.positions, (vj * (G + 1) + vi) * 12 + 4), buffer.readf32(child.positions, (vj * (G + 1) + vi) * 12 + 8))
+				worstOwn = math.max(worstOwn, (s - cp).Magnitude)
+				if vi % 2 == 0 and vj % 2 == 0 then
+					local pi, pj = (qx * G + vi) // 2, (qy * G + vj) // 2
+					local o = (pj * (G + 1) + pi) * 12
+					local pp = v3(buffer.readf32(parent.positions, o), buffer.readf32(parent.positions, o + 4), buffer.readf32(parent.positions, o + 8))
+					worstShared = math.max(worstShared, (s - pp).Magnitude)
+				end
+			end
+		end
+		check(worstShared < 1e-3, string.format("child quadrant %d,%d starts exactly on the parent's vertices (%.1e)", qx, qy, worstShared))
+		check(worstOwn < 12, string.format("and within %.1f studs of its own surface (so the slide is short)", worstOwn))
+	end
+	-- a merge: the parent starts on the children's vertices
+	local kids = {}
+	for qy = 0, 1 do
+		for qx = 0, 1 do
+			kids[qy * 2 + qx] = TileGenR.generate({ body = bodyId, face = 5, level = 6, i = 2 * 14 + qx, j = 2 * 16 + qy })
+		end
+	end
+	local slotLike = { result = parent }
+	local finals = MeshPool.finals(slotLike :: any)
+	local start = MeshPool.startFromChildren(finals, kids)
+	local worst = 0
+	for vj = 0, G do
+		for vi = 0, G do
+			local qx = if vi * 2 > G then 1 else 0
+			local qy = if vj * 2 > G then 1 else 0
+			local ci, cj = 2 * vi - qx * G, 2 * vj - qy * G
+			local o = (cj * (G + 1) + ci) * 12
+			local cpb = kids[qy * 2 + qx].positions
+			local cp = v3(buffer.readf32(cpb, o), buffer.readf32(cpb, o + 4), buffer.readf32(cpb, o + 8))
+			worst = math.max(worst, (start[vj * (G + 1) + vi + 1] - cp).Magnitude)
+		end
+	end
+	check(worst < 1e-3, string.format("a merged parent starts exactly on its children's vertices (%.1e)", worst))
+end
+
 -- 3. the coast at 25 studs: deep levels near the camera
 key("Three")
 for _ = 1, 1500 do
@@ -320,6 +412,7 @@ run(120)
 local coastShown = inspect("coast")
 check(D.lod.stats.deepest >= 8, "full detail near the ground (deepest level " .. D.lod.stats.deepest .. ")")
 check(D.lod.stats.swaps > 10, "refinement swaps happened (" .. D.lod.stats.swaps .. ")")
+check(D.lod.stats.morphs > 20 and D.lod.stats.morphWrites > 100, string.format("swaps slid vertices instead of fading parts (%d geomorphs, %d vertex writes of %d)", D.lod.stats.morphs, D.lod.stats.morphWrites, MeshPool.VS))
 check(#D.pool.slots <= 256, "the pool never exceeds the atlas (" .. #D.pool.slots .. " slots)")
 uploaderRule("coast")
 realPrint(string.format("     approach %d patches shown, coast %d, deepest L%d, %d generated, %d swaps, %d evicted", approachShown, coastShown, D.lod.stats.deepest, D.lod.stats.generated, D.lod.stats.swaps, D.lod.stats.evicted))
@@ -375,6 +468,44 @@ run(240)
 check(D.lod.body == nil, "at Saturnia no mesh is active")
 local sat = D.imps.byId.saturnia
 check(sat.renders > 1 and sat.n >= 128, "Saturnia's impostor re-rendered at " .. sat.n .. " px")
+
+-- 8b. atlas sets, and the engine's mesh size limit: a fresh two-set pool under a 30,000
+-- vertex limit finds the largest mesh the engine accepts by halving (256 slots is 91,449
+-- vertices, 128 is 45,702, 64 is 22,854)
+do
+	MOCK.maxMeshVerts = 30000
+	local folder2 = makeClass("Folder")
+	folder2.Parent = Workspace
+	local U2 = mockRequire(ClientF.Uploader).new()
+	local pool2 = MeshPool.new(U2, folder2)
+	local done2, ok1, ok2 = false, false, false
+	task.spawn(function()
+		ok1 = (MeshPool.addSet(pool2))
+		ok2 = (MeshPool.addSet(pool2))
+		done2 = true
+	end)
+	for _ = 1, 4000 do
+		if done2 then
+			break
+		end
+		frame(1 / 60)
+	end
+	check(done2 and ok1 and ok2, "two atlas sets were added under a mesh size limit")
+	check(pool2.slotsPerMesh == 64, "the pool settled on 64 slots per mesh (" .. pool2.slotsPerMesh .. ")")
+	check(#pool2.sets == 2 and #pool2.slots == 512 and #pool2.chunks == 8, string.format("two sets, 512 patch tiles, 8 mesh parts (%d, %d, %d)", #pool2.sets, #pool2.slots, #pool2.chunks))
+	local within = true
+	for _, chunk in pool2.chunks do
+		if chunk.mesh.verts > 30000 then
+			within = false
+		end
+	end
+	check(within, "every mesh is within the limit")
+	check(string.find(pool2.meshMode, "64 slots per mesh", 1, true) ~= nil, "the pool reports what it settled on: " .. pool2.meshMode)
+	-- slots of different sets have their own atlas images and tiles
+	local s0, s300 = pool2.slots[1], pool2.slots[300]
+	check(s0.set ~= s300.set and s0.set.color ~= s300.set.color and s300.tile == 299 - 256, "slots of the second set use the second set's atlases")
+	MOCK.maxMeshVerts = math.huge
+end
 
 -- 9. the memory-budget probe stops at the engine's refusal and reports it
 MOCK.budgetPx = MOCK.usedPx + 40 * 65536 + 100

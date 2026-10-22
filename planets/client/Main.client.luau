@@ -88,13 +88,14 @@ task.spawn(function()
 		return "ok", s.note
 	end)
 	stage("atlases", function()
-		local p, err = MeshPool.new(U, folder)
-		if not p then
+		local p = MeshPool.new(U, folder)
+		local ok, err = MeshPool.addSet(p)
+		if not ok then
 			return "failed", tostring(err)
 		end
 		pool = p
 		lod = PlanetLod.new(p, U, workers)
-		return if p.mode == "pbr" then "ok" else "fallback", p.note
+		return if p.mode == "pbr" then "ok" else "fallback", p.note .. "; " .. p.meshMode
 	end)
 	stage("impostors", function()
 		local m = Impostors.new(U, workers, folder)
@@ -115,6 +116,24 @@ task.spawn(function()
 		end
 		clouds = layer
 		return if layer.part then "ok" else "fallback", layer.note
+	end)
+	-- more atlas sets (finer ground), after everything else so the first image is up quickly
+	stage("atlas sets", function()
+		local p = pool
+		if not p then
+			return "failed", "no pool"
+		end
+		local want = math.clamp(Config.atlasSets, 1, 8)
+		local why = ""
+		while #p.sets < want do
+			local ok, err = MeshPool.addSet(p)
+			if not ok then
+				why = tostring(err)
+				break
+			end
+		end
+		local tiles = #p.slots
+		return if #p.sets >= want then "ok" else "fallback", string.format("%d of %d atlas sets, %d patch tiles%s", #p.sets, want, tiles, if why ~= "" then "; " .. why else "")
 	end)
 	Hud.set(hud, "client", "ok", "ready: fly with W A S D and the right mouse button")
 	Hud.debug.lod = lod
@@ -223,7 +242,7 @@ UserInputService.InputBegan:Connect(function(input: InputObject, processed: bool
 	elseif k == Enum.KeyCode.B and L then
 		local stress = L.opts.splitPx > Config.stressSplitPx
 		L.opts.splitPx = if stress then Config.stressSplitPx else Config.splitPx
-		L.opts.capacity = math.min(if stress then Config.stressCapacity else Config.capacity, 256)
+		L.opts.capacity = if stress then Config.stressCapacity else Config.capacity
 	elseif k == Enum.KeyCode.G then
 		impostorOnly = not impostorOnly
 	elseif k == Enum.KeyCode.N and L then
@@ -346,7 +365,7 @@ RunService.RenderStepped:Connect(function(dt: number)
 		end)
 		table.insert(lines, string.format("images  %.2f Mpx live in EditableImages = %.1f MB RGBA   engine texture memory %.0f MB", px / 1e6, px * 4 / 1048576, tex))
 		if pool then
-			table.insert(lines, string.format("surface %s   mesh %s   slots %d of 256", pool.mode, pool.meshMode, #pool.slots))
+			table.insert(lines, string.format("surface %s   mesh: %s   %d tiles in %d atlas sets, %d mesh parts, %d vertices", pool.mode, pool.meshMode, #pool.slots, #pool.sets, #pool.chunks, pool.stats.meshVerts))
 		end
 		Hud.stats(hud, table.concat(lines, "\n"))
 	end

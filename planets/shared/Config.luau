@@ -9,9 +9,16 @@
 return {
 	-- SURFACE (Terra and Selene meshes)
 	splitPx = 1.6, -- split a patch while one texel covers more than this many screen pixels (lower = sharper)
-	capacity = 200, -- most patches shown at once; cannot exceed 256 (the atlas has 256 tiles; 9 MB)
+	capacity = 100000, -- most patches shown at once (limited by the slots: 256 per atlas set)
+	atlasSets = 2, -- atlas sets (9 MB each, 256 patch tiles each). More sets = more tiles = finer
+	-- ground: one set reaches texel 0.16 studs at 25 studs up, two 0.08, four 0.04. If the memory
+	-- budget refuses a set, the surface keeps the sets it has
+	slotsPerMesh = 256, -- patch slots per EditableMesh (256 = one mesh per set; the pool halves it
+	-- by itself if the engine refuses a mesh that large)
+	morphSeconds = 0.45, -- a new patch slides from the old surface to its own over this long
+	morphPerFrame = 6, -- patches whose vertices are rewritten per frame while sliding
 	stressSplitPx = 0.8, -- the B key
-	stressCapacity = 240,
+	stressCapacity = 100000,
 	maxLevelTerra = 11, -- deepest quadtree level (level 11 = 0.02 studs per texel on Terra)
 	maxLevelOther = 10,
 	meshOn = 2.0, -- distance / radius under which a rocky body switches from billboard to mesh

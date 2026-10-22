@@ -25,6 +25,7 @@ local MOCK = {
 	meshes = {},
 	parts = {},
 	budgetPx = 64 * 1024 * 1024, -- generous by default; the probe test lowers it
+	maxMeshVerts = math.huge, -- the adaptation test lowers it
 	usedPx = 0,
 	refusals = 0,
 	sunClock = 14.2,
@@ -288,6 +289,8 @@ local function recordError(where, err)
 	table.insert(MOCK.errors, where .. ": " .. tostring(err))
 end
 
+local spawnHandler -- set below, once task.spawn exists: event handlers run in their own thread, as in the engine
+
 local function newSignal(name)
 	local s = { handlers = {}, name = name }
 	function s:Connect(fn)
@@ -304,10 +307,7 @@ local function newSignal(name)
 		local list = table.clone(self.handlers)
 		for _, h in list do
 			if h.on then
-				local ok, err = pcall(h.fn, ...)
-				if not ok then
-					recordError("signal " .. tostring(self.name), err)
-				end
+				spawnHandler(h.fn, ...)
 			end
 		end
 	end
@@ -343,6 +343,9 @@ function task.wait(t)
 	assert(coroutine.isyieldable(), "task.wait outside a yieldable thread")
 	table.insert(waiting, { co = co, wake = MOCK.time + (t or 0) })
 	return coroutine.yield()
+end
+spawnHandler = function(fn, ...)
+	task.spawn(fn, ...)
 end
 function task.synchronize() end
 function task.desynchronize() end
@@ -534,7 +537,7 @@ end
 local MeshMeta = {}
 MeshMeta.__index = MeshMeta
 local function newMesh()
-	local m = setmetatable({ next = 1, kind = {}, pos = {}, uv = {}, normal = {}, faces = {}, faceUV = {}, faceN = {}, destroyed = false, batchCalls = 0, setCalls = 0 }, MeshMeta)
+	local m = setmetatable({ next = 1, kind = {}, pos = {}, uv = {}, normal = {}, faces = {}, faceUV = {}, faceN = {}, destroyed = false, batchCalls = 0, setCalls = 0, verts = 0, faceCount = 0 }, MeshMeta)
 	table.insert(MOCK.meshes, m)
 	return m
 end
@@ -546,6 +549,13 @@ local function newId(m, kind)
 end
 function MeshMeta.BatchAdd(m, attr, data)
 	local kind = attr.Name
+	-- a size limit the real engine has but does not publish: the mock can impose one
+	if kind == "Vertex" then
+		assert(m.verts + #data <= MOCK.maxMeshVerts, "EditableMesh vertex limit exceeded (" .. (m.verts + #data) .. " > " .. MOCK.maxMeshVerts .. ")")
+		m.verts += #data
+	elseif kind == "Face" then
+		m.faceCount += #data
+	end
 	local ids = table.create(#data)
 	for i, d in data do
 		if kind == "Vertex" then

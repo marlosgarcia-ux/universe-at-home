@@ -129,6 +129,912 @@ WorkerMain.run(actor, jobs)
       </Properties>
       <Item class="ModuleScript" referent="12">
         <Properties>
+          <string name="Name">Atmos</string>
+          <string name="Source"><![CDATA[--!strict
+--!native
+--!optimize 2
+-- Universe at Home: Planets :: Atmos
+--
+-- Physically based atmosphere for the planet billboards, built to be cheap per pixel.
+--
+-- MODEL. Rayleigh scattering (blue, scale height hr), Mie scattering (haze and glare, scale
+-- height hm, Henyey-Greenstein phase), ozone absorption (a tent layer; it keeps sunsets
+-- from going grey), single scattering along every ray with the sun's own transmittance
+-- through the atmosphere, plus an isotropic second-order term that fills in twilight and
+-- shadowed air. Densities are exp(-h / H); optical depths come from a table.
+-- Radiance is in units where a Lambert surface of albedo A facing the sun at the top of
+-- the atmosphere has radiance A (sun irradiance = pi).
+--
+-- WHY IT IS CHEAP. The scattered light of a ray through a spherical atmosphere depends
+-- only on a handful of invariants, not on the camera, so it is tabulated once:
+--   Miss rays (past the planet): (d0, a, b)  d0 = distance of the ray's closest approach
+--     from the centre, a = s . v (sun against the ray), b = s . q (sun against the closest
+--     point's direction). Table of RGB radiance (view-independent).
+--   Hit rays (ending on the ground): (mu_v, mu_s, nu)  cosines of the view and sun against
+--     the surface normal, nu = s . v. Table of RGB radiance.
+--   Sunlight at the ground: transmittance and an ambient sky irradiance, both by mu_s.
+-- A pixel then costs a trilinear lookup (about 150 operations) instead of a 16-step
+-- integral (about 3000). Tables are built from the same integrator that the tests use as
+-- reference; builders take slices so worker Actors can share the work.
+--
+-- TRUE BLACK. Nothing here adds a floor: where no sunlight reaches (the night side, the
+-- shadow behind the planet), scattered radiance and ambient are exactly 0. `tonemap` maps
+-- 0 to 0 (ACES fit) and sRGB encodes 0 as 0.
+
+local Atmos = {}
+
+export type Spec = {
+	R: number, -- planet radius (studs)
+	H: number, -- atmosphere height
+	hr: number, -- Rayleigh scale height
+	hm: number, -- Mie scale height
+	tauR: { number }, -- Rayleigh optical depth of the vertical column at sea level (rgb)
+	tauM: number, -- Mie scattering optical depth of the vertical column
+	tauO: { number }, -- ozone absorption optical depth (rgb)
+	ozoneCenter: number, -- height of the ozone layer's middle
+	ozoneWidth: number,
+	g: number, -- Mie asymmetry
+	ms: number, -- second-order scattering strength (0 = single scattering only)
+}
+
+export type Model = {
+	spec: Spec,
+	R: number,
+	H: number,
+	Rt: number,
+	bRr: number,
+	bRg: number,
+	bRb: number,
+	bM: number,
+	bMe: number,
+	bOr: number,
+	bOg: number,
+	bOb: number,
+	-- optical depth table
+	NH: number,
+	NU: number,
+	od: { number }, -- 3 per entry: odR, odM, odO
+	-- scattering tables (filled by the builders / install)
+	ND: number,
+	NA: number,
+	NB: number,
+	miss: buffer?, -- ND * NA * NB * 9 f32 (phase-free parts)
+	tMiss: { number }?, -- ND * 3: transmittance along the whole chord
+	NMV: number,
+	NMS: number,
+	NNU: number,
+	hit: buffer?, -- NMV * NMS * NNU * 9 f32 (phase-free parts)
+	NAM: number,
+	amb: { number }?, -- NAM * 3: sky irradiance on the ground by mu_s (already / pi)
+	steps: number,
+}
+
+local sqrt, exp, floor = math.sqrt, math.exp, math.floor
+local PI = math.pi
+
+function Atmos.terra(): Spec
+	return {
+		R = 1600,
+		H = 130,
+		hr = 26,
+		hm = 9,
+		tauR = { 0.0464 * 1.15, 0.108 * 1.15, 0.265 * 1.15 },
+		tauM = 0.03,
+		tauO = { 0.0045, 0.013, 0.0006 },
+		ozoneCenter = 40,
+		ozoneWidth = 30,
+		g = 0.78,
+		ms = 0.22,
+	}
+end
+
+function Atmos.saturnia(): Spec
+	return {
+		R = 2400,
+		H = 90,
+		hr = 22,
+		hm = 8,
+		tauR = { 0.03, 0.04, 0.05 },
+		tauM = 0.02,
+		tauO = { 0, 0, 0 },
+		ozoneCenter = 30,
+		ozoneWidth = 20,
+		g = 0.7,
+		ms = 0.3,
+	}
+end
+
+----------------------------------------------------------------------------------------
+-- optical depth table
+----------------------------------------------------------------------------------------
+
+local function ozoneDensity(M: Model, h: number): number
+	local w = M.spec.ozoneWidth
+	local d = (h - M.spec.ozoneCenter) / w
+	if d < 0 then
+		d = -d
+	end
+	return if d < 1 then 1 - d else 0
+end
+
+-- cosine of the horizon at altitude h (rays with a smaller cosine hit the planet)
+local function muHorizon(M: Model, h: number): number
+	local r = M.R + h
+	local q = 1 - (M.R * M.R) / (r * r)
+	return -sqrt(if q > 0 then q else 0)
+end
+
+-- Direct integral of the three optical depths along a ray from altitude h with cosine mu
+-- to the top of the atmosphere (midpoint rule, n steps).
+local function opticalDepthDirect(M: Model, h: number, mu: number, n: number): (number, number, number)
+	local r0 = M.R + h
+	local disc = r0 * r0 * (mu * mu - 1) + M.Rt * M.Rt
+	if disc <= 0 then
+		return 0, 0, 0
+	end
+	local len = -r0 * mu + sqrt(disc)
+	if len <= 0 then
+		return 0, 0, 0
+	end
+	local ds = len / n
+	local hr, hm = M.spec.hr, M.spec.hm
+	local R = M.R
+	local aR, aM, aO = 0, 0, 0
+	for k = 0, n - 1 do
+		local s = (k + 0.5) * ds
+		local r2 = r0 * r0 + 2 * r0 * mu * s + s * s
+		local alt = sqrt(if r2 > 0 then r2 else 0) - R
+		if alt < 0 then
+			alt = 0
+		end
+		aR += exp(-alt / hr)
+		aM += exp(-alt / hm)
+		aO += ozoneDensity(M, alt)
+	end
+	return aR * ds, aM * ds, aO * ds
+end
+Atmos.opticalDepthDirect = opticalDepthDirect
+
+local function hOf(M: Model, i: number): number
+	local u = i / (M.NH - 1)
+	return M.H * u * u
+end
+
+-- table coordinate of a cosine at altitude h: u in [0, 1], 0 at the horizon
+local function uOfMu(M: Model, h: number, mu: number): number
+	local mh = muHorizon(M, h)
+	local t = (mu - mh) / (1 - mh)
+	if t < 0 then
+		t = 0
+	elseif t > 1 then
+		t = 1
+	end
+	return sqrt(t)
+end
+
+function Atmos.new(spec: Spec, quality: number?): Model
+	local q = quality or 1
+	local hr, hm = spec.hr, spec.hm
+	local M: Model = {
+		spec = spec,
+		R = spec.R,
+		H = spec.H,
+		Rt = spec.R + spec.H,
+		bRr = spec.tauR[1] / hr,
+		bRg = spec.tauR[2] / hr,
+		bRb = spec.tauR[3] / hr,
+		bM = spec.tauM / hm,
+		bMe = spec.tauM / hm * 1.11,
+		bOr = spec.tauO[1] / (spec.ozoneWidth * 1.0),
+		bOg = spec.tauO[2] / (spec.ozoneWidth * 1.0),
+		bOb = spec.tauO[3] / (spec.ozoneWidth * 1.0),
+		NH = 32,
+		NU = 96,
+		od = {},
+		ND = math.max(8, floor(28 * q)),
+		NA = math.max(6, floor(16 * q)),
+		NB = math.max(8, floor(24 * q)),
+		miss = nil,
+		tMiss = nil,
+		NMV = math.max(6, floor(16 * q)),
+		NMS = math.max(10, floor(32 * q)),
+		NNU = math.max(6, floor(16 * q)),
+		hit = nil,
+		NAM = math.max(16, floor(64 * q)),
+		amb = nil,
+		steps = math.max(12, floor(24 * q)),
+	}
+	local od = M.od
+	local n = 0
+	for i = 0, M.NH - 1 do
+		local h = hOf(M, i)
+		local mh = muHorizon(M, h)
+		for j = 0, M.NU - 1 do
+			local u = j / (M.NU - 1)
+			local mu = mh + (1 - mh) * u * u
+			local a, b, c = opticalDepthDirect(M, h, mu, 48)
+			od[n + 1], od[n + 2], od[n + 3] = a, b, c
+			n += 3
+		end
+	end
+	return M
+end
+
+-- Optical depths (Rayleigh, Mie, ozone: path integrals of the density profiles, in studs)
+-- from altitude h along cosine mu to space, by bilinear lookup.
+local function odLookup(M: Model, h: number, mu: number): (number, number, number)
+	if h < 0 then
+		h = 0
+	elseif h > M.H then
+		h = M.H
+	end
+	local fi = sqrt(h / M.H) * (M.NH - 1)
+	local i = floor(fi)
+	if i > M.NH - 2 then
+		i = M.NH - 2
+	end
+	local fy = fi - i
+	-- the two altitude rows have different horizons: look each up with its own u
+	local u0 = uOfMu(M, hOf(M, i), mu)
+	local u1 = uOfMu(M, hOf(M, i + 1), mu)
+	local NU = M.NU
+	local od = M.od
+	local f0 = u0 * (NU - 1)
+	local j0 = floor(f0)
+	if j0 > NU - 2 then
+		j0 = NU - 2
+	end
+	local gx0 = f0 - j0
+	local f1 = u1 * (NU - 1)
+	local j1 = floor(f1)
+	if j1 > NU - 2 then
+		j1 = NU - 2
+	end
+	local gx1 = f1 - j1
+	local a0 = (i * NU + j0) * 3
+	local a1 = (i * NU + j0 + 1) * 3
+	local b0 = ((i + 1) * NU + j1) * 3
+	local b1 = ((i + 1) * NU + j1 + 1) * 3
+	local r0 = od[a0 + 1] + (od[a1 + 1] - od[a0 + 1]) * gx0
+	local m0 = od[a0 + 2] + (od[a1 + 2] - od[a0 + 2]) * gx0
+	local o0 = od[a0 + 3] + (od[a1 + 3] - od[a0 + 3]) * gx0
+	local r1 = od[b0 + 1] + (od[b1 + 1] - od[b0 + 1]) * gx1
+	local m1 = od[b0 + 2] + (od[b1 + 2] - od[b0 + 2]) * gx1
+	local o1 = od[b0 + 3] + (od[b1 + 3] - od[b0 + 3]) * gx1
+	return r0 + (r1 - r0) * fy, m0 + (m1 - m0) * fy, o0 + (o1 - o0) * fy
+end
+Atmos.odLookup = odLookup
+
+-- Transmittance (rgb) of sunlight reaching altitude h whose local sun cosine is mu; 0 when
+-- the planet blocks the sun.
+local function sunT(M: Model, h: number, mu: number): (number, number, number)
+	if mu <= muHorizon(M, h) then
+		return 0, 0, 0
+	end
+	local a, b, c = odLookup(M, h, mu)
+	return exp(-(M.bRr * a + M.bMe * b + M.bOr * c)), exp(-(M.bRg * a + M.bMe * b + M.bOg * c)), exp(-(M.bRb * a + M.bMe * b + M.bOb * c))
+end
+Atmos.sunT = sunT
+
+local function phaseR(c: number): number
+	return 3 / (16 * PI) * (1 + c * c)
+end
+
+local function phaseM(g: number, c: number): number
+	local g2 = g * g
+	local d = 1 + g2 - 2 * g * c
+	return (1 - g2) / (4 * PI * d * sqrt(d))
+end
+Atmos.phaseR, Atmos.phaseM = phaseR, phaseM
+
+----------------------------------------------------------------------------------------
+-- the integrator (shared by the tables and the tests)
+----------------------------------------------------------------------------------------
+
+-- A ray's scattered light splits into three phase-free parts, each rgb:
+--   R  Rayleigh single scattering per unit Rayleigh phase
+--   M  Mie single scattering per unit Mie phase
+--   I  the isotropic second-order term
+-- so the radiance is pi (phaseR(nu) R + phaseM(nu) M + I). Tabulating the parts keeps the
+-- sharp Mie lobe out of the tables: the phase is applied analytically at lookup.
+export type Parts = { number } -- R rgb, M rgb, I rgb (9 numbers)
+
+-- Parts and chord transmittance of a ray that misses the planet: closest approach d0
+-- (>= R), a = s . v, b = s . q. `steps` samples along the chord.
+local function missParts(M: Model, d0: number, a: number, b: number, steps: number): (Parts, number, number, number)
+	local c2 = 1 - a * a - b * b
+	if c2 < 0 then
+		local bl = sqrt(1 - a * a)
+		b = if b > 0 then bl else -bl
+	end
+	local Rt, R = M.Rt, M.R
+	local t2 = Rt * Rt - d0 * d0
+	if t2 <= 0 then
+		return { 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 1, 1, 1
+	end
+	local tmax = sqrt(t2)
+	local ds = 2 * tmax / steps
+	local hr, hm = M.spec.hr, M.spec.hm
+	local ms = M.spec.ms
+	local oR, oM, oO = 0, 0, 0
+	local Rr, Rg, Rb, Mr, Mg, Mb, Ir, Ig, Ib = 0, 0, 0, 0, 0, 0, 0, 0, 0
+	local bRr, bRg, bRb, bM, bMe = M.bRr, M.bRg, M.bRb, M.bM, M.bMe
+	local bOr, bOg, bOb = M.bOr, M.bOg, M.bOb
+	local d02 = d0 * d0
+	for k = 0, steps - 1 do
+		local t = -tmax + (k + 0.5) * ds
+		local r = sqrt(d02 + t * t)
+		local h = r - R
+		if h < 0 then
+			h = 0
+		end
+		local rhoR, rhoM, rhoO = exp(-h / hr), exp(-h / hm), ozoneDensity(M, h)
+		local dR, dM, dO = rhoR * ds, rhoM * ds, rhoO * ds
+		local vR, vM, vO = oR + dR * 0.5, oM + dM * 0.5, oO + dO * 0.5
+		local tvr = exp(-(bRr * vR + bMe * vM + bOr * vO))
+		local tvg = exp(-(bRg * vR + bMe * vM + bOg * vO))
+		local tvb = exp(-(bRb * vR + bMe * vM + bOb * vO))
+		local mus = (d0 * b + t * a) / r
+		local sr, sg, sb = sunT(M, h, mus)
+		if sr > 0 or sg > 0 or sb > 0 then
+			local iso = ms / (4 * PI) * (rhoR + rhoM * bM / bRb * 0.4)
+			Rr += tvr * rhoR * bRr * sr * ds
+			Rg += tvg * rhoR * bRg * sg * ds
+			Rb += tvb * rhoR * bRb * sb * ds
+			Mr += tvr * rhoM * bM * sr * ds
+			Mg += tvg * rhoM * bM * sg * ds
+			Mb += tvb * rhoM * bM * sb * ds
+			Ir += tvr * iso * bRr * sr ^ 0.45 * ds
+			Ig += tvg * iso * bRg * sg ^ 0.45 * ds
+			Ib += tvb * iso * bRb * sb ^ 0.45 * ds
+		end
+		oR += dR
+		oM += dM
+		oO += dO
+	end
+	return { Rr * PI, Rg * PI, Rb * PI, Mr * PI, Mg * PI, Mb * PI, Ir * PI, Ig * PI, Ib * PI },
+		exp(-(bRr * oR + bMe * oM + bOr * oO)),
+		exp(-(bRg * oR + bMe * oM + bOg * oO)),
+		exp(-(bRb * oR + bMe * oM + bOb * oO))
+end
+Atmos.missParts = missParts
+
+local function compose(M: Model, p: Parts, nu: number): (number, number, number)
+	local pr, pm = phaseR(nu), phaseM(M.spec.g, nu)
+	return pr * p[1] + pm * p[4] + p[7], pr * p[2] + pm * p[5] + p[8], pr * p[3] + pm * p[6] + p[9]
+end
+
+-- Radiance (rgb) and chord transmittance of a ray that misses the planet.
+local function missRay(M: Model, d0: number, a: number, b: number, steps: number): (number, number, number, number, number, number)
+	local parts, tr, tg, tb = missParts(M, d0, a, b, steps)
+	local r, g, bl = compose(M, parts, a)
+	return r, g, bl, tr, tg, tb
+end
+Atmos.missRay = missRay
+
+-- Parts of a ray that ends on the ground: mu_v = -n . v (> 0), mu_s = n . s, nu = s . v.
+local function hitParts(M: Model, muv: number, mus0: number, nu: number, steps: number): Parts
+	if muv < 1e-4 then
+		muv = 1e-4
+	end
+	local R, Rt = M.R, M.Rt
+	local len = -R * muv + sqrt(R * R * (muv * muv - 1) + Rt * Rt)
+	if len <= 0 then
+		return { 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+	end
+	local ds = len / steps
+	local hr, hm = M.spec.hr, M.spec.hm
+	local ms = M.spec.ms
+	local oR, oM, oO = 0, 0, 0
+	local Rr, Rg, Rb, Mr, Mg, Mb, Ir, Ig, Ib = 0, 0, 0, 0, 0, 0, 0, 0, 0
+	local bRr, bRg, bRb, bM, bMe = M.bRr, M.bRg, M.bRb, M.bM, M.bMe
+	local bOr, bOg, bOb = M.bOr, M.bOg, M.bOb
+	for k = 0, steps - 1 do
+		-- from the top of the atmosphere down to the ground
+		local sd = len - (k + 0.5) * ds
+		local r2 = R * R + 2 * R * muv * sd + sd * sd
+		local r = sqrt(r2)
+		local h = r - R
+		if h < 0 then
+			h = 0
+		end
+		local rhoR, rhoM, rhoO = exp(-h / hr), exp(-h / hm), ozoneDensity(M, h)
+		local dR, dM, dO = rhoR * ds, rhoM * ds, rhoO * ds
+		local vR, vM, vO = oR + dR * 0.5, oM + dM * 0.5, oO + dO * 0.5
+		local tvr = exp(-(bRr * vR + bMe * vM + bOr * vO))
+		local tvg = exp(-(bRg * vR + bMe * vM + bOg * vO))
+		local tvb = exp(-(bRb * vR + bMe * vM + bOb * vO))
+		-- (P . s) / r with P = R z + (-v) sd: R mu_s - sd nu
+		local mus = (R * mus0 - sd * nu) / r
+		local sr, sg, sb = sunT(M, h, mus)
+		if sr > 0 or sg > 0 or sb > 0 then
+			local iso = ms / (4 * PI) * (rhoR + rhoM * bM / bRb * 0.4)
+			Rr += tvr * rhoR * bRr * sr * ds
+			Rg += tvg * rhoR * bRg * sg * ds
+			Rb += tvb * rhoR * bRb * sb * ds
+			Mr += tvr * rhoM * bM * sr * ds
+			Mg += tvg * rhoM * bM * sg * ds
+			Mb += tvb * rhoM * bM * sb * ds
+			Ir += tvr * iso * bRr * sr ^ 0.45 * ds
+			Ig += tvg * iso * bRg * sg ^ 0.45 * ds
+			Ib += tvb * iso * bRb * sb ^ 0.45 * ds
+		end
+		oR += dR
+		oM += dM
+		oO += dO
+	end
+	return { Rr * PI, Rg * PI, Rb * PI, Mr * PI, Mg * PI, Mb * PI, Ir * PI, Ig * PI, Ib * PI }
+end
+Atmos.hitParts = hitParts
+
+-- Radiance (rgb) of a ray that ends on the ground.
+local function hitRay(M: Model, muv: number, mus0: number, nu: number, steps: number): (number, number, number)
+	return compose(M, hitParts(M, muv, mus0, nu, steps), nu)
+end
+Atmos.hitRay = hitRay
+
+-- Transmittance (rgb) of the whole column from the ground to space along cosine mu_v.
+function Atmos.columnT(M: Model, muv: number): (number, number, number)
+	local a, b, c = odLookup(M, 0, if muv < 1e-4 then 1e-4 else muv)
+	return exp(-(M.bRr * a + M.bMe * b + M.bOr * c)), exp(-(M.bRg * a + M.bMe * b + M.bOg * c)), exp(-(M.bRb * a + M.bMe * b + M.bOb * c))
+end
+
+-- Sky radiance (rgb) seen from altitude h0 (inside the atmosphere) along a unit direction
+-- with elevation cosine `mu` (against the local up) and sun cosines: sunUp = s . up and
+-- the scattering cosine `nu` = s . v. Direct integration, for the ambient table and for
+-- deriving the engine's atmosphere settings.
+function Atmos.skyRay(M: Model, h0: number, mu: number, sunUp: number, nu: number, steps: number): (number, number, number)
+	local R, Rt = M.R, M.Rt
+	local r0 = R + h0
+	local disc = r0 * r0 * (mu * mu - 1) + Rt * Rt
+	if disc <= 0 then
+		return 0, 0, 0
+	end
+	local len = -r0 * mu + sqrt(disc)
+	-- a ray that meets the ground stops there
+	local hitG = r0 * r0 * (mu * mu - 1) + R * R
+	if mu < 0 and hitG >= 0 then
+		len = -r0 * mu - sqrt(hitG)
+	end
+	if len <= 0 then
+		return 0, 0, 0
+	end
+	local ds = len / steps
+	local hr, hm = M.spec.hr, M.spec.hm
+	local g = M.spec.g
+	local pR, pM = phaseR(nu), phaseM(g, nu)
+	local ms = M.spec.ms
+	local oR, oM, oO = 0, 0, 0
+	local Lr, Lg, Lb = 0, 0, 0
+	local bRr, bRg, bRb, bM, bMe = M.bRr, M.bRg, M.bRb, M.bM, M.bMe
+	local bOr, bOg, bOb = M.bOr, M.bOg, M.bOb
+	for k = 0, steps - 1 do
+		local s = (k + 0.5) * ds
+		local r = sqrt(r0 * r0 + 2 * r0 * mu * s + s * s)
+		local h = r - R
+		if h < 0 then
+			h = 0
+		end
+		local rhoR, rhoM, rhoO = exp(-h / hr), exp(-h / hm), ozoneDensity(M, h)
+		local dR, dM, dO = rhoR * ds, rhoM * ds, rhoO * ds
+		local vR, vM, vO = oR + dR * 0.5, oM + dM * 0.5, oO + dO * 0.5
+		local tvr = exp(-(bRr * vR + bMe * vM + bOr * vO))
+		local tvg = exp(-(bRg * vR + bMe * vM + bOg * vO))
+		local tvb = exp(-(bRb * vR + bMe * vM + bOb * vO))
+		-- local sun cosine: (P . s) / r, P = r0 up + v s, with up . s = sunUp and v . s = nu
+		local mus = (r0 * sunUp + s * nu) / r
+		local sr, sg, sb = sunT(M, h, mus)
+		if sr > 0 or sg > 0 or sb > 0 then
+			local mie = rhoM * bM * pM
+			local fr = rhoR * bRr * pR + mie
+			local fg = rhoR * bRg * pR + mie
+			local fb = rhoR * bRb * pR + mie
+			local iso = ms / (4 * PI) * (rhoR + rhoM * bM / bRb * 0.4)
+			Lr += tvr * (fr * sr + iso * bRr * sr ^ 0.45) * ds
+			Lg += tvg * (fg * sg + iso * bRg * sg ^ 0.45) * ds
+			Lb += tvb * (fb * sb + iso * bRb * sb ^ 0.45) * ds
+		end
+		oR += dR
+		oM += dM
+		oO += dO
+	end
+	return Lr * PI, Lg * PI, Lb * PI
+end
+
+----------------------------------------------------------------------------------------
+-- table builders (slices, so workers can share the work)
+----------------------------------------------------------------------------------------
+
+local function dOf(M: Model, i: number): number
+	local u = i / (M.ND - 1)
+	return M.R + M.H * u * u * 0.9999 + 1e-3
+end
+
+local function writeParts(buf: buffer, n: number, p: Parts)
+	for q = 1, 9 do
+		buffer.writef32(buf, (n + q - 1) * 4, p[q])
+	end
+end
+
+-- d0 rows [i0, i1) of the miss table: an f32 buffer of (i1 - i0) * NA * NB * 9 numbers.
+function Atmos.buildMiss(M: Model, i0: number, i1: number): buffer
+	local out = buffer.create((i1 - i0) * M.NA * M.NB * 9 * 4)
+	local n = 0
+	for i = i0, i1 - 1 do
+		local d0 = dOf(M, i)
+		for j = 0, M.NA - 1 do
+			-- a = cos(angle) with the angle uniform: dense where the sun is along the ray, where
+			-- the planet's shadow edge makes the radiance change fastest
+			local ang = math.pi * j / (M.NA - 1)
+			local a = math.cos(ang)
+			local bl = math.sin(ang)
+			for k = 0, M.NB - 1 do
+				local b = bl * (-1 + 2 * k / (M.NB - 1)) -- b in its feasible interval
+				local parts = missParts(M, d0, a, b, M.steps)
+				writeParts(out, n, parts)
+				n += 9
+			end
+		end
+	end
+	return out
+end
+
+-- Chord transmittance per d0 row (rgb); cheap.
+function Atmos.buildChord(M: Model): { number }
+	local out = table.create(M.ND * 3, 0)
+	for i = 0, M.ND - 1 do
+		local _, tr, tg, tb = missParts(M, dOf(M, i), 1, 0, 8)
+		out[i * 3 + 1], out[i * 3 + 2], out[i * 3 + 3] = tr, tg, tb
+	end
+	return out
+end
+
+local function muvOf(M: Model, i: number): number
+	local u = i / (M.NMV - 1)
+	return 0.02 + 0.98 * u * u -- dense near grazing views
+end
+
+local function musOf(M: Model, j: number): number
+	local u = j / (M.NMS - 1) * 2 - 1
+	-- dense around the terminator
+	return if u < 0 then -(-u) ^ 0.7 else u ^ 0.7
+end
+
+-- mu_v rows [i0, i1) of the hit table: an f32 buffer of (i1 - i0) * NMS * NNU * 9 numbers.
+-- The table is indexed by (mu_v, mu_s, tau) with tau in [-1, 1] the position of nu inside
+-- its feasible interval, so that every entry is a real geometry (nu itself is not
+-- independent of the other two cosines).
+function Atmos.buildHit(M: Model, i0: number, i1: number): buffer
+	local out = buffer.create((i1 - i0) * M.NMS * M.NNU * 9 * 4)
+	local n = 0
+	for i = i0, i1 - 1 do
+		local muv = muvOf(M, i)
+		local sinA = sqrt(1 - muv * muv)
+		for j = 0, M.NMS - 1 do
+			local mus = musOf(M, j)
+			local lim = sqrt(math.max(0, 1 - mus * mus))
+			for k = 0, M.NNU - 1 do
+				local tau = -1 + 2 * k / (M.NNU - 1)
+				local nu = tau * lim * sinA - muv * mus
+				writeParts(out, n, hitParts(M, muv, mus, nu, M.steps))
+				n += 9
+			end
+		end
+	end
+	return out
+end
+
+-- Ambient sky irradiance on the ground / pi (rgb) by mu_s: the radiance a white Lambert
+-- surface of albedo 1 returns from the sky alone. Zero when no sunlit air is above.
+function Atmos.buildAmbient(M: Model): { number }
+	local out = table.create(M.NAM * 3, 0)
+	local elevations = { 15 / 180 * PI, 45 / 180 * PI, 75 / 180 * PI }
+	local dE = 30 / 180 * PI
+	for i = 0, M.NAM - 1 do
+		local mus = -1 + 2 * i / (M.NAM - 1)
+		local sx = sqrt(math.max(0, 1 - mus * mus))
+		local Er, Eg, Eb = 0, 0, 0
+		for _, el in elevations do
+			local sinE, cosE = math.sin(el), math.cos(el)
+			for q = 0, 7 do
+				local ph = (q + 0.5) * PI / 4
+				-- v = (cosE cos ph, cosE sin ph, sinE); s = (sx, 0, mus)
+				local nu = cosE * math.cos(ph) * sx + sinE * mus
+				local r, g, b = Atmos.skyRay(M, 0, sinE, mus, nu, 14)
+				local w = sinE * cosE * dE * (PI / 4)
+				Er += r * w
+				Eg += g * w
+				Eb += b * w
+			end
+		end
+		out[i * 3 + 1], out[i * 3 + 2], out[i * 3 + 3] = Er / PI, Eg / PI, Eb / PI
+	end
+	return out
+end
+
+-- Joins buffers (slices of a table, in order) into one.
+function Atmos.concat(parts: { buffer }): buffer
+	local total = 0
+	for _, p in parts do
+		total += buffer.len(p)
+	end
+	local out = buffer.create(total)
+	local o = 0
+	for _, p in parts do
+		buffer.copy(out, o, p)
+		o += buffer.len(p)
+	end
+	return out
+end
+
+-- Installs finished tables into the model.
+function Atmos.install(M: Model, miss: buffer, chord: { number }, hit: buffer, amb: { number })
+	assert(buffer.len(miss) == M.ND * M.NA * M.NB * 9 * 4, "miss table size")
+	assert(#chord == M.ND * 3, "chord table size")
+	assert(buffer.len(hit) == M.NMV * M.NMS * M.NNU * 9 * 4, "hit table size")
+	assert(#amb == M.NAM * 3, "ambient table size")
+	M.miss, M.tMiss, M.hit, M.amb = miss, chord, hit, amb
+end
+
+-- Builds every table inline (tests, serial fallback).
+function Atmos.buildAll(M: Model)
+	local miss = Atmos.buildMiss(M, 0, M.ND)
+	local hit = Atmos.buildHit(M, 0, M.NMV)
+	Atmos.install(M, miss, Atmos.buildChord(M), hit, Atmos.buildAmbient(M))
+end
+
+----------------------------------------------------------------------------------------
+-- lookups
+----------------------------------------------------------------------------------------
+
+-- Radiance and chord transmittance for a ray that misses the planet (trilinear lookup of
+-- the three phase-free parts, then the analytic phases).
+function Atmos.lookMiss(M: Model, d0: number, a: number, b: number): (number, number, number, number, number, number)
+	local tab = M.miss :: buffer
+	local ch = M.tMiss :: { number }
+	local u = sqrt(math.max(0, (d0 - M.R) / (M.H * 0.9999)))
+	if u > 1 then
+		return 0, 0, 0, 1, 1, 1
+	end
+	local fi = u * (M.ND - 1)
+	local i = floor(fi)
+	if i > M.ND - 2 then
+		i = M.ND - 2
+	end
+	local fx = fi - i
+	if a > 1 then
+		a = 1
+	elseif a < -1 then
+		a = -1
+	end
+	local bl = sqrt(math.max(0, 1 - a * a))
+	local bn = if bl > 1e-6 then b / bl else 0
+	if bn > 1 then
+		bn = 1
+	elseif bn < -1 then
+		bn = -1
+	end
+	local fj = math.acos(a) / PI * (M.NA - 1)
+	local j = floor(fj)
+	if j > M.NA - 2 then
+		j = M.NA - 2
+	end
+	local fy = fj - j
+	local fk = (bn + 1) * 0.5 * (M.NB - 1)
+	local k = floor(fk)
+	if k > M.NB - 2 then
+		k = M.NB - 2
+	end
+	local fz = fk - k
+	local NA, NB = M.NA, M.NB
+	local P1, P2, P3, P4, P5, P6, P7, P8, P9 = 0, 0, 0, 0, 0, 0, 0, 0, 0
+	for di = 0, 1 do
+		local wi = if di == 0 then 1 - fx else fx
+		for dj = 0, 1 do
+			local wj = if dj == 0 then 1 - fy else fy
+			local base = (((i + di) * NA + (j + dj)) * NB + k) * 36
+			local w0 = wi * wj * (1 - fz)
+			local w1 = wi * wj * fz
+			P1 += buffer.readf32(tab, base) * w0 + buffer.readf32(tab, base + 36) * w1
+			P2 += buffer.readf32(tab, base + 4) * w0 + buffer.readf32(tab, base + 40) * w1
+			P3 += buffer.readf32(tab, base + 8) * w0 + buffer.readf32(tab, base + 44) * w1
+			P4 += buffer.readf32(tab, base + 12) * w0 + buffer.readf32(tab, base + 48) * w1
+			P5 += buffer.readf32(tab, base + 16) * w0 + buffer.readf32(tab, base + 52) * w1
+			P6 += buffer.readf32(tab, base + 20) * w0 + buffer.readf32(tab, base + 56) * w1
+			P7 += buffer.readf32(tab, base + 24) * w0 + buffer.readf32(tab, base + 60) * w1
+			P8 += buffer.readf32(tab, base + 28) * w0 + buffer.readf32(tab, base + 64) * w1
+			P9 += buffer.readf32(tab, base + 32) * w0 + buffer.readf32(tab, base + 68) * w1
+		end
+	end
+	local pr, pm = phaseR(a), phaseM(M.spec.g, a)
+	local c0, c1 = i * 3, (i + 1) * 3
+	return pr * P1 + pm * P4 + P7,
+		pr * P2 + pm * P5 + P8,
+		pr * P3 + pm * P6 + P9,
+		ch[c0 + 1] + (ch[c1 + 1] - ch[c0 + 1]) * fx,
+		ch[c0 + 2] + (ch[c1 + 2] - ch[c0 + 2]) * fx,
+		ch[c0 + 3] + (ch[c1 + 3] - ch[c0 + 3]) * fx
+end
+
+-- Radiance for a ray that ends on the ground.
+function Atmos.lookHit(M: Model, muv: number, mus: number, nu: number): (number, number, number)
+	local tab = M.hit :: buffer
+	local NMV, NMS, NNU = M.NMV, M.NMS, M.NNU
+	local uv = sqrt(math.max(0, (muv - 0.02) / 0.98))
+	local fi = uv * (NMV - 1)
+	local i = floor(fi)
+	if i > NMV - 2 then
+		i = NMV - 2
+	end
+	local fx = fi - i
+	if mus > 1 then
+		mus = 1
+	elseif mus < -1 then
+		mus = -1
+	end
+	local su = if mus < 0 then -((-mus) ^ (1 / 0.7)) else mus ^ (1 / 0.7)
+	local fj = (su + 1) * 0.5 * (NMS - 1)
+	local j = floor(fj)
+	if j > NMS - 2 then
+		j = NMS - 2
+	end
+	local fy = fj - j
+	-- position of nu in its feasible interval for this geometry
+	local sinA = sqrt(math.max(0, 1 - muv * muv))
+	local lim = sqrt(math.max(0, 1 - mus * mus)) * sinA
+	local tau = 0
+	if lim > 1e-6 then
+		tau = (nu + muv * mus) / lim
+		if tau > 1 then
+			tau = 1
+		elseif tau < -1 then
+			tau = -1
+		end
+	end
+	local fk = (tau + 1) * 0.5 * (NNU - 1)
+	local k = floor(fk)
+	if k > NNU - 2 then
+		k = NNU - 2
+	end
+	local fz = fk - k
+	local P1, P2, P3, P4, P5, P6, P7, P8, P9 = 0, 0, 0, 0, 0, 0, 0, 0, 0
+	for di = 0, 1 do
+		local wi = if di == 0 then 1 - fx else fx
+		for dj = 0, 1 do
+			local wj = if dj == 0 then 1 - fy else fy
+			local base = (((i + di) * NMS + (j + dj)) * NNU + k) * 36
+			local w0 = wi * wj * (1 - fz)
+			local w1 = wi * wj * fz
+			P1 += buffer.readf32(tab, base) * w0 + buffer.readf32(tab, base + 36) * w1
+			P2 += buffer.readf32(tab, base + 4) * w0 + buffer.readf32(tab, base + 40) * w1
+			P3 += buffer.readf32(tab, base + 8) * w0 + buffer.readf32(tab, base + 44) * w1
+			P4 += buffer.readf32(tab, base + 12) * w0 + buffer.readf32(tab, base + 48) * w1
+			P5 += buffer.readf32(tab, base + 16) * w0 + buffer.readf32(tab, base + 52) * w1
+			P6 += buffer.readf32(tab, base + 20) * w0 + buffer.readf32(tab, base + 56) * w1
+			P7 += buffer.readf32(tab, base + 24) * w0 + buffer.readf32(tab, base + 60) * w1
+			P8 += buffer.readf32(tab, base + 28) * w0 + buffer.readf32(tab, base + 64) * w1
+			P9 += buffer.readf32(tab, base + 32) * w0 + buffer.readf32(tab, base + 68) * w1
+		end
+	end
+	local pr, pm = phaseR(nu), phaseM(M.spec.g, nu)
+	return pr * P1 + pm * P4 + P7, pr * P2 + pm * P5 + P8, pr * P3 + pm * P6 + P9
+end
+
+-- Sky irradiance / pi (rgb) on the ground for sun cosine mu_s.
+function Atmos.ambient(M: Model, mus: number): (number, number, number)
+	local tab = M.amb :: { number }
+	local f = (mus + 1) * 0.5 * (M.NAM - 1)
+	if f < 0 then
+		f = 0
+	end
+	local i = floor(f)
+	if i > M.NAM - 2 then
+		i = M.NAM - 2
+	end
+	local t = f - i
+	local a, b = i * 3, (i + 1) * 3
+	return tab[a + 1] + (tab[b + 1] - tab[a + 1]) * t, tab[a + 2] + (tab[b + 2] - tab[a + 2]) * t, tab[a + 3] + (tab[b + 3] - tab[a + 3]) * t
+end
+
+-- Sunlight at altitude h with local sun cosine mu: rgb transmittance times 1 (the Lambert
+-- convention: radiance of albedo-1 facing the sun).
+function Atmos.sunlight(M: Model, h: number, mu: number): (number, number, number)
+	return sunT(M, h, mu)
+end
+
+----------------------------------------------------------------------------------------
+-- display
+----------------------------------------------------------------------------------------
+
+-- ACES filmic fit (Narkowicz): 0 maps to exactly 0.
+local function aces(x: number): number
+	if x <= 0 then
+		return 0
+	end
+	local v = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)
+	return if v > 1 then 1 else v
+end
+
+-- sRGB encode of a linear value in [0, 1]; 0 -> 0.
+local function srgb(v: number): number
+	if v <= 0 then
+		return 0
+	end
+	if v >= 1 then
+		return 1
+	end
+	if v <= 0.0031308 then
+		return v * 12.92
+	end
+	return 1.055 * v ^ (1 / 2.4) - 0.055
+end
+
+-- Linear HDR radiance (rgb) to 0..1 display values: exposure, filmic curve, sRGB.
+function Atmos.tonemap(r: number, g: number, b: number, exposure: number): (number, number, number)
+	return srgb(aces(r * exposure)), srgb(aces(g * exposure)), srgb(aces(b * exposure))
+end
+
+----------------------------------------------------------------------------------------
+-- registry: one model per body in this Luau state (every worker Actor has its own)
+----------------------------------------------------------------------------------------
+
+-- Table quality used by the planets place (dims scale with it; tests use less).
+Atmos.QUALITY = 1.5
+
+Atmos.models = {} :: { [string]: Model }
+
+function Atmos.specFor(id: string): Spec?
+	if id == "terra" then
+		return Atmos.terra()
+	elseif id == "saturnia" then
+		return Atmos.saturnia()
+	end
+	return nil
+end
+
+-- The installed model of a body, or nil.
+function Atmos.get(id: string): Model?
+	local M = Atmos.models[id]
+	if M and M.miss then
+		return M
+	end
+	return nil
+end
+
+-- Model of a body with its tables, built inline when absent (serial fallback, tests).
+function Atmos.ensure(id: string, quality: number?): Model?
+	local have = Atmos.get(id)
+	if have then
+		return have
+	end
+	local spec = Atmos.specFor(id)
+	if not spec then
+		return nil
+	end
+	local M = Atmos.new(spec, quality or Atmos.QUALITY)
+	Atmos.buildAll(M)
+	Atmos.models[id] = M
+	return M
+end
+
+-- Installs tables sent by the table jobs (see PlanetJobs): creates the model if needed.
+function Atmos.installFor(id: string, quality: number, miss: buffer, chord: { number }, hit: buffer, amb: { number }): boolean
+	local spec = Atmos.specFor(id)
+	if not spec then
+		return false
+	end
+	local M = Atmos.new(spec, quality)
+	Atmos.install(M, miss, chord, hit, amb)
+	Atmos.models[id] = M
+	return true
+end
+
+return Atmos
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="13">
+        <Properties>
           <string name="Name">Bodies</string>
           <string name="Source"><![CDATA[--!strict
 --!native
@@ -632,7 +1538,7 @@ local terra: Body = {
 	maxHeight = 90,
 	sea = true,
 	fields = fields(11, 6),
-	atmosphere = { r = 0.36, g = 0.62, b = 1.0, thickness = 0.065, strength = 1.0 },
+	atmosphere = { r = 0.36, g = 0.62, b = 1.0, thickness = 0.081, strength = 1.0 }, -- thickness = Atmos.terra().H / radius
 	rings = nil,
 	coarse = terraCoarse,
 	height = terraHeight,
@@ -674,7 +1580,7 @@ local saturnia: Body = {
 	maxHeight = 0,
 	sea = false,
 	fields = fields(37, 1),
-	atmosphere = { r = 0.95, g = 0.85, b = 0.65, thickness = 0.025, strength = 0.6 },
+	atmosphere = { r = 0.95, g = 0.85, b = 0.65, thickness = 0.0375, strength = 0.6 }, -- Atmos.saturnia().H / radius
 	rings = buildRings(37),
 	coarse = gasCoarse,
 	height = gasHeight,
@@ -699,7 +1605,7 @@ return Bodies
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="13">
+      <Item class="ModuleScript" referent="14">
         <Properties>
           <string name="Name">Clouds</string>
           <string name="Source"><![CDATA[--!strict
@@ -777,7 +1683,7 @@ return Clouds
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="14">
+      <Item class="ModuleScript" referent="15">
         <Properties>
           <string name="Name">Config</string>
           <string name="Source"><![CDATA[--!strict
@@ -791,9 +1697,16 @@ return Clouds
 return {
 	-- SURFACE (Terra and Selene meshes)
 	splitPx = 1.6, -- split a patch while one texel covers more than this many screen pixels (lower = sharper)
-	capacity = 200, -- most patches shown at once; cannot exceed 256 (the atlas has 256 tiles; 9 MB)
+	capacity = 100000, -- most patches shown at once (limited by the slots: 256 per atlas set)
+	atlasSets = 2, -- atlas sets (9 MB each, 256 patch tiles each). More sets = more tiles = finer
+	-- ground: one set reaches texel 0.16 studs at 25 studs up, two 0.08, four 0.04. If the memory
+	-- budget refuses a set, the surface keeps the sets it has
+	slotsPerMesh = 256, -- patch slots per EditableMesh (256 = one mesh per set; the pool halves it
+	-- by itself if the engine refuses a mesh that large)
+	morphSeconds = 0.45, -- a new patch slides from the old surface to its own over this long
+	morphPerFrame = 6, -- patches whose vertices are rewritten per frame while sliding
 	stressSplitPx = 0.8, -- the B key
-	stressCapacity = 240,
+	stressCapacity = 100000,
 	maxLevelTerra = 11, -- deepest quadtree level (level 11 = 0.02 studs per texel on Terra)
 	maxLevelOther = 10,
 	meshOn = 2.0, -- distance / radius under which a rocky body switches from billboard to mesh
@@ -802,7 +1715,10 @@ return {
 	-- FAR BODIES (billboards)
 	sphereCacheN = 128, -- texels per cube-face edge of the lookup cache; 256 = twice as sharp from orbit,
 	-- but each of the workers keeps ~10 MB (3 bodies); 128 = ~2.4 MB each
-	impostorMax = 512, -- largest billboard image (power of two, 32 to 1024); 1024 = 4 MB per body instead of 1 MB
+	impostorMax = 1024, -- largest billboard (power of two, 32 to 2048). Beyond 1024 a billboard is a
+	-- 2 x 2 grid of 1024 images (16 MB per body at 2048, uploaded over four frames). A full
+	-- 2048 render takes about 3 s across six interpreted workers; 1024 takes about 0.8 s.
+	exposure = 0.55, -- scene exposure before the filmic curve (lower = darker; black stays black)
 
 	-- SPACE
 	skyFace = 512, -- star skybox face size (up to 1024; 1024 = 24 MB instead of 6 MB)
@@ -814,7 +1730,7 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="15">
+      <Item class="ModuleScript" referent="16">
         <Properties>
           <string name="Name">CubeSphere</string>
           <string name="Source"><![CDATA[--!strict
@@ -957,7 +1873,7 @@ return CubeSphere
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="16">
+      <Item class="ModuleScript" referent="17">
         <Properties>
           <string name="Name">Impostor</string>
           <string name="Source"><![CDATA[--!strict
@@ -968,27 +1884,33 @@ return CubeSphere
 -- Raytraces a body into an EditableImage shown on a camera-facing BillboardGui. The
 -- billboard is a square of half-size `half` studs through the body's centre, spanned by
 -- the camera's right and up axes; pixel (x, y) is the ray from the camera through the
--- billboard point under it. Because every ray uses the true geometry, the silhouette,
--- phase, rings and atmosphere are exactly right for the current view, at any distance and
--- off-axis, and the billboard can be drawn nearer the camera at a reduced size (scaled
--- space) without changing the image.
+-- billboard point under it, so silhouette, phase, rings and atmosphere are exact for the
+-- current view at any distance, and the billboard can be drawn nearer the camera at a
+-- reduced size (scaled space) without changing the image.
 --
--- Exact anti-aliasing, the project's axioms applied to a sphere:
---   limb   the distance from the centre to the ray, d, minus the radius is a signed
---          distance in studs; divided by its per-pixel change (central differences of d
---          over neighbouring rays) it is a signed distance in pixels, and the disc's share
---          of the pixel is the exact area MyMath.coverageHalfPlane gives against the limb's
---          tangent line.
---   rings  the ring radius under the pixel spans an interval (its per-pixel change); the
---          ring's opacity and colour are the exact box filter of the profile over that
---          interval (Bodies.ringAt, prefix integrals). Gaps narrower than a pixel dim it by
---          their share instead of shimmering.
--- Lighting: Lambert on the cached normal with a soft terminator, Blinn-Phong glint on
--- smooth (water) texels, ring shadows on the planet, the planet's shadow on the rings,
--- clouds lit by the sphere normal, and an atmosphere rim lit on the day side.
+-- LIGHT. Everything is computed in linear radiance and tone mapped once at the end
+-- (Atmos.tonemap: exposure, ACES fit, sRGB; 0 stays exactly 0). Units: a Lambert surface
+-- of albedo A facing the unobstructed sun has radiance A.
+--   surface   A (T_sun(mu_s) max(0, n . s) + ambient(mu_s)): sunlight reddened by the air
+--             it crosses, so the terminator turns orange, and exactly nothing on the night
+--             side (the ambient table is exactly zero there)
+--   air       a ray that ends on the ground adds the tabulated in-scatter and dims the
+--             surface by the column's transmittance; a ray that grazes past the planet
+--             reads the limb table: the blue halo, the orange rim against the sun, Mie glare
+--   clouds    a shell above the surface, found by intersecting the ray with it (so clouds
+--             shift against the ground with the view, parallax), lit through the air at
+--             their height, self-shadowed by sampling the cloud field one step towards
+--             the sun, with a silver lining when backlit; they shadow the ground the same way
+--   rings     radii box-filtered exactly over the pixel (no shimmer in gaps), lit by the sun
+--             at the ring plane, exactly dark in the planet's shadow
+-- Exact anti-aliasing of the limb as before (MyMath.coverageHalfPlane on the distance
+-- from the centre to the ray). The image is premultiplied-composited back to front and
+-- written as straight alpha: planet coverage is the alpha of the disc; a faint halo has
+-- a small alpha so stars show through it.
 
 local Bodies = require("./Bodies")
 local SphereCache = require("./SphereCache")
+local Atmos = require("./Atmos")
 local MyMath = require("../Universe/MyMath")
 
 local Impostor = {}
@@ -1010,17 +1932,16 @@ export type Params = {
 	sy: number,
 	sz: number,
 	cloudAngle: number, -- cloud layer rotation about +Y (radians)
+	exposure: number?, -- default 1
+	cloudHeight: number?, -- studs above the surface (default 16)
 }
 
 local sqrt = math.sqrt
 local smoothstep = MyMath.smoothstep
 local coverageHalfPlane = MyMath.coverageHalfPlane
 local sample, cloudAt = SphereCache.sample, SphereCache.cloud
-
-local function byte(v: number): number
-	local q = (v * 255 + 0.5) // 1
-	return if q < 0 then 0 elseif q > 255 then 255 else q
-end
+local tonemap = Atmos.tonemap
+local hash2 = MyMath.hash2
 
 -- Half-size (studs) of the billboard that contains the body plus `extra` radii (atmosphere,
 -- rings) seen from distance D: the tangent cone of that sphere crosses the billboard plane
@@ -1040,6 +1961,11 @@ function Impostor.halfSize(radius: number, extra: number, D: number, n: number?)
 	return r * D / sqrt(D * D - r * r) * margin
 end
 
+local function byteOf(v: number): number
+	local q = (v * 255 + 0.5) // 1
+	return if q < 0 then 0 elseif q > 255 then 255 else q
+end
+
 -- Renders rows [y0, y1) of the n x n image into `out` (RGBA8, straight alpha). With
 -- `bandStart`, `out` holds only a band of rows starting at that row (worker jobs return
 -- bands); otherwise it is the whole image.
@@ -1047,21 +1973,26 @@ function Impostor.render(out: buffer, p: Params, cache: SphereCache.Cache?, y0: 
 	local base = bandStart or 0
 	local B = Bodies.get(p.body)
 	local R = B.radius
+	local A = Atmos.get(p.body)
 	local n = p.n
 	local cx, cy, cz = p.cx, p.cy, p.cz
 	local rx, ry, rz, ux, uy, uz = p.rx, p.ry, p.rz, p.ux, p.uy, p.uz
 	local half = p.half
 	local sx, sy, sz = p.sx, p.sy, p.sz
+	local exposure = p.exposure or 1
 	local cc = cx * cx + cy * cy + cz * cz
 	local c2 = cc - R * R
-	local atm = B.atmosphere
-	local Ra = if atm then R * (1 + atm.thickness) else R
+	local Rt = if A then A.Rt else R
 	local rings = B.rings
 	local terra = p.body == "terra"
+	local gas = B.kind == "gas"
 	local cosA, sinA = math.cos(p.cloudAngle), math.sin(p.cloudAngle)
-	local pix = 2 * half / n -- billboard pixel size (studs)
+	local pix = 2 * half / n
+	local hC = p.cloudHeight or 16
+	local Rc = R + hC
+	local useClouds = terra and cache ~= nil
+	local hasSea = B.sea
 
-	-- direction of the ray through pixel centre (x + 0.5, y + 0.5)
 	local function ray(x: number, y: number): (number, number, number)
 		local qx = ((x + 0.5) / n * 2 - 1) * half
 		local qy = (1 - (y + 0.5) / n * 2) * half
@@ -1071,40 +2002,15 @@ function Impostor.render(out: buffer, p: Params, cache: SphereCache.Cache?, y0: 
 		local l = sqrt(dx * dx + dy * dy + dz * dz)
 		return dx / l, dy / l, dz / l
 	end
-	-- distance from the centre to the ray's line
 	local function perp(dx: number, dy: number, dz: number): number
 		local b = cx * dx + cy * dy + cz * dz
 		local q = cc - b * b
 		return if q > 0 then sqrt(q) else 0
 	end
-	-- ring radius (body radii) where the ray crosses the ring plane, or -1
 	local nrx, nry, nrz = 0, 1, 0
 	if rings then
 		nrx, nry, nrz = rings.nx, rings.ny, rings.nz
 	end
-	-- Atmosphere brightness 0..1 for a ray passing at distance d from the centre: density
-	-- (1 - altitude / thickness) integrated along the chord through the shell (both sides of
-	-- the closest approach for a ray that misses, the near side only for one that hits),
-	-- normalised so the grazing ray is 1, then saturated as 1 - 1 / (1 + 3 tau).
-	local Ra2, R2 = Ra * Ra, R * R
-	local norm = if atm then 2 * sqrt(Ra2 - R2) * 0.5 else 1
-	local function atmGlow(d: number, hits: boolean): number
-		if not atm then
-			return 0
-		end
-		local d2 = d * d
-		local outer = if Ra2 > d2 then sqrt(Ra2 - d2) else 0
-		local inner = if R2 > d2 then sqrt(R2 - d2) else 0
-		-- mean density along the chord is about (1 - (d - R) / (Ra - R)) / 2 for a miss
-		local path = if hits then outer - inner else 2 * outer
-		local alt = (d - R) / (Ra - R)
-		if alt < 0 then
-			alt = 0
-		end
-		local tau = path / norm * (1 - alt) * 0.5
-		return (1 - 1 / (1 + 3 * tau)) * atm.strength
-	end
-
 	local function ringHit(dx: number, dy: number, dz: number): (number, number)
 		local den = dx * nrx + dy * nry + dz * nrz
 		if den > -1e-12 and den < 1e-12 then
@@ -1117,36 +2023,30 @@ function Impostor.render(out: buffer, p: Params, cache: SphereCache.Cache?, y0: 
 		local qx, qy, qz = cx + dx * t, cy + dy * t, cz + dz * t
 		return sqrt(qx * qx + qy * qy + qz * qz) / R, t
 	end
+	-- cloud cover at a unit direction of the (rotating) shell
+	local function cloudCover(hx: number, hy: number, hz: number): number
+		local qx = hx * cosA - hz * sinA
+		local qz = hx * sinA + hz * cosA
+		return cloudAt(cache :: SphereCache.Cache, qx, hy, qz)
+	end
 
 	for y = y0, y1 - 1 do
 		for x = 0, n - 1 do
 			local dx, dy, dz = ray(x, y)
 			local b = cx * dx + cy * dy + cz * dz
 			local d0 = perp(dx, dy, dz)
-			-- premultiplied accumulation, back to front
-			local ar, ag, ab, aa = 0, 0, 0, 0
-			local disc = b * b - c2
 			local tHit = math.huge
-			if disc >= 0 then
+			local disc = b * b - c2
+			if disc >= 0 and b < 0 then
 				local t = -b - sqrt(disc)
 				if t > 0 then
 					tHit = t
 				end
 			end
-			-- planet coverage of the pixel (exact area against the limb's tangent line)
-			local cov = if tHit < math.huge then 1 else 0
-			if d0 - R < 3 * pix and R - d0 < 3 * pix and b < 0 then
-				local ex, ey, ez = ray(x + 1, y)
-				local fx, fy, fz = ray(x, y + 1)
-				local gx = perp(ex, ey, ez) - d0
-				local gy = perp(fx, fy, fz) - d0
-				local g = sqrt(gx * gx + gy * gy)
-				if g > 1e-12 then
-					cov = coverageHalfPlane((d0 - R) / g, gx / g, gy / g)
-				end
-			end
-			-- rings: hit, footprint, box-filtered profile
-			local ringA, ringR, ringG, ringB, ringT = 0, 0, 0, 0, 0
+			local hits = tHit < math.huge
+			-- anything here at all? (the planet, its air, its clouds, its rings)
+			local near = d0 < Rt + 2 * pix or d0 < Rc + 2 * pix
+			local ringR, ringG, ringB, ringA, ringT = 0, 0, 0, 0, 0
 			if rings then
 				local rr, t = ringHit(dx, dy, dz)
 				if rr > 0 and rr > rings.inner - 0.1 and rr < rings.outer + 0.1 then
@@ -1159,12 +2059,12 @@ function Impostor.render(out: buffer, p: Params, cache: SphereCache.Cache?, y0: 
 					if dens > 0 then
 						local qx, qy, qz = cx + dx * t, cy + dy * t, cz + dz * t
 						local ndl = nrx * sx + nry * sy + nrz * sz
-						local lit = 0.22 + 0.78 * math.abs(ndl)
-						-- the planet's shadow on the rings
+						local lit = 0.18 + 0.82 * math.abs(ndl)
+						-- the planet's shadow on the rings: exactly dark
 						local bq = qx * sx + qy * sy + qz * sz
 						local cq = qx * qx + qy * qy + qz * qz - R * R
 						if bq < 0 and bq * bq - cq > 0 then
-							lit *= 0.07
+							lit = 0
 						end
 						ringA = dens * 0.95
 						ringR, ringG, ringB = cr * lit, cg * lit, cb * lit
@@ -1172,121 +2072,222 @@ function Impostor.render(out: buffer, p: Params, cache: SphereCache.Cache?, y0: 
 					end
 				end
 			end
-			local ringFront = ringA > 0 and ringT < tHit
-			if ringA > 0 and not ringFront then
-				ar, ag, ab, aa = ringR * ringA, ringG * ringA, ringB * ringA, ringA
-			end
-			-- atmosphere around the limb: light scattered along the ray's path through the
-			-- shell, weighted by density (falling linearly with altitude) and lit by the
-			-- sun at the ray's closest approach
-			if atm and d0 < Ra and b < 0 and cov < 1 then
-				local glow = atmGlow(d0, false)
-				local px, py, pz = cx + dx * -b, cy + dy * -b, cz + dz * -b
-				local pl = sqrt(px * px + py * py + pz * pz)
-				local sdl = if pl > 0 then (px * sx + py * sy + pz * sz) / pl else 0
-				glow *= smoothstep(-0.3, 0.35, sdl)
-				local ga = glow * (1 - cov)
-				ar = atm.r * ga + ar * (1 - ga)
-				ag = atm.g * ga + ag * (1 - ga)
-				ab = atm.b * ga + ab * (1 - ga)
-				aa = ga + aa * (1 - ga)
-			end
-			-- the planet
-			if cov > 0 then
-				-- surface point: the hit, or the closest approach for limb pixels whose centre misses
-				local px, py, pz
-				if tHit < math.huge then
-					px, py, pz = cx + dx * tHit, cy + dy * tHit, cz + dz * tHit
-				else
-					px, py, pz = cx - dx * b, cy - dy * b, cz - dz * b
+			local pr, pg, pb, pa = 0, 0, 0, 0 -- premultiplied display colour and alpha so far
+			if near or ringA > 0 then
+				local t0 = -b -- parameter of the closest approach
+				-- ---- the planet disc (exact coverage) and its air
+				local cov = if hits then 1 else 0
+				if d0 - R < 3 * pix and R - d0 < 3 * pix and b < 0 then
+					local ex, ey, ez = ray(x + 1, y)
+					local fx, fy, fz = ray(x, y + 1)
+					local gx = perp(ex, ey, ez) - d0
+					local gy = perp(fx, fy, fz) - d0
+					local g = sqrt(gx * gx + gy * gy)
+					if g > 1e-12 then
+						cov = coverageHalfPlane((d0 - R) / g, gx / g, gy / g)
+					end
 				end
-				local pl = sqrt(px * px + py * py + pz * pz)
-				local hx, hy, hz = px / pl, py / pl, pz / pl
-				local alr, alg, alb, rough, nx, ny, nz = 0.5, 0.5, 0.5, 0.9, hx, hy, hz
-				if cache then
-					alr, alg, alb, rough, nx, ny, nz = sample(cache, hx, hy, hz)
+				-- ring behind the body (farther than the closest approach)
+				local ringBehind = ringA > 0 and ringT >= t0
+				local backR, backG, backB, backA = 0, 0, 0, 0
+				if ringBehind then
+					local ar, ag, ab = tonemap(ringR, ringG, ringB, exposure)
+					backR, backG, backB, backA = ar * ringA, ag * ringA, ab * ringA, ringA
 				end
-				local sdl = hx * sx + hy * sy + hz * sz
-				local term = smoothstep(-0.06, 0.1, sdl)
-				local ndl = nx * sx + ny * sy + nz * sz
-				local diffuse = (if ndl > 0 then ndl else 0) * term
-				-- ring shadow on the planet
-				if rings then
-					local den = sx * nrx + sy * nry + sz * nrz
-					if den > 1e-9 or den < -1e-9 then
-						local t = -(px * nrx + py * nry + pz * nrz) / den
-						if t > 0 then
-							local qx, qy, qz = px + sx * t, py + sy * t, pz + sz * t
-							local rr = sqrt(qx * qx + qy * qy + qz * qz) / R
-							local dens = Bodies.ringAt(rings, rr, rr)
-							diffuse *= 1 - 0.85 * dens
+				local planetR, planetG, planetB = 0, 0, 0
+				-- clouds: the ray against the shell at R + hC
+				local cl, clR, clG, clB = 0, 0, 0, 0
+				if useClouds and d0 < Rc and b < 0 then
+					local dcl = Rc * Rc - d0 * d0
+					local tc = -b - sqrt(dcl)
+					if tc > 0 and (not hits or tc < tHit) then
+						local qx, qy, qz = (cx + dx * tc) / Rc, (cy + dy * tc) / Rc, (cz + dz * tc) / Rc
+						local cover = cloudCover(qx, qy, qz)
+						if cover > 0.01 then
+							local mus = qx * sx + qy * sy + qz * sz
+							local tr, tg, tb = 1, 1, 1
+							if A then
+								tr, tg, tb = Atmos.sunlight(A, hC, mus)
+							elseif mus <= 0 then
+								tr, tg, tb = 0, 0, 0
+							end
+							-- soft self shading from the cover gradient along the sun: a neighbour one
+							-- texel towards the sun with less cover means a lit, sun-facing edge; with
+							-- more cover, a shadowed one
+							local stx, sty, stz = sx - qx * mus, sy - qy * mus, sz - qz * mus
+							local sl = 0.02 / (if mus > 0.25 then mus else 0.25)
+							local kx, ky, kz = qx + stx * sl, qy + sty * sl, qz + stz * sl
+							local kl = sqrt(kx * kx + ky * ky + kz * kz)
+							local cs = cloudCover(kx / kl, ky / kl, kz / kl)
+							local shade = 0.92 + 0.9 * (cover - cs)
+							if shade < 0.4 then
+								shade = 0.4
+							elseif shade > 1.1 then
+								shade = 1.1
+							end
+							local lit = smoothstep(-0.1, 0.35, mus) * shade
+							-- silver lining: forward scattering through thin cloud edges
+							local cosv = -(dx * sx + dy * sy + dz * sz)
+							local fwd = if cosv > 0 then cosv ^ 6 else 0
+							local silver = 0.9 * fwd * (1 - cover) * smoothstep(-0.05, 0.3, mus)
+							local ar, ag, ab = 0, 0, 0
+							if A then
+								ar, ag, ab = Atmos.ambient(A, mus)
+							end
+							local k = 0.95
+							clR = k * (tr * (lit + silver) + ar * 0.8)
+							clG = k * (tg * (lit + silver) + ag * 0.8)
+							clB = k * (tb * (lit + silver) + ab * 0.8)
+							cl = cover * 0.97
 						end
 					end
 				end
-				local amb = 0.018
-				local cr = alr * (amb + diffuse * 1.05)
-				local cg = alg * (amb + diffuse * 1.05)
-				local cb = alb * (amb + diffuse * 1.05)
-				-- limb darkening for gas giants
-				local mu = -(hx * dx + hy * dy + hz * dz)
-				if B.kind == "gas" then
-					local ld = 0.55 + 0.45 * mu
-					cr, cg, cb = cr * ld, cg * ld, cb * ld
+				-- the air for rays that miss the planet (the halo), including limb pixels
+				local mr, mg, mb = 0, 0, 0
+				if A and d0 < Rt and b < 0 then
+					local dd = if d0 < R + 0.001 then R + 0.001 else d0
+					local qx, qy, qz = cx - dx * b, cy - dy * b, cz - dz * b
+					local ql = sqrt(qx * qx + qy * qy + qz * qz)
+					local a = dx * sx + dy * sy + dz * sz
+					local bs = if ql > 1e-9 then (qx * sx + qy * sy + qz * sz) / ql else 0
+					mr, mg, mb = Atmos.lookMiss(A, dd, a, bs)
 				end
-				-- glint on smooth texels (Blinn-Phong, exponent 64 by squaring)
-				local gloss = 1 - rough
-				if gloss > 0.5 and diffuse > 0 then
-					local hvx, hvy, hvz = sx - dx, sy - dy, sz - dz
-					local hl = sqrt(hvx * hvx + hvy * hvy + hvz * hvz)
-					local nh = (nx * hvx + ny * hvy + nz * hvz) / hl
-					if nh > 0 then
-						local s2 = nh * nh
-						local s4 = s2 * s2
-						local s8 = s4 * s4
-						local s16 = s8 * s8
-						local s32 = s16 * s16
-						local spec = s32 * s32 * (gloss - 0.5) * 2 * 0.9 * term
-						cr += spec
-						cg += spec * 0.97
-						cb += spec * 0.9
+				-- ---- the planet's own surface
+				if cov > 0 then
+					local px, py, pz
+					if hits then
+						px, py, pz = cx + dx * tHit, cy + dy * tHit, cz + dz * tHit
+					else
+						px, py, pz = cx - dx * b, cy - dy * b, cz - dz * b
 					end
-				end
-				-- clouds, lit by the sphere normal
-				if terra and cache then
-					local qx = hx * cosA - hz * sinA
-					local qz = hx * sinA + hz * cosA
-					local cl = cloudAt(cache, qx, hy, qz)
+					local pl = sqrt(px * px + py * py + pz * pz)
+					local hx, hy, hz = px / pl, py / pl, pz / pl
+					local alr, alg, alb, rough, nx, ny, nz = 0.5, 0.5, 0.5, 0.9, hx, hy, hz
+					if cache then
+						alr, alg, alb, rough, nx, ny, nz = sample(cache, hx, hy, hz)
+					end
+					local mus = hx * sx + hy * sy + hz * sz
+					local mu = -(hx * dx + hy * dy + hz * dz)
+					if mu < 0.001 then
+						mu = 0.001
+					end
+					-- light reaching the ground
+					local er, eg, eb = 1, 1, 1
+					local amr, amg, amb = 0, 0, 0
+					if A then
+						er, eg, eb = Atmos.sunlight(A, 0, mus)
+						amr, amg, amb = Atmos.ambient(A, mus)
+					elseif mus <= 0 then
+						er, eg, eb = 0, 0, 0
+					end
+					local ndl = nx * sx + ny * sy + nz * sz
+					if ndl < 0 then
+						ndl = 0
+					end
+					-- cloud shadow on the ground: the cover where the sun's ray crosses the shell
+					if useClouds and mus > 0.05 then
+						local kx, ky, kz = hx + (sx - hx * mus) * (hC / R) / mus, hy + (sy - hy * mus) * (hC / R) / mus, hz + (sz - hz * mus) * (hC / R) / mus
+						local kl = sqrt(kx * kx + ky * ky + kz * kz)
+						local sh = cloudCover(kx / kl, ky / kl, kz / kl)
+						ndl *= 1 - 0.78 * sh
+					end
+					local Lr = alr * (er * ndl + amr)
+					local Lg = alg * (eg * ndl + amg)
+					local Lb = alb * (eb * ndl + amb)
+					-- glint on smooth texels (water), Blinn-Phong exponent 64
+					local gloss = 1 - rough
+					if hasSea and gloss > 0.5 and ndl > 0 then
+						local hvx, hvy, hvz = sx - dx, sy - dy, sz - dz
+						local hl = sqrt(hvx * hvx + hvy * hvy + hvz * hvz)
+						local nh = (nx * hvx + ny * hvy + nz * hvz) / hl
+						if nh > 0 then
+							local s2 = nh * nh
+							local s4 = s2 * s2
+							local s8 = s4 * s4
+							local s16 = s8 * s8
+							local s32 = s16 * s16
+							local spec = s32 * s32 * (gloss - 0.5) * 2 * 0.9
+							Lr += spec * er
+							Lg += spec * eg
+							Lb += spec * eb
+						end
+					end
+					if gas then
+						local ld = 0.55 + 0.45 * mu
+						Lr, Lg, Lb = Lr * ld, Lg * ld, Lb * ld
+					end
+					-- clouds over the ground (parallax: they came from the shell hit above)
 					if cl > 0 then
-						local light = amb + 1.0 * (if sdl > 0 then sdl else 0) * term
-						cr += (light - cr) * cl * 0.95
-						cg += (light - cg) * cl * 0.95
-						cb += (light - cb) * cl * 0.95
+						Lr = clR * cl + Lr * (1 - cl)
+						Lg = clG * cl + Lg * (1 - cl)
+						Lb = clB * cl + Lb * (1 - cl)
+					end
+					-- through the air to the camera
+					if A then
+						local tr, tg, tb = Atmos.columnT(A, mu)
+						local ir, ig, ib = Atmos.lookHit(A, mu, mus, dx * sx + dy * sy + dz * sz)
+						Lr = Lr * tr + ir
+						Lg = Lg * tg + ig
+						Lb = Lb * tb + ib
+					end
+					planetR, planetG, planetB = tonemap(Lr, Lg, Lb, exposure)
+				end
+				-- ---- the uncovered part of the pixel: the ring behind, the halo over it, then
+				-- clouds beyond the limb (a halo is an emission of opacity max(rgb): stars show
+				-- through a faint one)
+				local rest = 1 - cov
+				local restR, restG, restB, restA = backR, backG, backB, backA
+				if rest > 0 then
+					if A and d0 < Rt then
+						local hr, hg, hb = tonemap(mr, mg, mb, exposure)
+						local ha = math.max(hr, hg, hb)
+						if ha > 0 then
+							restR = hr + (1 - ha) * restR
+							restG = hg + (1 - ha) * restG
+							restB = hb + (1 - ha) * restB
+							restA = ha + (1 - ha) * restA
+						end
+					end
+					if cl > 0 and not hits then
+						local ar, ag, ab = tonemap(clR, clG, clB, exposure)
+						restR = ar * cl + (1 - cl) * restR
+						restG = ag * cl + (1 - cl) * restG
+						restB = ab * cl + (1 - cl) * restB
+						restA = cl + (1 - cl) * restA
 					end
 				end
-				-- atmospheric haze: the same path model for a ray that ends on the surface
-				if atm then
-					local haze = atmGlow(if d0 < R then d0 else R, true) * smoothstep(-0.3, 0.35, sdl)
-					cr += (atm.r - cr) * haze
-					cg += (atm.g - cg) * haze
-					cb += (atm.b - cb) * haze
+				pr = planetR * cov + restR * rest
+				pg = planetG * cov + restG * rest
+				pb = planetB * cov + restB * rest
+				pa = cov + restA * rest
+				-- ring in front of the body
+				if ringA > 0 and not ringBehind then
+					local ar, ag, ab = tonemap(ringR, ringG, ringB, exposure)
+					pr = ar * ringA + pr * (1 - ringA)
+					pg = ag * ringA + pg * (1 - ringA)
+					pb = ab * ringA + pb * (1 - ringA)
+					pa = ringA + pa * (1 - ringA)
 				end
-				ar = cr * cov + ar * (1 - cov)
-				ag = cg * cov + ag * (1 - cov)
-				ab = cb * cov + ab * (1 - cov)
-				aa = cov + aa * (1 - cov)
-			end
-			if ringFront then
-				ar = ringR * ringA + ar * (1 - ringA)
-				ag = ringG * ringA + ag * (1 - ringA)
-				ab = ringB * ringA + ab * (1 - ringA)
-				aa = ringA + aa * (1 - ringA)
 			end
 			local o = ((y - base) * n + x) * 4
-			if aa <= 0 then
+			if pa <= 0 then
 				buffer.writeu32(out, o, 0)
 			else
-				local inv = 1 / aa
-				buffer.writeu32(out, o, byte(ar * inv) + byte(ag * inv) * 256 + byte(ab * inv) * 65536 + byte(aa) * 16777216)
+				-- straight alpha; one least-significant-bit of dither on non-zero values so
+				-- dark glows do not band (zero stays exactly zero)
+				local inv = 1 / pa
+				local dth = (hash2(x, y, 977) / 4294967296 - 0.5) / 255
+				local r, g, bl = pr * inv, pg * inv, pb * inv
+				if r > 0 then
+					r += dth
+				end
+				if g > 0 then
+					g += dth
+				end
+				if bl > 0 then
+					bl += dth
+				end
+				buffer.writeu32(out, o, byteOf(r) + byteOf(g) * 256 + byteOf(bl) * 65536 + byteOf(pa) * 16777216)
 			end
 		end
 	end
@@ -1296,7 +2297,7 @@ return Impostor
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="17">
+      <Item class="ModuleScript" referent="18">
         <Properties>
           <string name="Name">Layout</string>
           <string name="Source"><![CDATA[--!strict
@@ -1390,7 +2391,7 @@ return Layout
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="18">
+      <Item class="ModuleScript" referent="19">
         <Properties>
           <string name="Name">Noise3</string>
           <string name="Source"><![CDATA[--!strict
@@ -1600,7 +2601,7 @@ return Noise3
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="19">
+      <Item class="ModuleScript" referent="20">
         <Properties>
           <string name="Name">PlanetJobs</string>
           <string name="Source"><![CDATA[--!strict
@@ -1624,6 +2625,7 @@ local SphereCache = require("./SphereCache")
 local Impostor = require("./Impostor")
 local SkyGen = require("./SkyGen")
 local Clouds = require("./Clouds")
+local Atmos = require("./Atmos")
 
 type State = { [string]: any }
 
@@ -1665,6 +2667,49 @@ Jobs.impostor = {
 	end,
 }
 
+-- Atmosphere tables (planets/shared/Atmos): slices of the two big scattering tables, the
+-- small tables, and the install in a worker. The optical-depth table is rebuilt once per
+-- worker and body (cheap) and kept in the worker's state.
+local function atmosModel(state: State, body: string, quality: number): any
+	local cache = state.atmosShapes
+	if not cache then
+		cache = {}
+		state.atmosShapes = cache
+	end
+	local key = body .. "/" .. quality
+	local M = cache[key]
+	if not M then
+		local spec = Atmos.specFor(body)
+		assert(spec, "no atmosphere for " .. body)
+		M = Atmos.new(spec, quality)
+		cache[key] = M
+	end
+	return M
+end
+
+Jobs.atmosSlice = {
+	parallel = function(payload: any, state: State): any
+		local M = atmosModel(state, payload.body, payload.quality)
+		if payload.kind == "miss" then
+			return Atmos.buildMiss(M, payload.i0, payload.i1)
+		end
+		return Atmos.buildHit(M, payload.i0, payload.i1)
+	end,
+}
+
+Jobs.atmosSmall = {
+	parallel = function(payload: any, state: State): any
+		local M = atmosModel(state, payload.body, payload.quality)
+		return { chord = Atmos.buildChord(M), amb = Atmos.buildAmbient(M) }
+	end,
+}
+
+Jobs.setAtmos = {
+	parallel = function(payload: any, state: State): any
+		return Atmos.installFor(payload.body, payload.quality, payload.miss, payload.chord, payload.hit, payload.amb)
+	end,
+}
+
 Jobs.skyFace = {
 	parallel = function(payload: any, state: State): any
 		return SkyGen.face(payload.face, payload.n, payload.seed)
@@ -1687,7 +2732,7 @@ return Jobs
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="20">
+      <Item class="ModuleScript" referent="21">
         <Properties>
           <string name="Name">Quadtree</string>
           <string name="Source"><![CDATA[--!strict
@@ -2096,7 +3141,7 @@ return Quadtree
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="21">
+      <Item class="ModuleScript" referent="22">
         <Properties>
           <string name="Name">SkyGen</string>
           <string name="Source"><![CDATA[--!strict
@@ -2264,7 +3309,7 @@ return SkyGen
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="22">
+      <Item class="ModuleScript" referent="23">
         <Properties>
           <string name="Name">SphereCache</string>
           <string name="Source"><![CDATA[--!strict
@@ -2495,7 +3540,7 @@ return SphereCache
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="23">
+      <Item class="ModuleScript" referent="24">
         <Properties>
           <string name="Name">TileGen</string>
           <string name="Source"><![CDATA[--!strict
@@ -2913,7 +3958,7 @@ return TileGen
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="24">
+      <Item class="ModuleScript" referent="25">
         <Properties>
           <string name="Name">WorkerMain</string>
           <string name="Source"><![CDATA[--!strict
@@ -2967,7 +4012,7 @@ return WorkerMain
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="25">
+      <Item class="ModuleScript" referent="26">
         <Properties>
           <string name="Name">WorkerPool</string>
           <string name="Source"><![CDATA[--!strict
@@ -3313,11 +4358,11 @@ return WorkerPool
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="26">
+    <Item class="Folder" referent="27">
       <Properties>
         <string name="Name">Universe</string>
       </Properties>
-      <Item class="ModuleScript" referent="27">
+      <Item class="ModuleScript" referent="28">
         <Properties>
           <string name="Name">Canvas</string>
           <string name="Source"><![CDATA[--!native
@@ -3565,7 +4610,7 @@ return Canvas
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="28">
+      <Item class="ModuleScript" referent="29">
         <Properties>
           <string name="Name">Liquid</string>
           <string name="Source"><![CDATA[--!native
@@ -7082,7 +8127,7 @@ return Liquid
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="29">
+      <Item class="ModuleScript" referent="30">
         <Properties>
           <string name="Name">LiquidControl</string>
           <string name="Source"><![CDATA[--!native
@@ -7456,7 +8501,7 @@ return LiquidControl
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="30">
+      <Item class="ModuleScript" referent="31">
         <Properties>
           <string name="Name">LiquidLearn</string>
           <string name="Source"><![CDATA[--!native
@@ -9794,7 +10839,7 @@ return LiquidLearn
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="31">
+      <Item class="ModuleScript" referent="32">
         <Properties>
           <string name="Name">LiquidMatte</string>
           <string name="Source"><![CDATA[--!native
@@ -11740,7 +12785,7 @@ return LiquidMatte
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="32">
+      <Item class="ModuleScript" referent="33">
         <Properties>
           <string name="Name">LiquidTime</string>
           <string name="Source"><![CDATA[--!native
@@ -12595,7 +13640,7 @@ return LiquidTime
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="33">
+      <Item class="ModuleScript" referent="34">
         <Properties>
           <string name="Name">MyMath</string>
           <string name="Source"><![CDATA[--!native
@@ -13108,7 +14153,7 @@ return MyMath
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="34">
+      <Item class="ModuleScript" referent="35">
         <Properties>
           <string name="Name">Pixels</string>
           <string name="Source"><![CDATA[--!native
@@ -13397,7 +14442,7 @@ return Pixels
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="35">
+      <Item class="ModuleScript" referent="36">
         <Properties>
           <string name="Name">Saturn</string>
           <string name="Source"><![CDATA[--!native
@@ -13624,11 +14669,11 @@ return Saturn
 ]]></string>
         </Properties>
       </Item>
-      <Item class="Folder" referent="36">
+      <Item class="Folder" referent="37">
         <Properties>
           <string name="Name">compute</string>
         </Properties>
-        <Item class="ModuleScript" referent="37">
+        <Item class="ModuleScript" referent="38">
           <Properties>
             <string name="Name">Coverage</string>
             <string name="Source"><![CDATA[--!native
@@ -14492,7 +15537,7 @@ return Coverage
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="38">
+        <Item class="ModuleScript" referent="39">
           <Properties>
             <string name="Name">Distance</string>
             <string name="Source"><![CDATA[--!native
@@ -14861,7 +15906,7 @@ return Distance
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="39">
+        <Item class="ModuleScript" referent="40">
           <Properties>
             <string name="Name">Expr</string>
             <string name="Source"><![CDATA[--!native
@@ -15439,7 +16484,7 @@ return Expr
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="40">
+        <Item class="ModuleScript" referent="41">
           <Properties>
             <string name="Name">Filter</string>
             <string name="Source"><![CDATA[--!native
@@ -15878,7 +16923,7 @@ return Filter
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="41">
+        <Item class="ModuleScript" referent="42">
           <Properties>
             <string name="Name">Raster</string>
             <string name="Source"><![CDATA[--!native
@@ -17598,7 +18643,7 @@ return Raster
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="42">
+        <Item class="ModuleScript" referent="43">
           <Properties>
             <string name="Name">Rows</string>
             <string name="Source"><![CDATA[--!native
@@ -17722,7 +18767,7 @@ return Rows
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="43">
+        <Item class="ModuleScript" referent="44">
           <Properties>
             <string name="Name">Scanline</string>
             <string name="Source"><![CDATA[--!native
@@ -18690,7 +19735,7 @@ return Scanline
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="44">
+        <Item class="ModuleScript" referent="45">
           <Properties>
             <string name="Name">Tiles</string>
             <string name="Source"><![CDATA[--!native
@@ -18989,7 +20034,7 @@ return Tiles
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="45">
+        <Item class="ModuleScript" referent="46">
           <Properties>
             <string name="Name">Trace</string>
             <string name="Source"><![CDATA[--!native
@@ -19167,7 +20212,7 @@ return Trace
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="46">
+        <Item class="ModuleScript" referent="47">
           <Properties>
             <string name="Name">Visibility</string>
             <string name="Source"><![CDATA[--!native
@@ -19736,19 +20781,19 @@ return Visibility
       </Item>
     </Item>
   </Item>
-  <Item class="StarterPlayer" referent="47">
+  <Item class="StarterPlayer" referent="48">
     <Properties>
       <string name="Name">StarterPlayer</string>
     </Properties>
-    <Item class="StarterPlayerScripts" referent="48">
+    <Item class="StarterPlayerScripts" referent="49">
       <Properties>
         <string name="Name">StarterPlayerScripts</string>
       </Properties>
-      <Item class="Folder" referent="49">
+      <Item class="Folder" referent="50">
         <Properties>
           <string name="Name">Client</string>
         </Properties>
-        <Item class="ModuleScript" referent="50">
+        <Item class="ModuleScript" referent="51">
           <Properties>
             <string name="Name">CloudLayer</string>
             <string name="Source"><![CDATA[--!strict
@@ -19915,7 +20960,7 @@ return CloudLayer
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="51">
+        <Item class="ModuleScript" referent="52">
           <Properties>
             <string name="Name">Flight</string>
             <string name="Source"><![CDATA[--!strict
@@ -20173,7 +21218,7 @@ return Flight
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="52">
+        <Item class="ModuleScript" referent="53">
           <Properties>
             <string name="Name">Hud</string>
             <string name="Source"><![CDATA[--!strict
@@ -20287,7 +21332,7 @@ return Hud
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="53">
+        <Item class="ModuleScript" referent="54">
           <Properties>
             <string name="Name">Impostors</string>
             <string name="Source"><![CDATA[--!strict
@@ -20322,13 +21367,19 @@ local Uploader = require(script.Parent:WaitForChild("Uploader"))
 
 local Impostors = {}
 
-local MAX_N: number = require(Planets:WaitForChild("Config")).impostorMax
+local Config = require(Planets:WaitForChild("Config"))
+local Atmos = require(Planets:WaitForChild("Atmos"))
+local MAX_N: number = Config.impostorMax -- up to 2048: beyond 1024 a billboard is a 2 x 2 grid of images
+local TILE_MAX = 1024
 local BAND = 32
 
 export type Item = {
 	def: any,
 	img: EditableImage?,
 	entry: Uploader.Entry?,
+	images: { EditableImage }, -- 1 image, or 4 tiles once the billboard goes beyond 1024
+	entries: { Uploader.Entry },
+	labels: { ImageLabel },
 	anchor: Part,
 	gui: BillboardGui,
 	label: ImageLabel,
@@ -20352,6 +21403,7 @@ export type Manager = {
 	U: Uploader.Uploader,
 	workers: any,
 	cachesReady: number,
+	atmosReady: number,
 	stats: { renders: number, bands: number, failed: number, lastError: string? },
 }
 
@@ -20374,9 +21426,9 @@ local function extraFor(def: any): number
 end
 
 function Impostors.new(U: Uploader.Uploader, workers: any, folder: Instance): Manager
-	local M: Manager = { items = {}, byId = {}, U = U, workers = workers, cachesReady = 0, stats = { renders = 0, bands = 0, failed = 0, lastError = nil } }
+	local M: Manager = { items = {}, byId = {}, U = U, workers = workers, cachesReady = 0, atmosReady = 0, stats = { renders = 0, bands = 0, failed = 0, lastError = nil } }
 	for _, def in Bodies.list do
-		local img = MeshPool.createImage(MAX_N, MAX_N)
+		local img = MeshPool.createImage(math.min(MAX_N, TILE_MAX), math.min(MAX_N, TILE_MAX))
 		local anchor = Instance.new("Part")
 		anchor.Name = "Impostor_" .. def.name
 		anchor.Anchored = true
@@ -20402,15 +21454,30 @@ function Impostors.new(U: Uploader.Uploader, workers: any, folder: Instance): Ma
 		label.BackgroundTransparency = 1
 		label.Size = UDim2.fromScale(1, 1)
 		label.ImageRectOffset = Vector2.zero
-		label.ImageRectSize = Vector2.new(MAX_N, MAX_N)
+		label.ImageRectSize = Vector2.new(math.min(MAX_N, TILE_MAX), math.min(MAX_N, TILE_MAX))
 		if img then
 			label.ImageContent = Content.fromObject(img)
 		end
 		label.Parent = gui
+		local labels: { ImageLabel } = { label }
+		for k = 2, 4 do
+			local l = Instance.new("ImageLabel")
+			l.Name = "Tile" .. k
+			l.BackgroundTransparency = 1
+			l.Visible = false
+			l.Size = UDim2.fromScale(0.5, 0.5)
+			l.Position = UDim2.fromScale(if k % 2 == 0 then 0.5 else 0, if k > 2 then 0.5 else 0)
+			l.Parent = gui
+			labels[k] = l
+		end
+		local entry = if img then Uploader.register(U, "impostor " .. def.name, img) else nil
 		local item: Item = {
 			def = def,
 			img = img,
-			entry = if img then Uploader.register(U, "impostor " .. def.name, img) else nil,
+			entry = entry,
+			images = if img then { img } else {},
+			entries = if entry then { entry } else {},
+			labels = labels,
 			anchor = anchor,
 			gui = gui,
 			label = label,
@@ -20506,18 +21573,84 @@ local function startRender(M: Manager, item: Item, params: any, now: number)
 			if item.bandsLeft == 0 then
 				item.rendering = false
 				item.ms = (os.clock() - t0) * 1000
-				local entry = item.entry
-				if entry and back then
-					Uploader.queue(M.U, entry, 0, 0, n, n, back, function()
-						-- switch the visible region together with the new pixels
-						item.label.ImageRectOffset = Vector2.zero
-						item.label.ImageRectSize = Vector2.new(n, n)
-						item.n = n
-						item.shown = true
-					end)
+				if back then
+					Impostors.present(M, item, back, n)
 				end
 				item.renders += 1
 				M.stats.renders += 1
+			end
+		end)
+	end
+end
+
+-- Allocates the three extra tile images a billboard beyond 1024 needs (once). Returns false
+-- when the engine refuses (the billboard then stays at 1024).
+local function ensureTiles(M: Manager, item: Item): boolean
+	if #item.images >= 4 then
+		return true
+	end
+	while #item.images < 4 do
+		local img = MeshPool.createImage(TILE_MAX, TILE_MAX)
+		if not img then
+			return false
+		end
+		table.insert(item.images, img)
+		table.insert(item.entries, Uploader.register(M.U, "impostor " .. item.def.name .. " tile " .. #item.images, img))
+		item.labels[#item.images].ImageContent = Content.fromObject(img)
+	end
+	return true
+end
+
+-- Uploads a finished n x n render: one image, or four tiles (beyond 1024) that become
+-- visible together once all four have been written.
+function Impostors.present(M: Manager, item: Item, back: buffer, n: number)
+	local tiled = n > TILE_MAX
+	if tiled and not ensureTiles(M, item) then
+		-- cannot hold four tiles: show the top-left quarter scaled? no: skip this render
+		M.stats.failed += 1
+		M.stats.lastError = "tile images refused by the memory budget"
+		return
+	end
+	if not tiled then
+		local entry = item.entries[1]
+		if not entry then
+			return
+		end
+		Uploader.queue(M.U, entry, 0, 0, n, n, back, function()
+			local l = item.labels[1]
+			l.Position = UDim2.fromScale(0, 0)
+			l.Size = UDim2.fromScale(1, 1)
+			l.ImageRectOffset = Vector2.zero
+			l.ImageRectSize = Vector2.new(n, n)
+			for k = 2, 4 do
+				item.labels[k].Visible = false
+			end
+			item.n = n
+			item.shown = true
+		end)
+		return
+	end
+	local h = n // 2
+	local waiting = 4
+	for k = 1, 4 do
+		local tx, ty = (k - 1) % 2, (k - 1) // 2
+		local tile = buffer.create(h * h * 4)
+		for row = 0, h - 1 do
+			buffer.copy(tile, row * h * 4, back, ((ty * h + row) * n + tx * h) * 4, h * 4)
+		end
+		Uploader.queue(M.U, item.entries[k], 0, 0, h, h, tile, function()
+			waiting -= 1
+			if waiting == 0 then
+				for j = 1, 4 do
+					local l = item.labels[j]
+					l.Position = UDim2.fromScale(if j % 2 == 0 then 0.5 else 0, if j > 2 then 0.5 else 0)
+					l.Size = UDim2.fromScale(0.5, 0.5)
+					l.ImageRectOffset = Vector2.zero
+					l.ImageRectSize = Vector2.new(h, h)
+					l.Visible = true
+				end
+				item.n = n
+				item.shown = true
 			end
 		end)
 	end
@@ -20610,6 +21743,7 @@ function Impostors.update(M: Manager, cam: Camera, sun: Vector3, focus: any?, fo
 					sy = sun.Y,
 					sz = sun.Z,
 					cloudAngle = cloudAngle,
+					exposure = Config.exposure,
 				}, now)
 			end
 		end
@@ -20620,18 +21754,90 @@ end
 function Impostors.pixels(M: Manager): number
 	local n = 0
 	for _, item in M.items do
-		if item.img then
-			n += MAX_N * MAX_N
+		for _, img in item.images do
+			n += img.Size.X * img.Size.Y
 		end
 	end
 	return n
+end
+
+-- Builds every atmosphere's scattering tables on the workers (slices of the two big
+-- tables in parallel), joins them, and installs them in every worker and in this Luau
+-- state (for the serial fallback). Yields; run it in its own thread. Billboards re-render
+-- with the air once their body's tables are in.
+function Impostors.buildAtmos(M: Manager)
+	local q = Atmos.QUALITY
+	for _, item in M.items do
+		local id = item.def.id
+		local spec = Atmos.specFor(id)
+		if spec then
+			local shape = Atmos.new(spec, q) -- the dimensions only (cheap)
+			local slices: { { kind: string, i0: number, i1: number } } = {}
+			local step = math.max(1, math.ceil(shape.ND / 6))
+			for i = 0, shape.ND - 1, step do
+				table.insert(slices, { kind = "miss", i0 = i, i1 = math.min(shape.ND, i + step) })
+			end
+			local hstep = math.max(1, math.ceil(shape.NMV / 4))
+			for i = 0, shape.NMV - 1, hstep do
+				table.insert(slices, { kind = "hit", i0 = i, i1 = math.min(shape.NMV, i + hstep) })
+			end
+			local missParts: { [number]: buffer } = {}
+			local hitParts: { [number]: buffer } = {}
+			local small: any = nil
+			local pending = #slices + 1
+			for _, sl in slices do
+				WorkerPool.submit(M.workers, "atmosSlice", { body = id, quality = q, kind = sl.kind, i0 = sl.i0, i1 = sl.i1 }, function(ok: boolean, res: any)
+					pending -= 1
+					if ok then
+						if sl.kind == "miss" then
+							missParts[sl.i0] = res
+						else
+							hitParts[sl.i0] = res
+						end
+					else
+						M.stats.failed += 1
+						M.stats.lastError = tostring(res)
+					end
+				end)
+			end
+			WorkerPool.submit(M.workers, "atmosSmall", { body = id, quality = q }, function(ok: boolean, res: any)
+				pending -= 1
+				if ok then
+					small = res
+				end
+			end)
+			local t0 = os.clock()
+			while pending > 0 and os.clock() - t0 < 120 do
+				task.wait(0.05)
+			end
+			local function joined(parts: { [number]: buffer }): buffer?
+				local keys: { number } = {}
+				for k in parts do
+					table.insert(keys, k)
+				end
+				table.sort(keys)
+				local list: { buffer } = {}
+				for _, k in keys do
+					table.insert(list, parts[k])
+				end
+				return Atmos.concat(list)
+			end
+			local miss, hit = joined(missParts), joined(hitParts)
+			if miss and hit and small and buffer.len(miss) == shape.ND * shape.NA * shape.NB * 36 and buffer.len(hit) == shape.NMV * shape.NMS * shape.NNU * 36 then
+				Atmos.installFor(id, q, miss, small.chord, hit, small.amb)
+				WorkerPool.broadcast(M.workers, "setAtmos", { body = id, quality = q, miss = miss, hit = hit, chord = small.chord, amb = small.amb }, 30)
+				item.last = nil -- re-render with the air
+				M.atmosReady += 1
+			end
+		end
+	end
 end
 
 return Impostors
 ]]></string>
           </Properties>
         </Item>
-        <Item class="LocalScript" referent="54">
+        <Item class="LocalScript" referent="55">
           <Properties>
             <string name="Name">Main</string>
             <string name="Source"><![CDATA[--!strict
@@ -20724,13 +21930,14 @@ task.spawn(function()
 		return "ok", s.note
 	end)
 	stage("atlases", function()
-		local p, err = MeshPool.new(U, folder)
-		if not p then
+		local p = MeshPool.new(U, folder)
+		local ok, err = MeshPool.addSet(p)
+		if not ok then
 			return "failed", tostring(err)
 		end
 		pool = p
 		lod = PlanetLod.new(p, U, workers)
-		return if p.mode == "pbr" then "ok" else "fallback", p.note
+		return if p.mode == "pbr" then "ok" else "fallback", p.note .. "; " .. p.meshMode
 	end)
 	stage("impostors", function()
 		local m = Impostors.new(U, workers, folder)
@@ -20738,6 +21945,9 @@ task.spawn(function()
 		task.spawn(function()
 			Impostors.buildCaches(m)
 			Hud.set(hud, "sphere caches", if m.cachesReady == #m.items then "ok" else "fallback", string.format("%d of %d bodies cached on the workers", m.cachesReady, #m.items))
+			local t0 = os.clock()
+			Impostors.buildAtmos(m)
+			Hud.set(hud, "atmosphere", if m.atmosReady == 2 then "ok" else "fallback", string.format("%d of 2 scattering table sets built in %.1f s", m.atmosReady, os.clock() - t0))
 		end)
 		return "ok", string.format("%d raytraced billboards", #m.items)
 	end)
@@ -20748,6 +21958,24 @@ task.spawn(function()
 		end
 		clouds = layer
 		return if layer.part then "ok" else "fallback", layer.note
+	end)
+	-- more atlas sets (finer ground), after everything else so the first image is up quickly
+	stage("atlas sets", function()
+		local p = pool
+		if not p then
+			return "failed", "no pool"
+		end
+		local want = math.clamp(Config.atlasSets, 1, 8)
+		local why = ""
+		while #p.sets < want do
+			local ok, err = MeshPool.addSet(p)
+			if not ok then
+				why = tostring(err)
+				break
+			end
+		end
+		local tiles = #p.slots
+		return if #p.sets >= want then "ok" else "fallback", string.format("%d of %d atlas sets, %d patch tiles%s", #p.sets, want, tiles, if why ~= "" then "; " .. why else "")
 	end)
 	Hud.set(hud, "client", "ok", "ready: fly with W A S D and the right mouse button")
 	Hud.debug.lod = lod
@@ -20856,7 +22084,7 @@ UserInputService.InputBegan:Connect(function(input: InputObject, processed: bool
 	elseif k == Enum.KeyCode.B and L then
 		local stress = L.opts.splitPx > Config.stressSplitPx
 		L.opts.splitPx = if stress then Config.stressSplitPx else Config.splitPx
-		L.opts.capacity = math.min(if stress then Config.stressCapacity else Config.capacity, 256)
+		L.opts.capacity = if stress then Config.stressCapacity else Config.capacity
 	elseif k == Enum.KeyCode.G then
 		impostorOnly = not impostorOnly
 	elseif k == Enum.KeyCode.N and L then
@@ -20979,7 +22207,7 @@ RunService.RenderStepped:Connect(function(dt: number)
 		end)
 		table.insert(lines, string.format("images  %.2f Mpx live in EditableImages = %.1f MB RGBA   engine texture memory %.0f MB", px / 1e6, px * 4 / 1048576, tex))
 		if pool then
-			table.insert(lines, string.format("surface %s   mesh %s   slots %d of 256", pool.mode, pool.meshMode, #pool.slots))
+			table.insert(lines, string.format("surface %s   mesh: %s   %d tiles in %d atlas sets, %d mesh parts, %d vertices", pool.mode, pool.meshMode, #pool.slots, #pool.sets, #pool.chunks, pool.stats.meshVerts))
 		end
 		Hud.stats(hud, table.concat(lines, "\n"))
 	end
@@ -20992,29 +22220,33 @@ end)
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="55">
+        <Item class="ModuleScript" referent="56">
           <Properties>
             <string name="Name">MeshPool</string>
             <string name="Source"><![CDATA[--!strict
 -- Universe at Home: Planets :: MeshPool
 --
--- The GPU side of the patch system: three atlases and up to 256 pooled patch meshes.
+-- The GPU side of the surface: atlas sets and the EditableMeshes that carry every patch.
 --
--- ATLASES. Colour (1024 x 1024), normal (1024 x 1024) and roughness (512 x 512)
--- EditableImages; slot i owns tile i of each (Layout). One SurfaceAppearance per slot,
--- built by AssetService:CreateSurfaceAppearanceAsync from the three atlases: the only way a
--- game script gets normal and roughness maps on a mesh (their properties are plugin-only).
--- Its maps cannot be swapped, but the EditableImages behind them can be rewritten, which
--- is all the pool ever does. If the engine refuses, the pool falls back to
--- MeshPart.TextureContent (colour only; lighting from the sphere normals) and says so.
+-- ATLAS SET. Colour (1024 x 1024), normal (1024 x 1024) and roughness (512 x 512)
+-- EditableImages; patch slot i of a set owns tile i of each (Layout). One SurfaceAppearance
+-- per mesh part, built by AssetService:CreateSurfaceAppearanceAsync from the set's three
+-- atlases: the only way a game script gets normal and roughness maps on a mesh (their
+-- properties are plugin-only). Its maps cannot be swapped, but the EditableImages behind
+-- them can be rewritten, which is all the pool ever does. If the engine refuses, the pool
+-- falls back to MeshPart.TextureContent (colour only) and says so. More sets, more tiles:
+-- Config.atlasSets (9 MB each) is how the surface gets finer.
 --
--- SLOTS. Each slot is an EditableMesh with the fixed patch topology (TileGen.triangles,
--- per-vertex UVs into its own tile, per-vertex normals) shown by a MeshPart. Assigning a
--- patch rewrites the vertex positions and normals; nothing is created or destroyed while
--- flying. All vertices are body-local and two zero-area triangles pin the bounding box to
--- +-PIN_EXTENT on every axis, so the box is centred on the body whichever origin rule the
--- engine uses and never changes size (no rescaling when vertices move): every part simply
--- sits at the body's centre.
+-- ONE MESH. All 256 slots of a set live in ONE EditableMesh (one MeshPart, one draw
+-- call, one SurfaceAppearance): slot k owns vertices [k * 357, (k + 1) * 357) with fixed
+-- topology and fixed per-vertex UVs into its own tile. Showing a patch is two batch writes
+-- of its 357 vertices (positions, normals); hiding it parks the vertices in a tiny cluster
+-- at the body's centre (small, not degenerate, in case the engine drops degenerate faces).
+-- If the engine refuses a mesh that large (the limit is not publicly specified), the pool
+-- halves the slots per mesh until it is accepted, and reports what it settled on.
+-- All vertices are body-local and two tiny triangles pin each mesh's bounding box to
+-- +-PIN_EXTENT on every axis: the box is centred on the body whichever origin rule the
+-- engine uses and never changes size, so every part simply sits at the body's centre.
 
 local AssetService = game:GetService("AssetService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -21022,45 +22254,79 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Planets = ReplicatedStorage:WaitForChild("Planets")
 local Layout = require(Planets:WaitForChild("Layout")) :: any
 local TileGen = require(Planets:WaitForChild("TileGen")) :: any
+local Config = require(Planets:WaitForChild("Config")) :: any
 local Uploader = require(script.Parent:WaitForChild("Uploader"))
 
 local MeshPool = {}
 
-export type Slot = {
-	index: number, -- 0-based, = atlas tile
-	tx: number,
-	ty: number,
-	mesh: EditableMesh,
-	part: MeshPart,
-	sa: SurfaceAppearance?,
-	vIds: { number },
-	nIds: { number },
-	uvIds: { number },
-	key: number?, -- patch currently held
-	state: string, -- "free" | "generating" | "uploading" | "ready" | "shown"
-	lastUsed: number,
-	ticket: number, -- increments on every (re)assignment; stale job results are dropped
+local VS = Layout.VERTS - Layout.PIN_VERTS -- vertices per slot (grid + skirts): 357
+local TS = Layout.TRIS - Layout.PIN_TRIS -- triangles per slot: 640
+MeshPool.VS = VS
+
+export type Morph = {
+	t: number,
+	start: { Vector3 },
+	final: { Vector3 },
 }
 
-export type Pool = {
+export type Set = {
+	index: number,
 	color: EditableImage,
 	normal: EditableImage?,
 	rough: EditableImage?,
 	colorEntry: Uploader.Entry,
 	normalEntry: Uploader.Entry?,
 	roughEntry: Uploader.Entry?,
+	template: SurfaceAppearance?,
+	chunks: { Chunk },
+}
+
+export type Chunk = {
+	set: Set,
+	mesh: EditableMesh,
+	part: MeshPart,
+	sa: SurfaceAppearance?,
+	first: number, -- first slot (index within the set)
+	count: number,
+	uvIds: { number }, -- every vertex's UV id (to rewrite the UV origin)
+}
+
+export type Slot = {
+	index: number, -- 0-based over the whole pool
+	set: Set,
+	chunk: Chunk,
+	tile: number, -- index within the set = atlas tile
+	tx: number,
+	ty: number,
+	vIds: { number }, -- this slot's VS vertex ids
+	nIds: { number },
+	key: number?,
+	state: string, -- "free" | "generating" | "uploading" | "ready" | "shown"
+	lastUsed: number,
+	ticket: number,
+	result: any?, -- generated buffers while the patch is held
+	final: { Vector3 }?,
+	finalN: { Vector3 }?,
+	morph: Morph?,
+}
+
+export type Pool = {
+	sets: { Set },
+	chunks: { Chunk },
+	slots: { Slot },
 	mode: string, -- "pbr" | "texture"
 	note: string,
-	slots: { Slot },
 	folder: Folder,
 	flipV: boolean,
-	template: SurfaceAppearance?,
 	cloneWorks: boolean?,
 	tris: { number },
-	growing: boolean,
 	failed: string?,
 	meshMode: string,
-	stats: { created: number, writes: number, meshMs: number, pixels: number },
+	slotsPerMesh: number,
+	maxSlots: number, -- slots in the sets built so far
+	stats: { created: number, writes: number, meshMs: number, pixels: number, meshVerts: number },
+	park: { Vector3 },
+	U: Uploader.Uploader,
 }
 
 local function createImage(w: number, h: number): (EditableImage?, string?)
@@ -21077,60 +22343,35 @@ local function createImage(w: number, h: number): (EditableImage?, string?)
 end
 MeshPool.createImage = createImage
 
--- Creates the atlases. Returns nil and a reason when even the colour atlas cannot exist.
-function MeshPool.new(U: Uploader.Uploader, folder: Folder): (Pool?, string?)
-	local color, err = createImage(Layout.ATLAS, Layout.ATLAS)
-	if not color then
-		return nil, "colour atlas: " .. tostring(err)
+function MeshPool.new(U: Uploader.Uploader, folder: Folder): Pool
+	local park: { Vector3 } = table.create(VS)
+	for i = 0, VS - 1 do
+		park[i + 1] = Vector3.new((i % 19) * 0.002, ((i // 19) % 19) * 0.002, (i // 361) * 0.002)
 	end
-	local normal = createImage(Layout.ATLAS, Layout.ATLAS)
-	local rough = createImage(Layout.ROUGH_ATLAS, Layout.ROUGH_ATLAS)
-	local pool: Pool = {
-		color = color,
-		normal = normal,
-		rough = rough,
-		colorEntry = Uploader.register(U, "colour atlas", color),
-		normalEntry = if normal then Uploader.register(U, "normal atlas", normal) else nil,
-		roughEntry = if rough then Uploader.register(U, "roughness atlas", rough) else nil,
-		mode = "texture",
-		note = "not decided yet",
+	return {
+		sets = {},
+		chunks = {},
 		slots = {},
+		mode = "texture",
+		note = "no atlas set yet",
 		folder = folder,
 		flipV = false,
-		template = nil,
 		cloneWorks = nil,
 		tris = TileGen.triangles(),
-		growing = false,
 		failed = nil,
 		meshMode = "batch",
-		stats = { created = 0, writes = 0, meshMs = 0, pixels = Layout.ATLAS * Layout.ATLAS + (if normal then Layout.ATLAS * Layout.ATLAS else 0) + (if rough then Layout.ROUGH_ATLAS * Layout.ROUGH_ATLAS else 0) },
+		slotsPerMesh = math.clamp(Config.slotsPerMesh, 8, Layout.SLOTS),
+		maxSlots = 0,
+		stats = { created = 0, writes = 0, meshMs = 0, pixels = 0, meshVerts = 0 },
+		park = park,
+		U = U,
 	}
-	-- decide the surface path once: PBR maps through CreateSurfaceAppearanceAsync, or colour only
-	if normal and rough then
-		local ok, sa = pcall(function()
-			return AssetService:CreateSurfaceAppearanceAsync({
-				ColorMap = Content.fromObject(color),
-				NormalMap = Content.fromObject(normal),
-				RoughnessMap = Content.fromObject(rough),
-			})
-		end)
-		if ok and sa then
-			pool.template = sa
-			pool.mode = "pbr"
-			pool.note = "colour + normal + roughness maps (CreateSurfaceAppearanceAsync)"
-		else
-			pool.note = "CreateSurfaceAppearanceAsync refused (" .. tostring(sa) .. "); colour only via TextureContent"
-		end
-	else
-		pool.note = "normal/roughness atlases refused by the memory budget; colour only"
-	end
-	return pool, nil
 end
 
--- One SurfaceAppearance per slot: a clone of the template when cloning keeps the maps,
--- else a fresh CreateSurfaceAppearanceAsync call.
-local function surfaceFor(pool: Pool): SurfaceAppearance?
-	local template = pool.template
+-- One SurfaceAppearance for a mesh part of `set`: a clone of the set's template when cloning
+-- keeps the maps, else a fresh CreateSurfaceAppearanceAsync call.
+local function surfaceFor(pool: Pool, set: Set): SurfaceAppearance?
+	local template = set.template
 	if not template then
 		return nil
 	end
@@ -21141,7 +22382,7 @@ local function surfaceFor(pool: Pool): SurfaceAppearance?
 		if ok and clone then
 			if pool.cloneWorks == nil then
 				local same = pcall(function()
-					assert(((clone :: SurfaceAppearance).ColorMapContent.Object :: any) == pool.color)
+					assert(((clone :: SurfaceAppearance).ColorMapContent.Object :: any) == set.color)
 				end)
 				pool.cloneWorks = same
 			end
@@ -21155,88 +22396,87 @@ local function surfaceFor(pool: Pool): SurfaceAppearance?
 	end
 	local ok, sa = pcall(function()
 		return AssetService:CreateSurfaceAppearanceAsync({
-			ColorMap = Content.fromObject(pool.color),
-			NormalMap = Content.fromObject(pool.normal :: EditableImage),
-			RoughnessMap = Content.fromObject(pool.rough :: EditableImage),
+			ColorMap = Content.fromObject(set.color),
+			NormalMap = Content.fromObject(set.normal :: EditableImage),
+			RoughnessMap = Content.fromObject(set.rough :: EditableImage),
 		})
 	end)
 	return if ok then sa else nil
 end
 
-local function uvVector(pool: Pool, uvs: { number }, v: number): Vector2
+local function uvOf(pool: Pool, uvs: { number }, v: number): Vector2
 	local u, w = uvs[v * 2 + 1], uvs[v * 2 + 2]
 	return Vector2.new(u, if pool.flipV then 1 - w else w)
 end
 
--- Builds one slot (yields: CreateMeshPartAsync). Returns nil and a reason on failure.
-local function newSlot(pool: Pool, index: number): (Slot?, string?)
-	local tx, ty = Layout.tileOf(index)
+-- Builds one mesh part carrying slots [first, first + count) of `set`. Yields between the
+-- heavy calls. Returns nil and the reason when the engine refuses.
+local function buildChunk(pool: Pool, set: Set, first: number, count: number): (Chunk?, string?)
 	local mesh = AssetService:CreateEditableMesh()
 	if not mesh then
 		return nil, "CreateEditableMesh returned nil (editable memory budget)"
 	end
-	local V = Layout.VERTS
-	local G = Layout.GRID
 	local P = Layout.PIN_EXTENT
-	-- initial geometry: a small flat grid (no zero-area triangles except the pins)
-	local positions = table.create(V, Vector3.zero)
-	local normals = table.create(V, Vector3.yAxis)
-	for v = 0, Layout.GRID_VERTS + Layout.SKIRT_VERTS - 1 do
-		local g = if v < Layout.GRID_VERTS then v else v % (G + 1)
-		positions[v + 1] = Vector3.new(g % (G + 1), (g // (G + 1)) * 0.5 + (if v < Layout.GRID_VERTS then 0 else -1), g // (G + 1))
+	local nV = count * VS + 6
+	local positions: { Vector3 } = table.create(nV, Vector3.zero)
+	local uvList: { Vector2 } = table.create(nV, Vector2.zero)
+	local normals: { Vector3 } = table.create(nV, Vector3.yAxis)
+	for k = 0, count - 1 do
+		local tx, ty = Layout.tileOf(first + k)
+		local uvs = TileGen.uvs(tx, ty)
+		local base = k * VS
+		for v = 0, VS - 1 do
+			positions[base + v + 1] = pool.park[v + 1]
+			uvList[base + v + 1] = uvOf(pool, uvs, v)
+		end
 	end
 	local pins = { Vector3.new(P, P, P), Vector3.new(P - 0.01, P, P), Vector3.new(P, P - 0.01, P), Vector3.new(-P, -P, -P), Vector3.new(-P + 0.01, -P, -P), Vector3.new(-P, -P + 0.01, -P) }
 	for k = 1, 6 do
-		positions[V - 6 + k] = pins[k]
-	end
-	local uvs = TileGen.uvs(tx, ty)
-	local uvList = table.create(V, Vector2.zero)
-	for v = 0, V - 1 do
-		uvList[v + 1] = uvVector(pool, uvs, v)
+		positions[count * VS + k] = pins[k]
 	end
 	local tris = pool.tris
-	local T = #tris // 3
 	local vIds: { number } = {}
-	local nIds: { number } = {}
 	local uvIds: { number } = {}
+	local nIds: { number } = {}
 	local ok, err = pcall(function()
 		vIds = mesh:BatchAdd(Enum.MeshAttribute.Vertex, positions) :: { number }
+		task.wait()
 		uvIds = mesh:BatchAdd(Enum.MeshAttribute.UV, uvList) :: { number }
 		nIds = mesh:BatchAdd(Enum.MeshAttribute.Normal, normals) :: { number }
+		task.wait()
+		local T = count * TS + 2
 		local faces = table.create(T)
 		local faceUV = table.create(T)
 		local faceN = table.create(T)
-		for t = 0, T - 1 do
-			local a, b, c = tris[t * 3 + 1] + 1, tris[t * 3 + 2] + 1, tris[t * 3 + 3] + 1
-			faces[t + 1] = { vIds[a], vIds[b], vIds[c] }
-			faceUV[t + 1] = { uvIds[a], uvIds[b], uvIds[c] }
-			faceN[t + 1] = { nIds[a], nIds[b], nIds[c] }
+		local n = 0
+		for k = 0, count - 1 do
+			local base = k * VS
+			for t = 0, TS - 1 do
+				local a, b, c = base + tris[t * 3 + 1] + 1, base + tris[t * 3 + 2] + 1, base + tris[t * 3 + 3] + 1
+				n += 1
+				faces[n] = { vIds[a], vIds[b], vIds[c] }
+				faceUV[n] = { uvIds[a], uvIds[b], uvIds[c] }
+				faceN[n] = { nIds[a], nIds[b], nIds[c] }
+			end
+			if k % 32 == 31 then
+				task.wait()
+			end
+		end
+		local pb = count * VS
+		for _, tri in { { 1, 2, 3 }, { 4, 5, 6 } } do
+			n += 1
+			faces[n] = { vIds[pb + tri[1]], vIds[pb + tri[2]], vIds[pb + tri[3]] }
+			faceUV[n] = { uvIds[pb + tri[1]], uvIds[pb + tri[2]], uvIds[pb + tri[3]] }
+			faceN[n] = { nIds[pb + tri[1]], nIds[pb + tri[2]], nIds[pb + tri[3]] }
 		end
 		local fIds = mesh:BatchAdd(Enum.MeshAttribute.Face, faces) :: { number }
+		task.wait()
 		mesh:BatchSetFaceAttributes(fIds, faceUV)
 		mesh:BatchSetFaceAttributes(fIds, faceN)
 	end)
 	if not ok then
-		-- per-element fallback on a fresh mesh
-		pool.meshMode = "per-element (batch failed: " .. tostring(err) .. ")"
 		mesh:Destroy()
-		local m2 = AssetService:CreateEditableMesh()
-		if not m2 then
-			return nil, "CreateEditableMesh returned nil on retry"
-		end
-		mesh = m2
-		vIds, nIds, uvIds = table.create(V), table.create(V), table.create(V)
-		for v = 1, V do
-			vIds[v] = m2:AddVertex(positions[v])
-			uvIds[v] = m2:AddUV(uvList[v])
-			nIds[v] = m2:AddNormal(normals[v])
-		end
-		for t = 0, T - 1 do
-			local a, b, c = tris[t * 3 + 1] + 1, tris[t * 3 + 2] + 1, tris[t * 3 + 3] + 1
-			local f = m2:AddTriangle(vIds[a], vIds[b], vIds[c])
-			m2:SetFaceUVs(f, { uvIds[a], uvIds[b], uvIds[c] })
-			m2:SetFaceNormals(f, { nIds[a], nIds[b], nIds[c] })
-		end
+		return nil, "mesh build with " .. count .. " slots: " .. tostring(err)
 	end
 	local partOk, partOrErr = pcall(function()
 		return AssetService:CreateMeshPartAsync(Content.fromObject(mesh), {
@@ -21246,10 +22486,10 @@ local function newSlot(pool: Pool, index: number): (Slot?, string?)
 	end)
 	if not partOk or not partOrErr then
 		mesh:Destroy()
-		return nil, "CreateMeshPartAsync: " .. tostring(partOrErr)
+		return nil, "CreateMeshPartAsync with " .. count .. " slots: " .. tostring(partOrErr)
 	end
 	local part = partOrErr :: MeshPart
-	part.Name = "Patch" .. index
+	part.Name = string.format("Surface_%d_%d", set.index, first)
 	part.Anchored = true
 	part.CanCollide = false
 	part.CanQuery = false
@@ -21261,57 +22501,205 @@ local function newSlot(pool: Pool, index: number): (Slot?, string?)
 	part.Locked = true
 	local sa: SurfaceAppearance? = nil
 	if pool.mode == "pbr" then
-		sa = surfaceFor(pool)
+		sa = surfaceFor(pool, set)
 		if sa then
 			sa.Parent = part
 		end
 	end
 	if not sa then
 		pcall(function()
-			part.TextureContent = Content.fromObject(pool.color)
+			part.TextureContent = Content.fromObject(set.color)
 		end)
 	end
 	part.Parent = pool.folder
-	pool.stats.created += 1
-	return {
-		index = index,
-		tx = tx,
-		ty = ty,
-		mesh = mesh,
-		part = part,
-		sa = sa,
-		vIds = vIds,
-		nIds = nIds,
-		uvIds = uvIds,
-		key = nil,
-		state = "free",
-		lastUsed = 0,
-		ticket = 0,
-	},
-		nil
-end
-
--- Grows the pool by up to `count` slots (yields). Returns the number created.
-function MeshPool.grow(pool: Pool, count: number): number
-	local made = 0
-	while made < count and #pool.slots < Layout.SLOTS do
-		local slot, err = newSlot(pool, #pool.slots)
-		if not slot then
-			pool.failed = err
-			break
-		end
-		table.insert(pool.slots, slot)
-		made += 1
+	local chunk: Chunk = { set = set, mesh = mesh, part = part, sa = sa, first = first, count = count, uvIds = uvIds }
+	table.insert(set.chunks, chunk)
+	table.insert(pool.chunks, chunk)
+	for k = 0, count - 1 do
+		local tile = first + k
+		local tx, ty = Layout.tileOf(tile)
+		local slotV: { number } = table.create(VS)
+		local slotN: { number } = table.create(VS)
+		table.move(vIds, k * VS + 1, k * VS + VS, 1, slotV)
+		table.move(nIds, k * VS + 1, k * VS + VS, 1, slotN)
+		table.insert(pool.slots, {
+			index = #pool.slots,
+			set = set,
+			chunk = chunk,
+			tile = tile,
+			tx = tx,
+			ty = ty,
+			vIds = slotV,
+			nIds = slotN,
+			key = nil,
+			state = "free",
+			lastUsed = 0,
+			ticket = 0,
+			result = nil,
+			final = nil,
+			finalN = nil,
+			morph = nil,
+		})
 	end
-	return made
+	pool.stats.created += 1
+	pool.stats.meshVerts += nV
+	return chunk, nil
 end
 
--- Writes a generated patch into a slot: three tile uploads (queued) and the mesh (now).
--- `onReady` runs once every atlas holding the patch has been refreshed.
-function MeshPool.assign(pool: Pool, U: Uploader.Uploader, slot: Slot, result: any, onReady: () -> ())
-	local t0 = os.clock()
+-- Adds an atlas set: three images, the SurfaceAppearance template, and the meshes of its
+-- 256 slots (one mesh, or fewer slots per mesh if the engine refuses). Yields. Returns
+-- false and the reason when nothing could be added.
+function MeshPool.addSet(pool: Pool): (boolean, string?)
+	local index = #pool.sets + 1
+	local color, err = createImage(Layout.ATLAS, Layout.ATLAS)
+	if not color then
+		return false, "set " .. index .. " colour atlas: " .. tostring(err)
+	end
+	local normal = createImage(Layout.ATLAS, Layout.ATLAS)
+	local rough = createImage(Layout.ROUGH_ATLAS, Layout.ROUGH_ATLAS)
+	local U = pool.U
+	local set: Set = {
+		index = index,
+		color = color,
+		normal = normal,
+		rough = rough,
+		colorEntry = Uploader.register(U, string.format("colour atlas %d", index), color),
+		normalEntry = if normal then Uploader.register(U, string.format("normal atlas %d", index), normal) else nil,
+		roughEntry = if rough then Uploader.register(U, string.format("roughness atlas %d", index), rough) else nil,
+		template = nil,
+		chunks = {},
+	}
+	pool.stats.pixels += Layout.ATLAS * Layout.ATLAS + (if normal then Layout.ATLAS * Layout.ATLAS else 0) + (if rough then Layout.ROUGH_ATLAS * Layout.ROUGH_ATLAS else 0)
+	if index == 1 then
+		if normal and rough then
+			local ok, sa = pcall(function()
+				return AssetService:CreateSurfaceAppearanceAsync({
+					ColorMap = Content.fromObject(color),
+					NormalMap = Content.fromObject(normal),
+					RoughnessMap = Content.fromObject(rough),
+				})
+			end)
+			if ok and sa then
+				set.template = sa
+				pool.mode = "pbr"
+				pool.note = "colour + normal + roughness maps (CreateSurfaceAppearanceAsync)"
+			else
+				pool.note = "CreateSurfaceAppearanceAsync refused (" .. tostring(sa) .. "); colour only via TextureContent"
+			end
+		else
+			pool.note = "normal/roughness atlases refused by the memory budget; colour only"
+		end
+	elseif pool.mode == "pbr" then
+		if normal and rough then
+			local ok, sa = pcall(function()
+				return AssetService:CreateSurfaceAppearanceAsync({
+					ColorMap = Content.fromObject(color),
+					NormalMap = Content.fromObject(normal),
+					RoughnessMap = Content.fromObject(rough),
+				})
+			end)
+			if ok and sa then
+				set.template = sa
+			end
+		end
+		if not set.template then
+			-- a later set without its normal maps cannot match the first: do not add it
+			color:Destroy()
+			if normal then
+				normal:Destroy()
+			end
+			if rough then
+				rough:Destroy()
+			end
+			Uploader.unregister(U, set.colorEntry)
+			if set.normalEntry then
+				Uploader.unregister(U, set.normalEntry :: Uploader.Entry)
+			end
+			if set.roughEntry then
+				Uploader.unregister(U, set.roughEntry :: Uploader.Entry)
+			end
+			pool.stats.pixels -= Layout.ATLAS * Layout.ATLAS * 2 + Layout.ROUGH_ATLAS * Layout.ROUGH_ATLAS
+			return false, "set " .. index .. ": the memory budget refused its normal or roughness atlas"
+		end
+	end
+	-- meshes: all slots in one, halving on refusal
+	table.insert(pool.sets, set)
+	local per = pool.slotsPerMesh
+	local first = 0
+	while first < Layout.SLOTS do
+		local count = math.min(per, Layout.SLOTS - first)
+		local chunk, why = buildChunk(pool, set, first, count)
+		if chunk then
+			first += count
+		else
+			pool.meshMode = string.format("%d slots per mesh (a larger mesh was refused: %s)", math.max(8, per // 2), string.sub(tostring(why), 1, 80))
+			if per <= 8 then
+				pool.failed = why
+				break
+			end
+			per //= 2
+			pool.slotsPerMesh = per
+		end
+	end
+	if first == 0 then
+		table.remove(pool.sets)
+		return false, tostring(pool.failed)
+	end
+	pool.maxSlots = #pool.slots
+	if per == Layout.SLOTS or first >= Layout.SLOTS and #set.chunks == 1 then
+		pool.meshMode = string.format("one mesh per set (%d vertices)", Layout.SLOTS * VS)
+	end
+	return true, nil
+end
+
+----------------------------------------------------------------------------------------
+-- slot geometry
+----------------------------------------------------------------------------------------
+
+-- Final positions and normals of the patch a slot holds, as Vector3 arrays (cached).
+function MeshPool.finals(slot: Slot): ({ Vector3 }, { Vector3 })
+	local f, fn = slot.final, slot.finalN
+	if f and fn then
+		return f, fn
+	end
+	local r = slot.result
+	local pb, nb = r.positions, r.normals
+	local pos: { Vector3 } = table.create(VS)
+	local nrm: { Vector3 } = table.create(VS)
+	for v = 0, VS - 1 do
+		local o = v * 12
+		pos[v + 1] = Vector3.new(buffer.readf32(pb, o), buffer.readf32(pb, o + 4), buffer.readf32(pb, o + 8))
+		nrm[v + 1] = Vector3.new(buffer.readf32(nb, o), buffer.readf32(nb, o + 4), buffer.readf32(nb, o + 8))
+	end
+	slot.final, slot.finalN = pos, nrm
+	return pos, nrm
+end
+
+local function writeValues(mesh: EditableMesh, ids: { number }, values: { Vector3 }, setter: string)
+	local ok = pcall(function()
+		mesh:BatchSetValues(ids, values)
+	end)
+	if not ok then
+		for i = 1, #ids do
+			if setter == "pos" then
+				mesh:SetPosition(ids[i], values[i])
+			else
+				mesh:SetNormal(ids[i], values[i])
+			end
+		end
+	end
+end
+
+-- Hands a generated patch to a slot: queues its three atlas tiles and keeps the buffers.
+-- The mesh is not touched until the slot is shown. `onReady` runs once every atlas holding
+-- the patch has been refreshed.
+function MeshPool.assign(pool: Pool, slot: Slot, result: any, onReady: () -> ())
 	slot.key = result.key
 	slot.state = "uploading"
+	slot.result = result
+	slot.final, slot.finalN = nil, nil
+	slot.morph = nil
+	local set = slot.set
 	local T, RT = Layout.TILE, Layout.ROUGH_TILE
 	local waiting = 1
 	local function done()
@@ -21320,79 +22708,192 @@ function MeshPool.assign(pool: Pool, U: Uploader.Uploader, slot: Slot, result: a
 			onReady()
 		end
 	end
-	if pool.mode == "pbr" and pool.normalEntry and pool.roughEntry then
+	if pool.mode == "pbr" and set.normalEntry and set.roughEntry then
 		waiting = 3
-		Uploader.queue(U, pool.normalEntry :: Uploader.Entry, slot.tx * T, slot.ty * T, T, T, result.normal, done)
-		Uploader.queue(U, pool.roughEntry :: Uploader.Entry, slot.tx * RT, slot.ty * RT, RT, RT, result.rough, done)
+		Uploader.queue(pool.U, set.normalEntry :: Uploader.Entry, slot.tx * T, slot.ty * T, T, T, result.normal, done)
+		Uploader.queue(pool.U, set.roughEntry :: Uploader.Entry, slot.tx * RT, slot.ty * RT, RT, RT, result.rough, done)
 	end
-	Uploader.queue(U, pool.colorEntry, slot.tx * T, slot.ty * T, T, T, result.color, done)
-	-- the mesh: positions and normals from the f32 buffers
-	local V = Layout.VERTS
-	local pb, nb = result.positions, result.normals
-	local pos = table.create(V, Vector3.zero)
-	local nrm = table.create(V, Vector3.yAxis)
-	for v = 0, V - 1 do
-		local o = v * 12
-		pos[v + 1] = Vector3.new(buffer.readf32(pb, o), buffer.readf32(pb, o + 4), buffer.readf32(pb, o + 8))
-		nrm[v + 1] = Vector3.new(buffer.readf32(nb, o), buffer.readf32(nb, o + 4), buffer.readf32(nb, o + 8))
-	end
-	local mesh = slot.mesh
-	local ok = pcall(function()
-		mesh:BatchSetValues(slot.vIds, pos)
-	end)
-	if not ok then
-		for v = 1, V do
-			mesh:SetPosition(slot.vIds[v], pos[v])
-		end
-	end
-	ok = pcall(function()
-		mesh:BatchSetValues(slot.nIds, nrm)
-	end)
-	if not ok then
-		for v = 1, V do
-			mesh:SetNormal(slot.nIds[v], nrm[v])
-		end
-	end
+	Uploader.queue(pool.U, set.colorEntry, slot.tx * T, slot.ty * T, T, T, result.color, done)
 	pool.stats.writes += 1
+end
+
+-- Shows the patch a slot holds. With `start` (a Vector3 array of its vertices' starting
+-- positions) the vertices begin there and slide to their final positions (geomorph): the
+-- new patch appears exactly on the surface that was displayed, and refines into itself.
+function MeshPool.show(pool: Pool, slot: Slot, start: { Vector3 }?)
+	local t0 = os.clock()
+	local pos, nrm = MeshPool.finals(slot)
+	local mesh = slot.chunk.mesh
+	writeValues(mesh, slot.nIds, nrm, "nrm")
+	if start then
+		writeValues(mesh, slot.vIds, start, "pos")
+		slot.morph = { t = 0, start = start, final = pos }
+	else
+		writeValues(mesh, slot.vIds, pos, "pos")
+		slot.morph = nil
+	end
+	slot.state = "shown"
 	pool.stats.meshMs += (os.clock() - t0) * 1000
 end
 
--- Flips the V coordinate of every slot's UVs (for an engine whose UV origin is the
+-- Advances a slot's geomorph by dt / seconds. Returns true while it is still morphing.
+function MeshPool.stepMorph(slot: Slot, dt: number, seconds: number): boolean
+	local m = slot.morph
+	if not m then
+		return false
+	end
+	m.t += dt / seconds
+	local mesh = slot.chunk.mesh
+	if m.t >= 1 then
+		writeValues(mesh, slot.vIds, m.final, "pos")
+		slot.morph = nil
+		return false
+	end
+	local e = m.t * m.t * (3 - 2 * m.t)
+	local out: { Vector3 } = table.create(VS)
+	local a, b = m.start, m.final
+	for i = 1, VS do
+		out[i] = a[i]:Lerp(b[i], e)
+	end
+	writeValues(mesh, slot.vIds, out, "pos")
+	return true
+end
+
+-- Hides a slot's patch: its vertices go back to the parking cluster at the body's centre.
+function MeshPool.park(pool: Pool, slot: Slot)
+	slot.morph = nil
+	writeValues(slot.chunk.mesh, slot.vIds, pool.park, "pos")
+end
+
+-- Frees a slot's held patch (the slot must be parked or never shown).
+function MeshPool.clear(slot: Slot)
+	slot.result, slot.final, slot.finalN, slot.morph = nil, nil, nil, nil
+end
+
+-- Starting positions for a new child patch (quadrant qx, qy of its parent, whose generated
+-- result is `parent`): the parent's displayed surface, bilinear between its grid vertices
+-- (skirt vertices follow their grid neighbours down).
+function MeshPool.startFromParent(parent: any, qx: number, qy: number, skirt: number): { Vector3 }
+	local G = Layout.GRID
+	local pb = parent.positions
+	local function grid(i: number, j: number): (number, number, number)
+		local o = (j * (G + 1) + i) * 12
+		return buffer.readf32(pb, o), buffer.readf32(pb, o + 4), buffer.readf32(pb, o + 8)
+	end
+	local out: { Vector3 } = table.create(VS)
+	local function at(vi: number, vj: number): Vector3
+		local u = (qx * G + vi) / 2
+		local w = (qy * G + vj) / 2
+		local i0 = math.min(math.floor(u), G - 1)
+		local j0 = math.min(math.floor(w), G - 1)
+		local fx, fy = u - i0, w - j0
+		local x00, y00, z00 = grid(i0, j0)
+		local x10, y10, z10 = grid(i0 + 1, j0)
+		local x01, y01, z01 = grid(i0, j0 + 1)
+		local x11, y11, z11 = grid(i0 + 1, j0 + 1)
+		local ax, ay, az = x00 + (x10 - x00) * fx, y00 + (y10 - y00) * fx, z00 + (z10 - z00) * fx
+		local bx, by, bz = x01 + (x11 - x01) * fx, y01 + (y11 - y01) * fx, z01 + (z11 - z01) * fx
+		return Vector3.new(ax + (bx - ax) * fy, ay + (by - ay) * fy, az + (bz - az) * fy)
+	end
+	for vj = 0, G do
+		for vi = 0, G do
+			out[vj * (G + 1) + vi + 1] = at(vi, vj)
+		end
+	end
+	-- skirts: bottom, right, top, left (the order TileGen writes), each one skirt depth below
+	-- its grid neighbour along the radial direction
+	local base = Layout.GRID_VERTS
+	local function drop(p: Vector3): Vector3
+		local m = p.Magnitude
+		return if m > 1e-6 then p * ((m - skirt) / m) else p
+	end
+	for vi = 0, G do
+		out[base + vi + 1] = drop(out[vi + 1])
+	end
+	for vj = 0, G do
+		out[base + (G + 1) + vj + 1] = drop(out[vj * (G + 1) + G + 1])
+	end
+	for vi = 0, G do
+		out[base + 2 * (G + 1) + vi + 1] = drop(out[G * (G + 1) + vi + 1])
+	end
+	for vj = 0, G do
+		out[base + 3 * (G + 1) + vj + 1] = drop(out[vj * (G + 1) + 1])
+	end
+	return out
+end
+
+-- Starting positions for a coarser parent patch that replaces its children: each of its
+-- vertices begins exactly on the child vertex at the same place (a coarse grid is a
+-- subsample of the fine one). `children` maps quadrant index (qy * 2 + qx) to the child's
+-- generated result; missing children leave their quadrant at the parent's own position.
+function MeshPool.startFromChildren(parentFinal: { Vector3 }, children: { [number]: any }): { Vector3 }
+	local G = Layout.GRID
+	local out: { Vector3 } = table.clone(parentFinal)
+	for vj = 0, G do
+		for vi = 0, G do
+			-- the child quadrant containing this vertex (vertices on the middle line use the
+			-- lower-index child: same position in both)
+			local qx = if vi * 2 > G then 1 else 0
+			local qy = if vj * 2 > G then 1 else 0
+			local child = children[qy * 2 + qx]
+			if child then
+				local ci, cj = 2 * vi - qx * G, 2 * vj - qy * G
+				local o = (cj * (G + 1) + ci) * 12
+				local pb = child.positions
+				out[vj * (G + 1) + vi + 1] = Vector3.new(buffer.readf32(pb, o), buffer.readf32(pb, o + 4), buffer.readf32(pb, o + 8))
+			end
+		end
+	end
+	-- skirts follow: parent skirts stay as generated (they are below the surface anyway)
+	return out
+end
+
+-- Flips the V coordinate of every vertex's UV (for an engine whose UV origin is the
 -- bottom-left corner). Tile contents stay; only the mapping changes.
 function MeshPool.setFlipV(pool: Pool, flip: boolean)
 	if pool.flipV == flip then
 		return
 	end
 	pool.flipV = flip
-	for _, slot in pool.slots do
-		local uvs = TileGen.uvs(slot.tx, slot.ty)
-		local V = Layout.VERTS
-		local list = table.create(V, Vector2.zero)
-		for v = 0, V - 1 do
-			list[v + 1] = uvVector(pool, uvs, v)
+	for _, chunk in pool.chunks do
+		local nV = chunk.count * VS + 6
+		local list: { Vector2 } = table.create(nV, Vector2.zero)
+		for k = 0, chunk.count - 1 do
+			local tx, ty = Layout.tileOf(chunk.first + k)
+			local uvs = TileGen.uvs(tx, ty)
+			for v = 0, VS - 1 do
+				list[k * VS + v + 1] = uvOf(pool, uvs, v)
+			end
 		end
 		local ok = pcall(function()
-			slot.mesh:BatchSetValues(slot.uvIds, list)
+			chunk.mesh:BatchSetValues(chunk.uvIds, list)
 		end)
 		if not ok then
-			for v = 1, V do
+			for i = 1, nV do
 				pcall(function()
-					slot.mesh:SetUV(slot.uvIds[v], list[v])
+					chunk.mesh:SetUV(chunk.uvIds[i], list[i])
 				end)
 			end
+		end
+		task.wait()
+	end
+end
+
+-- Whole-surface opacity (crossfade with the impostor).
+function MeshPool.setOpacity(pool: Pool, opacity: number)
+	local tr = 1 - opacity
+	for _, chunk in pool.chunks do
+		if chunk.part.Transparency ~= tr then
+			chunk.part.Transparency = tr
 		end
 	end
 end
 
--- Debug tint of a slot's surface (SurfaceAppearance.Color multiplies the colour map).
-function MeshPool.tint(slot: Slot, color: Color3)
-	local sa = slot.sa
-	if sa then
-		pcall(function()
-			sa.Color = color
-		end)
-	else
-		slot.part.Color = color
+-- Places every part at the body's centre (all vertices are body-local).
+function MeshPool.place(pool: Pool, center: Vector3)
+	local cf = CFrame.new(center)
+	for _, chunk in pool.chunks do
+		chunk.part.CFrame = cf
 	end
 end
 
@@ -21400,27 +22901,30 @@ return MeshPool
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="56">
+        <Item class="ModuleScript" referent="57">
           <Properties>
             <string name="Name">PlanetLod</string>
             <string name="Source"><![CDATA[--!strict
 -- Universe at Home: Planets :: PlanetLod
 --
--- Drives the patch system for the one body the camera is close to (the focus): selects
--- the target cut (Quadtree.select), plans hole-free steps towards it (Quadtree.plan),
--- generates patches on the worker Actors, uploads them through the atlases, and swaps
--- them in with a two-phase fade.
+-- Drives the surface of the one body the camera is close to (the focus): selects the target
+-- cut (Quadtree.select), plans hole-free steps towards it (Quadtree.plan), generates patches
+-- on the worker Actors, uploads their tiles through the atlases, and moves them into the
+-- single mesh with a geomorph.
 --
 --   bootstrap  the six face roots are generated and shown together (the plan needs a
 --              displayed partition to start from)
---   generate   patches the plan asks for, most visible first, into free slots or slots
+--   generate   the patches the plan asks for, most visible first, into free slots or slots
 --              holding cached patches nobody needs (least recently used first)
---   results    applied on the main thread within a time budget (mesh writes), atlas
---              tiles queued on the Uploader; a patch is ready once its atlases flushed
---   swaps      phase 1: the new patches fade in over the old ones, pulled a hair towards
---              the camera so the depth test never lets the old surface win (no
---              z-fighting); phase 2: the old patches disappear behind them. With fades off
---              the swap is instant (the comparison the HUD toggle shows).
+--   results    applied on the main thread: atlas tiles queued on the Uploader; a patch is
+--              ready once all its atlases have flushed. The mesh is not touched until the
+--              patch is shown, which spreads the vertex writes over the swaps
+--   swaps      GEOMORPH. A new patch is shown with its vertices on the surface that was
+--              displayed (a child on its parent's bilinear surface, a parent on the
+--              children's vertices) and they slide to their own heights over
+--              Config.morphSeconds. There is no fade, no overlap and no depth trick: at every
+--              instant the surface is one continuous mesh. (The tile contents switch at the
+--              first frame; a child's tile refines its parent's, so that is a sharpening.)
 --   alpha      the whole mesh fades against the body's impostor when the focus changes
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -21428,37 +22932,18 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Planets = ReplicatedStorage:WaitForChild("Planets")
 local Quadtree = require(Planets:WaitForChild("Quadtree")) :: any
 local CubeSphere = require(Planets:WaitForChild("CubeSphere")) :: any
-local Layout = require(Planets:WaitForChild("Layout")) :: any
+local TileGen = require(Planets:WaitForChild("TileGen")) :: any
 local WorkerPool = require(Planets:WaitForChild("WorkerPool")) :: any
+local Config = require(Planets:WaitForChild("Config")) :: any
 local MeshPool = require(script.Parent:WaitForChild("MeshPool"))
 local Uploader = require(script.Parent:WaitForChild("Uploader"))
 
-local Config = require(Planets:WaitForChild("Config"))
-
 local PlanetLod = {}
-
-local FADE_SECONDS = 0.35
-local LEVEL_TINTS = {
-	Color3.fromRGB(255, 140, 140),
-	Color3.fromRGB(255, 205, 128),
-	Color3.fromRGB(255, 255, 128),
-	Color3.fromRGB(153, 255, 128),
-	Color3.fromRGB(128, 255, 230),
-	Color3.fromRGB(128, 190, 255),
-	Color3.fromRGB(190, 140, 255),
-	Color3.fromRGB(255, 140, 230),
-}
 
 type Slot = MeshPool.Slot
 
-type Fade = {
-	show: { Slot },
-	hide: { Slot },
-	t: number,
-}
-
 export type Options = {
-	fades: boolean,
+	fades: boolean, -- geomorph on (true) or hard swaps (false)
 	frozen: boolean,
 	greenUp: boolean,
 	tint: boolean,
@@ -21484,12 +22969,12 @@ export type Lod = {
 	split: { [number]: boolean }?,
 	metric: { [number]: number },
 	target: { number },
-	fades: { Fade },
-	opacity: { [Slot]: number },
-	biased: { [Slot]: boolean },
+	morphing: { Slot },
+	morphAcc: { [Slot]: number },
 	booted: boolean,
 	alpha: number, -- whole-mesh opacity
 	alphaTarget: number,
+	shownAlpha: number,
 	frame: number,
 	lastSelect: number,
 	lastCam: Vector3,
@@ -21501,9 +22986,11 @@ export type Lod = {
 		genMs: number,
 		swaps: number,
 		evicted: number,
-		rate: number, -- patches per second (smoothed)
+		rate: number,
 		deepest: number,
 		limited: boolean,
+		morphs: number,
+		morphWrites: number,
 	},
 }
 
@@ -21526,17 +23013,17 @@ function PlanetLod.new(pool: MeshPool.Pool, U: Uploader.Uploader, workers: any):
 		split = nil,
 		metric = {},
 		target = {},
-		fades = {},
-		opacity = {},
-		biased = {},
+		morphing = {},
+		morphAcc = {},
 		booted = false,
 		alpha = 0,
 		alphaTarget = 0,
+		shownAlpha = -1,
 		frame = 0,
 		lastSelect = -100,
 		lastCam = Vector3.new(1e9, 0, 0),
-		opts = { fades = true, frozen = false, greenUp = true, tint = false, splitPx = Config.splitPx, capacity = math.min(Config.capacity, Layout.SLOTS) },
-		stats = { generated = 0, failed = 0, lastError = nil, genMs = 0, swaps = 0, evicted = 0, rate = 0, deepest = 0, limited = false },
+		opts = { fades = true, frozen = false, greenUp = true, tint = false, splitPx = Config.splitPx, capacity = Config.capacity },
+		stats = { generated = 0, failed = 0, lastError = nil, genMs = 0, swaps = 0, evicted = 0, rate = 0, deepest = 0, limited = false, morphs = 0, morphWrites = 0 },
 	}
 end
 
@@ -21545,11 +23032,7 @@ local function levelOf(key: number): number
 	return L
 end
 
-local function applyVisual(L: Lod, slot: Slot)
-	local o = L.opacity[slot] or 0
-	slot.part.Transparency = 1 - o * L.alpha
-end
-
+-- Frees a slot: forgets its patch and parks its vertices if they were visible.
 local function release(L: Lod, slot: Slot)
 	local key = slot.key
 	if key then
@@ -21558,19 +23041,21 @@ local function release(L: Lod, slot: Slot)
 			L.slotOf[key] = nil
 		end
 	end
+	if slot.state == "shown" then
+		MeshPool.park(L.pool, slot)
+	end
+	MeshPool.clear(slot)
 	slot.key = nil
 	slot.state = "free"
 	slot.ticket += 1
-	L.opacity[slot] = nil
-	L.biased[slot] = nil
-	slot.part.Transparency = 1
-	slot.part.CFrame = CFrame.new(L.bodyPos)
 end
 
--- Drops every patch (focus change, normal-convention change).
+-- Drops every patch (focus change, convention change).
 function PlanetLod.reset(L: Lod)
 	for _, slot in L.pool.slots do
-		release(L, slot)
+		if slot.state ~= "free" then
+			release(L, slot)
+		end
 	end
 	L.displayed = {}
 	L.ready = {}
@@ -21578,9 +23063,8 @@ function PlanetLod.reset(L: Lod)
 	L.generating = {}
 	L.wanted = {}
 	L.results = {}
-	L.fades = {}
-	L.opacity = {}
-	L.biased = {}
+	L.morphing = {}
+	L.morphAcc = {}
 	L.split = nil
 	L.booted = false
 	L.lastSelect = -100
@@ -21598,35 +23082,24 @@ function PlanetLod.setBody(L: Lod, body: any?)
 	L.alpha = 0
 	if body then
 		L.bodyPos = Vector3.new(body.px, body.py, body.pz)
+		MeshPool.place(L.pool, L.bodyPos)
 	end
 end
 
 -- A slot for a new patch: a free one, else the least recently used cached patch that is
--- neither displayed nor wanted. Grows the pool in the background when everything is busy.
+-- neither displayed nor needed by a pending step.
 local function acquire(L: Lod): Slot?
 	local free: Slot? = nil
-	local nFree = 0
 	local best: Slot? = nil
 	for _, slot in L.pool.slots do
 		if slot.state == "free" then
-			nFree += 1
-			if not free then
-				free = slot
-			end
+			free = slot
+			break
 		elseif slot.state == "ready" and slot.key and not L.displayed[slot.key :: number] and not L.wanted[slot.key :: number] then
 			if best == nil or slot.lastUsed < (best :: Slot).lastUsed then
 				best = slot
 			end
 		end
-	end
-	-- grow before free slots run out: cached patches are worth keeping
-	local pool = L.pool
-	if nFree <= 4 and not pool.growing and #pool.slots < Layout.SLOTS and not pool.failed then
-		pool.growing = true
-		task.spawn(function()
-			MeshPool.grow(pool, 8)
-			pool.growing = false
-		end)
 	end
 	if free then
 		return free
@@ -21661,7 +23134,7 @@ local function submit(L: Lod, key: number): boolean
 		i = i,
 		j = j,
 		greenUp = L.opts.greenUp,
-		tint = false,
+		tint = L.opts.tint,
 	}, function(ok: boolean, result: any, ms: number)
 		L.inflight -= 1
 		L.generating[key] = nil
@@ -21680,7 +23153,7 @@ local function submit(L: Lod, key: number): boolean
 	return true
 end
 
--- Applies finished jobs within `budget` seconds of main-thread time.
+-- Applies finished jobs: tiles are queued, nothing is written to the mesh.
 local function drainResults(L: Lod, budget: number)
 	local t0 = os.clock()
 	while #L.results > 0 and os.clock() - t0 < budget do
@@ -21690,7 +23163,7 @@ local function drainResults(L: Lod, budget: number)
 			local key = r.key
 			L.heightLo[key] = r.result.hmin
 			L.heightHi[key] = r.result.hmax
-			MeshPool.assign(L.pool, L.U, s, r.result, function()
+			MeshPool.assign(L.pool, s, r.result, function()
 				if s.ticket == r.ticket then
 					s.state = "ready"
 					s.lastUsed = L.frame
@@ -21703,30 +23176,18 @@ local function drainResults(L: Lod, budget: number)
 	end
 end
 
-local function showSlot(L: Lod, slot: Slot, opacity: number)
-	slot.state = "shown"
-	slot.lastUsed = L.frame
-	slot.part.CFrame = CFrame.new(L.bodyPos) -- vertices are body-local
-	L.opacity[slot] = opacity
-	if L.opts.tint and slot.key then
-		MeshPool.tint(slot, LEVEL_TINTS[(levelOf(slot.key :: number) % #LEVEL_TINTS) + 1])
-	else
-		MeshPool.tint(slot, Color3.new(1, 1, 1))
+local function startMorph(L: Lod, slot: Slot)
+	if slot.morph then
+		table.insert(L.morphing, slot)
+		L.morphAcc[slot] = 0
+		L.stats.morphs += 1
 	end
-	applyVisual(L, slot)
 end
 
-local function hideSlot(L: Lod, slot: Slot)
-	if slot.state == "shown" then
-		slot.state = "ready"
-	end
-	L.opacity[slot] = 0
-	L.biased[slot] = nil
-	slot.part.Transparency = 1
-	slot.part.CFrame = CFrame.new(L.bodyPos)
-end
-
+-- Moves a displayed set of patches over to a new one (Quadtree swap) with a geomorph when
+-- the mesh is fully visible, else instantly.
 local function startSwap(L: Lod, swap: any)
+	local pool = L.pool
 	local show: { Slot } = {}
 	local hide: { Slot } = {}
 	for _, k in swap.show do
@@ -21743,57 +23204,95 @@ local function startSwap(L: Lod, swap: any)
 	end
 	Quadtree.apply(L.displayed, swap)
 	L.stats.swaps += 1
-	if L.opts.fades and #hide > 0 and L.alpha > 0.99 then
+	local R = L.body.radius
+	local morph = L.opts.fades and L.alpha > 0.99
+	local shownNew = false
+	if morph and #hide == 1 and #show == 4 and hide[1].result then
+		-- split: each child starts on its parent's surface
+		local parent = hide[1]
+		local pr = parent.result
 		for _, s in show do
-			showSlot(L, s, 0)
-			L.biased[s] = true
+			local _, lev, i, j = CubeSphere.unkey(s.key :: number)
+			local start = MeshPool.startFromParent(pr, i % 2, j % 2, TileGen.skirtDepth(R, lev))
+			MeshPool.show(pool, s, start)
+			startMorph(L, s)
 		end
-		table.insert(L.fades, { show = show, hide = hide, t = 0 })
-	else
+		shownNew = true
+	elseif morph and #show == 1 and #hide >= 2 then
+		-- merge: the coarser parent starts on its children's vertices
+		local s = show[1]
+		local f, lev, pi, pj = CubeSphere.unkey(s.key :: number)
+		local kids: { [number]: any } = {}
+		for _, h in hide do
+			if h.result and h.key then
+				local hf, hl, hi, hj = CubeSphere.unkey(h.key :: number)
+				if hf == f and hl == lev + 1 and hi // 2 == pi and hj // 2 == pj then
+					kids[(hj % 2) * 2 + (hi % 2)] = h.result
+				end
+			end
+		end
+		if next(kids) then
+			local finals = MeshPool.finals(s)
+			MeshPool.show(pool, s, MeshPool.startFromChildren(finals, kids))
+			startMorph(L, s)
+			shownNew = true
+		end
+	end
+	for _, h in hide do
+		MeshPool.park(pool, h)
+		L.morphAcc[h] = nil
+		h.state = "ready"
+	end
+	if not shownNew then
 		for _, s in show do
-			showSlot(L, s, 1)
+			MeshPool.show(pool, s, nil)
 		end
-		for _, s in hide do
-			hideSlot(L, s)
-		end
+	end
+	for _, s in show do
+		s.lastUsed = L.frame
 	end
 end
 
-local function stepFades(L: Lod, dt: number)
-	local i = 1
-	while i <= #L.fades do
-		local fd = L.fades[i]
-		fd.t += dt / FADE_SECONDS
-		local o = math.clamp(fd.t, 0, 1)
-		o = o * o * (3 - 2 * o)
-		for _, s in fd.show do
-			if s.state == "shown" then
-				L.opacity[s] = o
-				applyVisual(L, s)
-			end
-		end
-		if fd.t >= 1 then
-			-- phase 2: the old patches are now fully covered; remove them, then drop the bias
-			for _, s in fd.hide do
-				if s.state == "shown" and not (s.key and L.displayed[s.key :: number]) then
-					hideSlot(L, s)
-				end
-			end
-			for _, s in fd.show do
-				L.biased[s] = nil
-				s.part.CFrame = CFrame.new(L.bodyPos)
-			end
-			table.remove(L.fades, i)
-		else
-			i += 1
-		end
+-- Advances geomorphs, at most Config.morphPerFrame slots per frame (round robin; a slot that
+-- waits catches up by the time it accumulated).
+local function stepMorphs(L: Lod, dt: number)
+	local n = #L.morphing
+	if n == 0 then
+		return
 	end
+	for _, s in L.morphing do
+		L.morphAcc[s] = (L.morphAcc[s] or 0) + dt
+	end
+	local budget = Config.morphPerFrame
+	local keep: { Slot } = {}
+	for idx, s in L.morphing do
+		if s.morph and s.state == "shown" then
+			if budget > 0 then
+				budget -= 1
+				local acc = L.morphAcc[s] or dt
+				L.morphAcc[s] = 0
+				L.stats.morphWrites += 1
+				if MeshPool.stepMorph(s, acc, Config.morphSeconds) then
+					table.insert(keep, s)
+				else
+					L.morphAcc[s] = nil
+				end
+			else
+				table.insert(keep, s)
+			end
+		else
+			L.morphAcc[s] = nil
+		end
+		local _ = idx
+	end
+	L.morphing = keep
 end
 
 -- Per frame. `cam` is the current camera; `budget` the main-thread seconds allowed.
 function PlanetLod.update(L: Lod, cam: Camera, dt: number, budget: number)
 	L.frame += 1
 	local body = L.body
+	local pool = L.pool
 	-- whole-mesh opacity follows alphaTarget (impostor crossfade)
 	local target = if body and L.booted then L.alphaTarget else 0
 	if L.alpha ~= target then
@@ -21803,45 +23302,25 @@ function PlanetLod.update(L: Lod, cam: Camera, dt: number, budget: number)
 		else
 			L.alpha = math.max(target, L.alpha - step)
 		end
-		for slot, _ in L.opacity do
-			applyVisual(L, slot)
-		end
 	end
-	if not body then
+	if L.alpha ~= L.shownAlpha then
+		L.shownAlpha = L.alpha
+		MeshPool.setOpacity(pool, L.alpha)
+	end
+	if not body or #pool.slots == 0 then
 		return
 	end
 	drainResults(L, budget * 0.5)
-	stepFades(L, dt)
-	-- depth bias for patches fading in: a hair towards the camera
-	local camPos = cam.CFrame.Position
-	for slot, _ in L.biased do
-		local key = slot.key
-		if key then
-			local f, lev, i, j = CubeSphere.unkey(key)
-			local x, y, z = CubeSphere.patchPoint(f, lev, i, j, 0.5, 0.5)
-			local centre = L.bodyPos + Vector3.new(x, y, z) * body.radius
-			local toCam = camPos - centre
-			local d = toCam.Magnitude
-			if d > 1e-3 then
-				slot.part.CFrame = CFrame.new(L.bodyPos + toCam.Unit * (d * 0.0015 + 0.02))
-			end
-		end
-	end
+	stepMorphs(L, dt)
 
-	local pool = L.pool
+	local camPos = cam.CFrame.Position
 	local inUse = 0
 	for _, slot in pool.slots do
 		if slot.state ~= "free" then
 			inUse += 1
 		end
 	end
-	if #pool.slots < 24 and not pool.growing and not pool.failed then
-		pool.growing = true
-		task.spawn(function()
-			MeshPool.grow(pool, 24)
-			pool.growing = false
-		end)
-	end
+	local total = pool.maxSlots
 	local maxInflight = if L.workers.available then math.max(2, L.workers.readyCount * 2) else 1
 
 	-- bootstrap: the six roots, shown together
@@ -21861,7 +23340,8 @@ function PlanetLod.update(L: Lod, cam: Camera, dt: number, budget: number)
 		if all then
 			for _, k in roots do
 				L.displayed[k] = true
-				showSlot(L, L.slotOf[k], 1)
+				MeshPool.show(pool, L.slotOf[k], nil)
+				L.slotOf[k].lastUsed = L.frame
 			end
 			L.booted = true
 		end
@@ -21880,6 +23360,7 @@ function PlanetLod.update(L: Lod, cam: Camera, dt: number, budget: number)
 		L.lastCam = camPos
 		local viewport = cam.ViewportSize
 		local look = cam.CFrame.LookVector
+		local reserve = math.max(16, total // 5)
 		local sel = Quadtree.select({
 			x = rel.X,
 			y = rel.Y,
@@ -21895,7 +23376,7 @@ function PlanetLod.update(L: Lod, cam: Camera, dt: number, budget: number)
 			maxHeight = body.maxHeight,
 			heightLo = L.heightLo,
 			heightHi = L.heightHi,
-			capacity = L.opts.capacity,
+			capacity = math.min(L.opts.capacity, total - reserve),
 			splitPx = L.opts.splitPx,
 			hysteresis = 1.35,
 			maxLevel = if body.id == "terra" then Config.maxLevelTerra else Config.maxLevelOther,
@@ -21906,7 +23387,7 @@ function PlanetLod.update(L: Lod, cam: Camera, dt: number, budget: number)
 		L.stats.limited = sel.limited
 	end
 
-	local plan = Quadtree.plan(L.displayed, L.ready, L.target, L.metric, Layout.SLOTS - inUse < 32)
+	local plan = Quadtree.plan(L.displayed, L.ready, L.target, L.metric, total - inUse < 32)
 	L.wanted = plan.needed
 	-- generation, most visible first
 	local sent = 0
@@ -21925,7 +23406,6 @@ function PlanetLod.update(L: Lod, cam: Camera, dt: number, budget: number)
 	for _, swap in plan.swaps do
 		startSwap(L, swap)
 	end
-	-- deepest displayed level, for the HUD
 	local deepest = 0
 	for k in L.displayed do
 		local lev = levelOf(k)
@@ -21936,7 +23416,7 @@ function PlanetLod.update(L: Lod, cam: Camera, dt: number, budget: number)
 	L.stats.deepest = deepest
 end
 
--- Counts for the HUD.
+-- Counts for the HUD: shown, cached, generating, uploading.
 function PlanetLod.counts(L: Lod): (number, number, number, number)
 	local shown, ready, gen, uploading = 0, 0, 0, 0
 	for _, s in L.pool.slots do
@@ -21953,20 +23433,17 @@ function PlanetLod.counts(L: Lod): (number, number, number, number)
 	return shown, ready, gen, uploading
 end
 
--- Re-tints every shown patch (debug view of the levels).
+-- Debug tint by level is a tile-generation option now (patches carry the tint in their
+-- colour tiles), so changing it regenerates every patch.
 function PlanetLod.refreshTint(L: Lod)
-	for _, s in L.pool.slots do
-		if s.state == "shown" and s.key then
-			MeshPool.tint(s, if L.opts.tint then LEVEL_TINTS[(levelOf(s.key :: number) % #LEVEL_TINTS) + 1] else Color3.new(1, 1, 1))
-		end
-	end
+	PlanetLod.reset(L)
 end
 
 return PlanetLod
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="57">
+        <Item class="ModuleScript" referent="58">
           <Properties>
             <string name="Name">Sky</string>
             <string name="Source"><![CDATA[--!strict
@@ -22101,7 +23578,7 @@ return Sky
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="58">
+        <Item class="ModuleScript" referent="59">
           <Properties>
             <string name="Name">Uploader</string>
             <string name="Source"><![CDATA[--!strict
@@ -22217,7 +23694,7 @@ return Uploader
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="59">
+        <Item class="ModuleScript" referent="60">
           <Properties>
             <string name="Name">Workers</string>
             <string name="Source"><![CDATA[--!strict
@@ -22288,7 +23765,7 @@ return Workers
       </Item>
     </Item>
   </Item>
-  <Item class="Workspace" referent="60">
+  <Item class="Workspace" referent="61">
     <Properties>
       <string name="Name">Workspace</string>
       <float name="FallenPartsDestroyHeight">-50000</float>
