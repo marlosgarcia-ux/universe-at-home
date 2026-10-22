@@ -827,14 +827,21 @@ local function addPieces(sc: Scene, s: number, px: number, py: number, w: number
 		Visibility.disc((P1[s] - px) * iw, (P2[s] - py) * iw, P3[s] * iw)
 		Visibility.piece()
 	elseif k == RING then
+		-- annulus = outer disc - inner disc; a disc that covers the whole pixel is
+		-- the plain square, one that cannot reach it is left out
 		local Cx, Cy = (P1[s] - px) * iw, (P2[s] - py) * iw
-		local r, t = P3[s], P4[s]
+		local len = sqrt(Cx * Cx + Cy * Cy)
+		local ro, ri = (P3[s] + P4[s]) * iw, (P3[s] - P4[s]) * iw
 		Visibility.square(1)
-		Visibility.disc(Cx, Cy, (r + t) * iw)
+		if len - ro > -REACH then
+			Visibility.disc(Cx, Cy, ro)
+		end
 		Visibility.piece()
-		if r - t > 0 then
+		if ri > 0 and len - ri < REACH then
 			Visibility.square(-1)
-			Visibility.disc(Cx, Cy, (r - t) * iw)
+			if len - ri > -REACH then
+				Visibility.disc(Cx, Cy, ri)
+			end
 			Visibility.piece()
 		end
 	elseif k == BOX then
@@ -1032,13 +1039,13 @@ local function shadeExact(
 						local X0, X1, Y0, Y1 = px - hw - cx, px + hw - cx, py - hw - cy, py + hw - cy
 						if Y0 >= rad - hy and Y1 <= hy - rad then
 							-- inside the horizontal band: the box is locally the slab |x| <= hx
-							local lo = if X0 > -hx then X0 else -hx
-							local hi = if X1 < hx then X1 else hx
-							cov = if hi > lo then (hi - lo) * iw else 0
+							local u0 = if X0 > -hx then X0 else -hx
+							local u1 = if X1 < hx then X1 else hx
+							cov = if u1 > u0 then (u1 - u0) * iw else 0
 						elseif X0 >= rad - hx and X1 <= hx - rad then
-							local lo = if Y0 > -hy then Y0 else -hy
-							local hi = if Y1 < hy then Y1 else hy
-							cov = if hi > lo then (hi - lo) * iw else 0
+							local u0 = if Y0 > -hy then Y0 else -hy
+							local u1 = if Y1 < hy then Y1 else hy
+							cov = if u1 > u0 then (u1 - u0) * iw else 0
 						else
 							cov = boxArea(X0, X1, Y0, Y1, hx, hy, rad) * iw2
 						end

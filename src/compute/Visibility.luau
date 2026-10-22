@@ -328,8 +328,47 @@ end
 -- Region areas ---------------------------------------------------------------------
 
 -- Area of polygon (px, py)[1..m] intersected with discs K[1..k] (power cells).
+-- Discs that contain the (convex) polygon are dropped first and a disc that misses
+-- its bounding box makes the area 0, so most regions need one disc area or none.
 local function regionArea(px: { number }, py: { number }, m: number, k: number): number
 	stats.areas += 1
+	if k > 0 then
+		local x0, y0, x1, y1 = px[1], py[1], px[1], py[1]
+		for v = 2, m do
+			local x, y = px[v], py[v]
+			if x < x0 then
+				x0 = x
+			elseif x > x1 then
+				x1 = x
+			end
+			if y < y0 then
+				y0 = y
+			elseif y > y1 then
+				y1 = y
+			end
+		end
+		local k2 = 0
+		for i = 1, k do
+			local cx, cy, r = KX[i], KY[i], KR[i]
+			if cx - r >= x1 or cx + r <= x0 or cy - r >= y1 or cy + r <= y0 then
+				return 0
+			end
+			local r2 = r * r
+			local all = true
+			for v = 1, m do
+				local dx, dy = px[v] - cx, py[v] - cy
+				if dx * dx + dy * dy > r2 then
+					all = false
+					break
+				end
+			end
+			if not all then
+				k2 += 1
+				KX[k2], KY[k2], KR[k2] = cx, cy, r
+			end
+		end
+		k = k2
+	end
 	if k == 0 then
 		return polyArea(px, py, m)
 	elseif k == 1 then
