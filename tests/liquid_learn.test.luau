@@ -420,6 +420,64 @@ do
 	local trT = LL.accumulateSplit(tuned, tree, target, M, 4, {})
 	local direct = LL.solve(trT, N, c.lambda)
 	assert(math.abs(LL.mseOf(trT, direct) - gs.trainMSE) <= 1e-9 * (1 + gs.trainMSE), "sub-Gram solve must equal a direct solve")
+	-- byte level: statistics extracted from a superset equal a direct accumulation of
+	-- the configuration, integer for integer, and give the same readout bytes
+	local sp, sk = {}, {}
+	for p = 0, M - 1 do
+		for _, k in { -64, -2, 0, 2 } do
+			table.insert(sp, p)
+			table.insert(sk, k)
+		end
+	end
+	local S = #sp
+	local sup = LL.walshReservoir(S, M, c.K, sk, nil, sp)
+	local stSup = LL.newStats(2 * S + 1, M)
+	LL.accumulate(stSup, LL.newRows(sup, tree, 0), target, {})
+	local pick = { 1, 5, 9, 3, 6, 12, 2 } -- any neurons of the superset, in any order
+	local cp, ck = {}, {}
+	for i, si in pick do
+		cp[i], ck[i] = sp[si], sk[si]
+	end
+	local cfg = LL.walshReservoir(#pick, M, c.K, ck, nil, cp)
+	local stCfg = LL.newStats(2 * #pick + 1, M)
+	LL.accumulate(stCfg, LL.newRows(cfg, tree, 0), target, {})
+	local ext = LL.extractStats(stSup, LL.superMap(pick, S))
+	assert(LL.statsEqual(ext, stCfg), "extracted sub-statistics must equal a direct accumulation")
+	assert(
+		buffer.tostring(LL.encodeReadout(LL.solve(ext, #pick, c.lambda))) == buffer.tostring(LL.encodeReadout(LL.solve(stCfg, #pick, c.lambda))),
+		"sub-Gram readout bytes must equal the direct readout bytes"
+	)
+end
+
+-- S3 invariant under splitting: a lowered per-pass weight limit forces every band to
+-- be cut into sub-bands (batch path and trainer); the integers must not change
+do
+	local c = G[2]
+	local M, N, size = c.M, c.N, c.size
+	local target = hexToBuffer(c.target)
+	local tree = LL.buildTree(target, size, size, M, M, c.theta)
+	local res = LL.walshReservoir(N, M, c.K, nil, c.scales)
+	local ticks = 0
+	local clock = function(): number
+		ticks += 1
+		return ticks * 0.001
+	end
+	local saved = LL.pendingLimit
+	for _, opts in { {}, { event = true }, { stride = 4 } } do
+		local o: LL.AccumOptions = opts
+		LL.pendingLimit = saved
+		local want = LL.newStats(2 * N + 1, M)
+		LL.accumulate(want, LL.newRows(res, tree, 0), target, o)
+		LL.pendingLimit = 3 * size -- three render rows per pass
+		local st = LL.newStats(2 * N + 1, M)
+		LL.accumulate(st, LL.newRows(res, tree, 0), target, o)
+		assert(LL.statsEqual(st, want), "split batch accumulation changed the integers")
+		local trn = LL.newTrainer(res, tree, target, M, o, 0, clock)
+		while not LL.step(trn, 0.0005) do
+		end
+		assert(LL.statsEqual(trn.stats, want), "split trainer changed the integers")
+	end
+	LL.pendingLimit = saved
 end
 
 -- 7. S3 second limb: 2^24 samples of the largest feature (q = 32767) give

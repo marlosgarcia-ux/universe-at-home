@@ -6,7 +6,7 @@
 -- docs/LIQUID_TRAINING.md). Pure Luau, deterministic ops only, no engine globals.
 --
 --   * shell-byte quadtree builder (exact integer means and deviations)
---   * the ALN binary codec (layout below; src/Liquid.luau carries the same header)
+--   * the ALN binary codec (layout: header of src/Liquid.luau)
 --   * exact row simulation in the Luau step order, bidirectional
 --   * S1/S3 exact sufficient statistics: states quantised to 15-bit fixed point,
 --     integer sums held in two limbs; plain mode (every pixel or every k-th) or
@@ -22,32 +22,12 @@
 --   * a time-sliced trainer for Heartbeat
 --   * renderExact: the reference renderer (every pixel stepped; epsilon = 0)
 --
--- ALN binary layout, version 1 (all multi-byte values little-endian)
---   bytes 0..2   magic "ALN"
---   byte  3      version (1)
---   bytes 4..7   N, I, M, K as u8 (neurons, input bytes per leaf, output channels,
---                gain exponents k in [0, K))
---   f64 arrays   beta[N], B[N*I] (B[i*I + t]), kBase[N], Cf[M*N] (Cf[m*N + i]),
---                Cb[M*N], d[M]
---   quadtree     width u16, height u16, maxDepth u8; root side S = smallest power of
---                two >= max(width, height); a node at depth t has side S >> t.
---                Preorder split bits, packed LSB-first: one bit per visited node with
---                depth < maxDepth (1 = split; nodes at maxDepth are leaves and have no
---                bit); children in the order (x, y), (x + h, y), (x, y + h), (x + h, y + h).
---                The bit stream is self-delimiting; leaf bytes start at the next byte:
---                I bytes per leaf, leaves in preorder (a node with no pixel inside the
---                image is a leaf with zero bytes).
---
--- Exact semantics (every implementation uses this operation order; 0-based i, t, m)
---   u_t = byte_t / 255
---   b_i = beta_i, then b_i = b_i + B[i*I + t] * u_t for t = 0 .. I-1
---   k_i = clamp(kBase_i + log2(leafSide) + r, 0, K - 1), g_i = 2^-k_i (exact table),
---         r = log2(render scale); kBase <= -K means an instant neuron (g = 1, h = b)
---   forward:  h = b(first segment); for x = 0 .. W-1:   h = h + (b - h) * g; hf[x] = h
---   backward: h = b(last segment);  for x = W-1 .. 0:   h = h + (b - h) * g; hb[x] = h
---   z_m = d_m, then z_m = z_m + Cf[m*N+i] * hf_i for i = 0 .. N-1,
---         then z_m = z_m + Cb[m*N+i] * hb_i for i = 0 .. N-1
---   byte = clamp(floor(z_m + 0.5), 0, 255)
+-- The ALN binary layout (version 1) and the model arithmetic are defined once, in the
+-- header of src/Liquid.luau (the single source of truth). This module implements the
+-- same layout and the same operation order (encode, decode, buildTree, renderExact)
+-- without depending on the renderer; tests/liquid_learn.test.luau checks every byte
+-- against tools/liquid_train.py and against Liquid.reference. Defaults used here:
+-- Walsh reservoirs (b in [0, 1]) and INSTANT = -64 for neurons with k = 0 everywhere.
 --
 -- Training statistics (S3): q = floor(h * 32767 + 0.5), features s = (qf, qb, 32767),
 -- D = 2N + 1. Entries in order: G upper triangle (row-major, i <= j), P (D x M,
@@ -67,6 +47,10 @@ local MAX_M = 8 -- output channels supported by the band accumulators
 
 LiquidLearn.QSCALE = QSCALE
 LiquidLearn.VERSION = 1
+-- Maximum sample weight per accumulation pass and between limb normalisations. Any
+-- value in [1, 2^22] keeps every partial sum below 2^53 (docs/LIQUID_TRAINING.md 7.1);
+-- tests lower it to exercise band splitting.
+LiquidLearn.pendingLimit = PENDING_LIMIT
 LiquidLearn.INSTANT = -64
 LiquidLearn.DEFAULT_SCALES = { -64, 0, -2, 2, -4, 4, 1, -1 }
 LiquidLearn.DEFAULT_LAMBDA = 1e-7
@@ -779,27 +763,71 @@ function LiquidLearn.simulateQ(rows: Rows, i0: number?, i1: number?)
 	local segX0, segX1, segLeaf = rows.segX0, rows.segX1, rows.segLeaf
 	local n = rows.segCount
 	local last = i1 or N
-	for i = i0 or 1, last do
+	local i = i0 or 1
+	-- four neurons per pass: four independent recurrences hide the latency of the
+	-- step (each neuron's own operation sequence, and therefore its bits, is unchanged)
+	while i + 3 <= last do
+		local i2, i3, i4 = i + 1, i + 2, i + 3
+		local k0 = segLeaf[1] * N
+		local h1, h2, h3, h4 = leafB[k0 + i], leafB[k0 + i2], leafB[k0 + i3], leafB[k0 + i4]
+		local o1, o2, o3, o4 = (i - 1) * W + 1, i * W + 1, (i + 1) * W + 1, (i + 2) * W + 1
+		for sg = 1, n do
+			local k = segLeaf[sg] * N
+			local b1, b2, b3, b4 = leafB[k + i], leafB[k + i2], leafB[k + i3], leafB[k + i4]
+			local g1, g2, g3, g4 = leafG[k + i], leafG[k + i2], leafG[k + i3], leafG[k + i4]
+			for x = segX0[sg], segX1[sg] - 1 do
+				h1 = h1 + (b1 - h1) * g1
+				h2 = h2 + (b2 - h2) * g2
+				h3 = h3 + (b3 - h3) * g3
+				h4 = h4 + (b4 - h4) * g4
+				feat[o1 + x] = floor(h1 * 32767 + 0.5)
+				feat[o2 + x] = floor(h2 * 32767 + 0.5)
+				feat[o3 + x] = floor(h3 * 32767 + 0.5)
+				feat[o4 + x] = floor(h4 * 32767 + 0.5)
+			end
+		end
+		local kn = segLeaf[n] * N
+		h1, h2, h3, h4 = leafB[kn + i], leafB[kn + i2], leafB[kn + i3], leafB[kn + i4]
+		o1, o2, o3, o4 = (N + i - 1) * W + 1, (N + i) * W + 1, (N + i + 1) * W + 1, (N + i + 2) * W + 1
+		for sg = n, 1, -1 do
+			local k = segLeaf[sg] * N
+			local b1, b2, b3, b4 = leafB[k + i], leafB[k + i2], leafB[k + i3], leafB[k + i4]
+			local g1, g2, g3, g4 = leafG[k + i], leafG[k + i2], leafG[k + i3], leafG[k + i4]
+			for x = segX1[sg] - 1, segX0[sg], -1 do
+				h1 = h1 + (b1 - h1) * g1
+				h2 = h2 + (b2 - h2) * g2
+				h3 = h3 + (b3 - h3) * g3
+				h4 = h4 + (b4 - h4) * g4
+				feat[o1 + x] = floor(h1 * 32767 + 0.5)
+				feat[o2 + x] = floor(h2 * 32767 + 0.5)
+				feat[o3 + x] = floor(h3 * 32767 + 0.5)
+				feat[o4 + x] = floor(h4 * 32767 + 0.5)
+			end
+		end
+		i += 4
+	end
+	while i <= last do
 		local h = leafB[segLeaf[1] * N + i]
 		local of = (i - 1) * W + 1
-		for s = 1, n do
-			local k = segLeaf[s] * N + i
+		for sg = 1, n do
+			local k = segLeaf[sg] * N + i
 			local b, g = leafB[k], leafG[k]
-			for x = segX0[s], segX1[s] - 1 do
+			for x = segX0[sg], segX1[sg] - 1 do
 				h = h + (b - h) * g
 				feat[of + x] = floor(h * 32767 + 0.5)
 			end
 		end
 		h = leafB[segLeaf[n] * N + i]
 		local ob = (N + i - 1) * W + 1
-		for s = n, 1, -1 do
-			local k = segLeaf[s] * N + i
+		for sg = n, 1, -1 do
+			local k = segLeaf[sg] * N + i
 			local b, g = leafB[k], leafG[k]
-			for x = segX1[s] - 1, segX0[s], -1 do
+			for x = segX1[sg] - 1, segX0[sg], -1 do
 				h = h + (b - h) * g
 				feat[ob + x] = floor(h * 32767 + 0.5)
 			end
 		end
+		i += 1
 	end
 	if last == N then
 		local oc = (D - 1) * W + 1
@@ -876,6 +904,12 @@ local function normalise(st: Stats)
 	st.pending = 0
 end
 LiquidLearn.normalise = normalise
+
+local function weightLimit(): number
+	local lim = LiquidLearn.pendingLimit
+	assert(lim >= 1 and lim <= PENDING_LIMIT and lim % 1 == 0, "pendingLimit must be an integer in [1, 2^22]")
+	return lim
+end
 
 function LiquidLearn.copyStats(st: Stats): Stats
 	local o = LiquidLearn.newStats(st.D, st.M)
@@ -1134,7 +1168,11 @@ function LiquidLearn.bandGram(st: Stats, rows: Rows, k0: number, k1: number)
 	for k = k0, k1 - 1 do
 		wsum += tW[k]
 	end
-	if st.pending + wsum > PENDING_LIMIT then
+	-- S3 invariant: one call adds at most 2^22 of sample weight, so every inner product
+	-- (at most 2^22 * 2^30) and every accumulator stays below 2^53
+	local lim = weightLimit()
+	assert(wsum <= lim, "too much sample weight in one Gram call; split the band rows")
+	if st.pending + wsum > lim then
 		normalise(st)
 	end
 	local Dv = D - 1 -- varying features; feature D is the constant QSCALE
@@ -1377,15 +1415,23 @@ function LiquidLearn.accumulateRange(st: Stats, rows: Rows, target: buffer, yr0:
 		naiveRange(st, rows, target, yr0, yr1, o)
 		return
 	end
-	LiquidLearn.bandReset(rows, st.M)
-	LiquidLearn.bandTargets(st, rows, target, yr0, yr1, x0, x1, o)
-	local K
-	if not o.event and LiquidLearn.bandAllSampled(rows) then
-		K = LiquidLearn.bandTermsIdentity(rows)
-	else
-		K = LiquidLearn.bandTerms(rows, st.M, o)
+	-- at most pendingLimit (<= 2^22) samples per pass (S3 invariant); large bands go in
+	-- row chunks
+	local maxRows = math.max(1, weightLimit() // rows.W)
+	local ya = yr0
+	while ya < yr1 do
+		local yb = math.min(yr1, ya + maxRows)
+		LiquidLearn.bandReset(rows, st.M)
+		LiquidLearn.bandTargets(st, rows, target, ya, yb, x0, x1, o)
+		local K
+		if not o.event and LiquidLearn.bandAllSampled(rows) then
+			K = LiquidLearn.bandTermsIdentity(rows)
+		else
+			K = LiquidLearn.bandTerms(rows, st.M, o)
+		end
+		LiquidLearn.bandGram(st, rows, 1, K + 1)
+		ya = yb
 	end
-	LiquidLearn.bandGram(st, rows, 1, K + 1)
 end
 
 -- Accumulates every row of the tree (rendered at the scale of `rows`) against the
@@ -1977,6 +2023,52 @@ function LiquidLearn.accumulateSplit(res: Reservoir, tree: Tree, target: buffer,
 	return tr, va
 end
 
+-- Exact sub-statistics: features map[1..d] of a superset (map[d] must be the constant
+-- feature). The integers are copied, so solving them gives the bytes a direct
+-- accumulation of that configuration gives.
+function LiquidLearn.extractStats(st: Stats, map: { number }): Stats
+	local d, M, D = #map, st.M, st.D
+	local c = canonical(st)
+	local out = LiquidLearn.newStats(d, M)
+	local offS, offD = triOffsets(D), triOffsets(d)
+	for a = 1, d do
+		for b = a, d do
+			local i, j = map[a], map[b]
+			if i > j then
+				i, j = j, i
+			end
+			local src = offS[i] + (j - i) + 1
+			local dst = offD[a] + (b - a) + 1
+			out.hi[dst], out.lo[dst] = c.hi[src], c.lo[src]
+		end
+	end
+	local TS, TD = D * (D + 1) // 2, d * (d + 1) // 2
+	for a = 1, d do
+		for m = 1, M do
+			local src = TS + (map[a] - 1) * M + m
+			local dst = TD + (a - 1) * M + m
+			out.hi[dst], out.lo[dst] = c.hi[src], c.lo[src]
+		end
+	end
+	for m = 1, M + 1 do
+		out.hi[TD + d * M + m], out.lo[TD + d * M + m] = c.hi[TS + D * M + m], c.lo[TS + D * M + m]
+	end
+	return out
+end
+
+-- Feature map of a configuration inside a superset reservoir: for neuron i of the
+-- configuration, superIndex[i] is its neuron in the superset (S neurons).
+function LiquidLearn.superMap(superIndex: { number }, S: number): { number }
+	local N = #superIndex
+	local map = table.create(2 * N + 1, 0)
+	for i = 1, N do
+		map[i] = superIndex[i]
+		map[N + i] = S + superIndex[i]
+	end
+	map[2 * N + 1] = 2 * S + 1
+	return map
+end
+
 -- Coordinate descent over kBase (S5) on one superset accumulation. The superset
 -- reservoir holds every (projection, candidate kBase) pair; neurons are uncoupled,
 -- so the sub-Gram of a configuration is exactly the Gram a direct accumulation of
@@ -2096,8 +2188,10 @@ export type Trainer = {
 	y: number, -- tree row of the current band
 	phase: number, -- 0 segments, 1 states, 2 reset, 3 targets, 4 terms, 5 Gram
 	neuron: number, -- next neuron (states phase)
-	yr: number, -- next render row of the band (targets phase)
-	yrEnd: number,
+	subStart: number, -- first render row of the current sub-band
+	bandEndR: number, -- render row after the band
+	yr: number, -- next render row of the sub-band (targets phase)
+	yrEnd: number, -- render row after the sub-band (at most 2^22 samples per sub-band)
 	x: number, -- next column (terms phase)
 	k: number, -- next term (Gram phase)
 	neuronChunk: number, -- neurons per states unit
@@ -2119,6 +2213,8 @@ function LiquidLearn.newTrainer(res: Reservoir, tree: Tree, target: buffer, M: n
 		y = 0,
 		phase = 0,
 		neuron = 1,
+		subStart = 0,
+		bandEndR = 0,
 		yr = 0,
 		yrEnd = 0,
 		x = 0,
@@ -2164,12 +2260,14 @@ function LiquidLearn.step(tr: Trainer, budget: number): boolean
 			LiquidLearn.simulateQ(rows, tr.neuron, i1)
 			tr.neuron = i1 + 1
 			if i1 >= rows.N then
+				tr.subStart = tr.y * rep
+				tr.bandEndR = rows.groupEnd * rep
 				tr.phase = 2
 			end
 		elseif phase == 2 then
 			LiquidLearn.bandReset(rows, st.M)
-			tr.yr = tr.y * rep
-			tr.yrEnd = rows.groupEnd * rep
+			tr.yr = tr.subStart
+			tr.yrEnd = math.min(tr.bandEndR, tr.subStart + math.max(1, weightLimit() // rows.W))
 			tr.phase = 3
 		elseif phase == 3 then
 			local ye = math.min(tr.yr + tr.rowChunk, tr.yrEnd)
@@ -2198,8 +2296,13 @@ function LiquidLearn.step(tr: Trainer, budget: number): boolean
 			LiquidLearn.bandGram(st, rows, tr.k, ke)
 			tr.k = ke
 			if ke > K then
-				tr.y = rows.groupEnd
-				tr.phase = 0
+				if tr.yrEnd < tr.bandEndR then
+					tr.subStart = tr.yrEnd -- next sub-band of the same band (states reused)
+					tr.phase = 2
+				else
+					tr.y = rows.groupEnd
+					tr.phase = 0
+				end
 			end
 		end
 		tr.units += 1

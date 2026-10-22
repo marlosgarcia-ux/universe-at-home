@@ -336,4 +336,84 @@ do
 	assert(canvas:get(5, 10) == 0 and canvas:get(5, 70) == 0, "untouched rows stay untouched")
 end
 
+----------------------------------------------------------------------------------------
+-- X3 endless textures: tiling invariance, T2 against the windowed reference, seam bound
+----------------------------------------------------------------------------------------
+do
+	local W, H = 64, 64
+	local tree = makeTree(41, W, H, 3, 6)
+	local model = makeModel(41, 8, 3, 3, 7, tree.P, 30)
+	local plan = Liquid.prepare(model, tree)
+	local seed = 1234567
+	local horizon = 2
+	local endless = { seed = seed, horizon = horizon }
+	-- every virtual leaf carries the content of a stored leaf
+	for _ = 1, 200 do
+		local xs = math.floor(rnd(valuesChecked, 1, 3) * 2000) - 1000
+		local ys = math.floor(rnd(valuesChecked, 2, 3) * 2000) - 1000
+		valuesChecked += 1
+		local leaf, depth = Liquid.virtualLeafAt(tree, xs, ys, seed)
+		assert(leaf >= 0 and leaf < tree.leafCount and depth >= 0 and depth <= tree.maxDepth, "virtual leaf")
+	end
+	for _, L in { 0, 1 } do
+		local F = 2 ^ L
+		local rx, ry, rw, rh = -100 // F, -30 // F, 250 // F, 120 // F
+		local big = buffer.create(rw * rh * 4)
+		Liquid.render(plan, tree, big, rw, { epsilon = 0.5, level = L, x = rx, y = ry, w = rw, h = rh, endless = endless })
+		-- tiles of every size and offset give the same pixels
+		for _, tile in { 64 // F, 37, 23 } do
+			local t = buffer.create(tile * tile * 4)
+			for ty = ry, ry + rh - 1, tile do
+				for tx = rx, rx + rw - 1, tile do
+					Liquid.render(plan, tree, t, tile, { epsilon = 0.5, level = L, x = tx, y = ty, w = tile, h = tile, endless = endless })
+					for yy = 0, tile - 1 do
+						for xx = 0, tile - 1 do
+							local X, Y = tx + xx, ty + yy
+							if X < rx + rw and Y < ry + rh then
+								assert(
+									buffer.readu32(t, (yy * tile + xx) * 4) == buffer.readu32(big, ((Y - ry) * rw + X - rx) * 4),
+									"X3: a pixel must not depend on the tiling"
+								)
+							end
+						end
+					end
+				end
+			end
+		end
+		-- T2 against the endless reference (each block stepped over its canonical window)
+		if L == 0 then
+			local z = {}
+			for Y = ry, ry + rh - 1, 7 do
+				for block = rx // plan.Sr, (rx + rw - 1) // plan.Sr do
+					local wa = Liquid.referenceEndless(plan, tree, Y, block, horizon, seed, z)
+					for X = math.max(rx, block * plan.Sr), math.min(rx + rw, (block + 1) * plan.Sr) - 1 do
+						for m = 0, 2 do
+							checkBytes("X3 T2", big, rw, X - rx, Y - ry, 3, z[(X - wa) * 3 + m + 1], 0.5, m)
+						end
+					end
+				end
+			end
+		end
+	end
+	-- seam bound: two windows that both contain a pixel at distance >= horizon * Sr from
+	-- their ends disagree there by at most seamBound
+	local bound = Liquid.seamBound(plan, tree, horizon)
+	local z1, z2 = {}, {}
+	local worst = 0
+	for Y = -20, 70, 9 do
+		local wa1 = Liquid.referenceEndless(plan, tree, Y, 0, horizon, seed, z1) -- [-128, 192)
+		local wa2 = Liquid.referenceEndless(plan, tree, Y, 1, horizon, seed, z2) -- [-64, 256)
+		-- pixels at distance >= horizon * Sr = 128 from both windows' ends: [64, 64]
+		for X = 64, 64 do
+			for m = 0, 2 do
+				local d = math.abs(z1[(X - wa1) * 3 + m + 1] - z2[(X - wa2) * 3 + m + 1])
+				if d > worst then
+					worst = d
+				end
+			end
+		end
+	end
+	assert(worst <= bound, `X3 seam bound violated: {worst} > {bound}`)
+end
+
 print("liquid tests ok", valuesChecked)
