@@ -76,9 +76,28 @@ local hash2 = MyMath.hash2
 local fillSpan = Pixels.fillSpan
 
 local JMAX = 62 -- drop tables cover residual ratios up to 2^62
+-- Powers of two built by exact doubling and halving (the ^ operator is libm pow, which the
+-- deterministic op set excludes even though it is exact for powers of two on sane libms).
+local POW2: { number } = table.create(1024, 1) -- POW2[e + 1] = 2^e, e = 0..1023
+local POW2N: { number } = table.create(1075, 1) -- POW2N[e + 1] = 2^-e, e = 0..1074
+do
+	local p = 1
+	for e = 1, 1023 do
+		p *= 2
+		POW2[e + 1] = p
+	end
+	p = 1
+	for e = 1, 1074 do
+		p *= 0.5
+		POW2N[e + 1] = p
+	end
+end
+local function pow2(e: number): number
+	return if e >= 0 then POW2[e + 1] else POW2N[1 - e]
+end
+
 local ETA = 1 / 16777216 -- 2^-24: slack of the quantisation-margin skip, in output units
 local SHRINK = 1 - 1 / 1099511627776 -- 1 - 2^-40: absorbs rounding of computed bounds
-local TWO32 = 4294967296
 local NONE = -math.huge -- "no output pixel" (output pixels may be negative in the endless mode)
 
 export type Model = {
@@ -189,7 +208,7 @@ local function parseTree(
 	assert(width >= 1 and width <= 65535 and height >= 1 and height <= 65535, "bad tree size")
 	local P = rootLog2(width, height)
 	assert(maxDepth >= 0 and maxDepth <= P, "maxDepth must be in 0..P")
-	local S = 2 ^ P
+	local S = pow2(P)
 	local srcLen = buffer.len(src)
 
 	-- pass 1: count nodes, leaves and flags
@@ -353,13 +372,13 @@ function Liquid.buildTree(
 			leafCount += 1
 		end
 	end
-	visit(0, 0, 0, 2 ^ P)
+	visit(0, 0, 0, pow2(P))
 	local fb = buffer.create((#flags + 7) // 8 + leafCount * I)
 	for j = 1, #flags do
 		if flags[j] == 1 then
 			local p = j - 1
 			local at = p // 8
-			buffer.writeu8(fb, at, buffer.readu8(fb, at) + 2 ^ (p % 8))
+			buffer.writeu8(fb, at, buffer.readu8(fb, at) + bit32.lshift(1, p % 8))
 		end
 	end
 	local fo = (#flags + 7) // 8
@@ -379,7 +398,7 @@ local function treeFlags(tree: Tree): buffer
 		if depth < D then
 			if not isLeaf then
 				local at = pos // 8
-				buffer.writeu8(out, at, buffer.readu8(out, at) + 2 ^ (pos % 8))
+				buffer.writeu8(out, at, buffer.readu8(out, at) + bit32.lshift(1, pos % 8))
 			end
 			pos += 1
 		end
@@ -559,6 +578,13 @@ export type Plan = {
 	trkCls: { number }, -- trkCls[t * nt + j] = its class at depth t (0 when k = 0 there)
 	CfT4: { number }, -- CfT4[(j - 1) * 4 + m] = Cf[m][trk[j]], zero for m > M
 	CbT4: { number },
+	-- tracked neurons with equal kBase share k at every depth: a group. The fast path
+	-- tracks each group's readout-projected state sum_{i in g} Cf[m][i] h_i (and Cb), which
+	-- jumps exactly like one neuron (linearity), so no per-segment projection is needed.
+	NG: number,
+	grpOf: { number }, -- grpOf[j] = group of tracked neuron j
+	grpOff: { number }, -- grpOff[t * G + g] = pw offset of group g at depth t
+	grpCls: { number }, -- grpCls[t * G + g] = class of group g at depth t (0 when k = 0)
 	maxSeg: number,
 	scratch: any,
 }
@@ -571,7 +597,7 @@ function Liquid.prepare(model: Model, tree: Tree, renderScale: number?): Plan
 	local R = renderScale or 0
 	assert(R >= 0 and R <= 8 and R % 1 == 0, "render scale must be an integer in 0..8")
 	local P, S = tree.P, tree.S
-	local sf = 2 ^ R
+	local sf = pow2(R)
 	local T = S * sf
 	assert(T <= 65536, "rendered root side above 65536")
 	local TP1 = T + 1
@@ -581,7 +607,7 @@ function Liquid.prepare(model: Model, tree: Tree, renderScale: number?): Plan
 	end
 	local gk = table.create(K, 0)
 	for k = 0, K - 1 do
-		gk[k + 1] = 1 / 2 ^ k -- exact power of two
+		gk[k + 1] = POW2N[k + 1] -- 2^-k exactly
 	end
 	local pw = table.create(K * TP1, 0)
 	local S1 = table.create(K * TP1, 0)
@@ -658,7 +684,7 @@ function Liquid.prepare(model: Model, tree: Tree, renderScale: number?): Plan
 	end
 	local G = table.create((P + R + 1) * K, 0)
 	for L = 0, P + R do
-		local F = 2 ^ L
+		local F = pow2(L)
 		for k = 0, K - 1 do
 			G[L * K + k + 1] = S1[k * TP1 + F + 1] / F
 		end
@@ -682,6 +708,33 @@ function Liquid.prepare(model: Model, tree: Tree, renderScale: number?): Plan
 		for j = 1, nt do
 			trkOff[t * nt + j] = pwOff[t * N + trk[j]]
 			trkCls[t * nt + j] = clsOf[t * N + trk[j]]
+		end
+	end
+	local grpOf = table.create(math.max(nt, 1), 0)
+	local grpBase: { number } = {}
+	local grpRep: { number } = {}
+	for j = 1, nt do
+		local kb = model.kBase[trk[j]]
+		local g = 0
+		for q = 1, #grpBase do
+			if grpBase[q] == kb then
+				g = q
+			end
+		end
+		if g == 0 then
+			table.insert(grpBase, kb)
+			table.insert(grpRep, trk[j])
+			g = #grpBase
+		end
+		grpOf[j] = g
+	end
+	local NG = #grpBase
+	local grpOff = table.create((P + 1) * math.max(NG, 1), 0)
+	local grpCls = table.create((P + 1) * math.max(NG, 1), 0)
+	for t = 0, P do
+		for g = 1, NG do
+			grpOff[t * NG + g] = pwOff[t * N + grpRep[g]]
+			grpCls[t * NG + g] = clsOf[t * N + grpRep[g]]
 		end
 	end
 	local CfT4 = table.create(math.max(nt, 1) * 4, 0)
@@ -724,6 +777,10 @@ function Liquid.prepare(model: Model, tree: Tree, renderScale: number?): Plan
 		trkCls = trkCls,
 		CfT4 = CfT4,
 		CbT4 = CbT4,
+		NG = NG,
+		grpOf = grpOf,
+		grpOff = grpOff,
+		grpCls = grpCls,
 		maxSeg = T + 2,
 		scratch = nil,
 	}
@@ -737,36 +794,36 @@ local function ceilLog2(r: number): number
 		return 0
 	end
 	local e = 0
-	if r > 2 ^ 512 then
-		r *= 2 ^ -512
+	if r > POW2[512 + 1] then
+		r *= POW2N[512 + 1]
 		e += 512
 	end
-	if r > 2 ^ 256 then
-		r *= 2 ^ -256
+	if r > POW2[256 + 1] then
+		r *= POW2N[256 + 1]
 		e += 256
 	end
-	if r > 2 ^ 128 then
-		r *= 2 ^ -128
+	if r > POW2[128 + 1] then
+		r *= POW2N[128 + 1]
 		e += 128
 	end
-	if r > 2 ^ 64 then
-		r *= 2 ^ -64
+	if r > POW2[64 + 1] then
+		r *= POW2N[64 + 1]
 		e += 64
 	end
-	if r > 2 ^ 32 then
-		r *= 2 ^ -32
+	if r > POW2[32 + 1] then
+		r *= POW2N[32 + 1]
 		e += 32
 	end
 	if r > 65536 then
-		r *= 2 ^ -16
+		r *= POW2N[16 + 1]
 		e += 16
 	end
 	if r > 256 then
-		r *= 2 ^ -8
+		r *= POW2N[8 + 1]
 		e += 8
 	end
 	if r > 16 then
-		r *= 2 ^ -4
+		r *= POW2N[4 + 1]
 		e += 4
 	end
 	if r > 4 then
@@ -829,6 +886,7 @@ type Scratch = {
 	z: { number },
 	pend: { number },
 	acc: { number },
+	sigv: { number }, -- per-segment signature values of the last segmented row (dedup)
 	stats: Stats,
 }
 
@@ -845,6 +903,7 @@ export type Stats = {
 	fillPixels: number, -- pixels written by fills
 	searchProbes: number, -- bound evaluations made by the n0 search
 	seam: number, -- endless mode: largest X3 certificate of the rendered block rows
+	terms: number, -- transient pixels: terms looked at after trailing T4 trims (fast path)
 }
 
 local function newStats(): Stats
@@ -861,6 +920,7 @@ local function newStats(): Stats
 		fillPixels = 0,
 		searchProbes = 0,
 		seam = 0,
+		terms = 0,
 	}
 end
 Liquid.newStats = newStats
@@ -878,6 +938,11 @@ local function getScratch(plan: Plan, minCap: number): Scratch
 		slot = table.create(cap, 0),
 		tmpB = table.create(N, 0),
 		rowB = table.create(cap * math.max(plan.nt, 1), 0),
+		rowPF = table.create(cap * math.max(plan.NG, 1) * 4, 0),
+		rowPB = table.create(cap * math.max(plan.NG, 1) * 4, 0),
+		hP = table.create(math.max(plan.NG, 1) * 4, 0),
+		efP = table.create(math.max(plan.NG, 1) * 4, 0),
+		sebP = table.create(cap * math.max(plan.NG, 1) * 4, 0),
 		rowZ = table.create(cap * 4, 0),
 		rowMg = table.create(cap * 4, 0),
 		rowCol = table.create(cap, 0),
@@ -929,6 +994,7 @@ local function getScratch(plan: Plan, minCap: number): Scratch
 		z = table.create(M, 0),
 		pend = table.create(M, 0),
 		acc = {},
+		sigv = table.create(cap, 0),
 		stats = newStats(),
 	}
 	for k, v in base :: any do
@@ -1087,7 +1153,8 @@ end
 
 export type Endless = {
 	seed: number, -- any integer; selects the virtual canvas
-	horizon: number?, -- h >= 1 blocks of warm-up on each side of a block (default 2)
+	horizon: number?, -- largest warm-up, in blocks on each side of a block (default 2)
+	tolerance: number?, -- certificate the warm-up must reach, output units (default 2^-24)
 }
 
 -- Leaf of the virtual canvas containing stored pixel (xs, ys): (stored leaf index whose
@@ -1151,7 +1218,7 @@ local function segmentEndless(plan: Plan, tree: Tree, sc: Scratch, y: number, xa
 	local V = virtualStats(tree)
 	local nodes = tree.nodes
 	local leafKey = tree.leafKey
-	local sf = 2 ^ plan.R
+	local sf = pow2(plan.R)
 	local Sr, T, D = plan.Sr, plan.T, tree.maxDepth
 	local Wr, Hr = plan.Wr, plan.Hr
 	local nodesAt, splitsAt, leavesAt, all = V.nodesAt, V.splitsAt, V.leavesAt, V.all
@@ -1460,7 +1527,7 @@ end
 -- [0, M). leafFn(x, y) -> (leaf, depth) gives the leaf of each rendered pixel (default:
 -- Liquid.leafAt on the stored pixel (x >> R, y >> R)).
 function Liquid.referenceRow(plan: Plan, tree: Tree, y: number, zOut: { number }, leafFn: ((number, number) -> (number, number))?)
-	local sf = 2 ^ plan.R
+	local sf = pow2(plan.R)
 	local lookup = leafFn or function(x: number, yy: number): (number, number)
 		return Liquid.leafAt(tree, x // sf, yy // sf)
 	end
@@ -1472,7 +1539,7 @@ end
 -- window [wa, wb). Returns wa, wb.
 function Liquid.referenceEndless(plan: Plan, tree: Tree, y: number, block: number, horizon: number, seed: number, zOut: { number }): (number, number)
 	local Sr = plan.Sr
-	local sf = 2 ^ plan.R
+	local sf = pow2(plan.R)
 	local wa, wb = (block - horizon) * Sr, (block + 1 + horizon) * Sr
 	Liquid.referenceSpan(plan, tree, y, wa, wb, zOut, function(x: number, yy: number): (number, number)
 		return Liquid.virtualLeafAt(tree, x // sf, yy // sf, seed)
@@ -1575,7 +1642,7 @@ local function eventRow(
 	local wfA, wbA = sc.wf, sc.wb
 	local z, pend, acc = sc.z, sc.pend, sc.acc
 	local stats = sc.stats
-	local F = 2 ^ L
+	local F = pow2(L)
 	local GL = L * K
 	local JW = JMAX + 1
 	local hasEps = eps > 0
@@ -2028,6 +2095,7 @@ end
 
 local CACHE_MAX_KEYS = 32768
 local SHORT_LEN = 4 -- segments up to this length (level 0) skip the class machinery
+local RATIO_TOL = 1e-6 -- X2: relative agreement of two consecutive Aitken ratios
 
 -- Per-(plan, tree) cache of what depends only on a leaf's content: tracked targets b,
 -- limit colour zinf (4 channels), quantisation margins and the packed fill colour.
@@ -2039,7 +2107,9 @@ local function ensureCache(plan: Plan, tree: Tree, sc: any): boolean
 	local on = tree.keyCount <= CACHE_MAX_KEYS
 	sc.cacheOn = on
 	local nk = if on then tree.keyCount else 0
-	sc.keyB = table.create(nk * math.max(plan.nt, 1), 0)
+	sc.keyB = table.create(0, 0)
+	sc.keyPF = table.create(nk * math.max(plan.NG, 1) * 4, 0)
+	sc.keyPB = table.create(nk * math.max(plan.NG, 1) * 4, 0)
 	sc.keyZ = table.create(nk * 4, 0)
 	sc.keyMg = table.create(nk * 4, 0)
 	sc.keyCol = table.create(nk, 0)
@@ -2047,12 +2117,24 @@ local function ensureCache(plan: Plan, tree: Tree, sc: any): boolean
 	return on
 end
 
-local function fillSlot(plan: Plan, tree: Tree, sc: any, leaf: number, slot: number, Bt: { number }, Zt: { number }, MGt: { number }, COLt: { number })
+local function fillSlot(plan: Plan, tree: Tree, sc: any, leaf: number, slot: number, PFt: { number }, PBt: { number }, Zt: { number }, MGt: { number }, COLt: { number })
 	local tmp = sc.tmpB
 	leafTargets(plan, tree, leaf, tmp, 0)
-	local nt, trk = plan.nt, plan.trk
+	local nt, trk, grpOf, NG = plan.nt, plan.trk, plan.grpOf, plan.NG
+	local CfT4, CbT4 = plan.CfT4, plan.CbT4
+	local base = slot * NG * 4
+	for q = 1, NG * 4 do
+		PFt[base + q] = 0
+		PBt[base + q] = 0
+	end
 	for j = 1, nt do
-		Bt[slot * nt + j] = tmp[trk[j]]
+		local b = tmp[trk[j]]
+		local go = base + (grpOf[j] - 1) * 4
+		local co = (j - 1) * 4
+		for m = 1, 4 do
+			PFt[go + m] += CfT4[co + m] * b
+			PBt[go + m] += CbT4[co + m] * b
+		end
 	end
 	local M, N = plan.M, plan.N
 	local Csum, d = plan.Csum, plan.model.d
@@ -2090,13 +2172,15 @@ local function eventRow4(
 	wgt: number,
 	xEnd: number
 )
-	local M, K, nt = plan.M, plan.K, plan.nt
+	local M, K = plan.M, plan.K
 	local pw, S1, NT, G = plan.pw, plan.S1, plan.NT, plan.G
-	local trkOff, trkCls, CfT4, CbT4 = plan.trkOff, plan.trkCls, plan.CfT4, plan.CbT4
+	local NG = plan.NG -- groups of tracked neurons (shared gain at every depth)
+	local GW = NG * 4 -- projected state width: 4 channels per group
+	local grpOff, grpCls = plan.grpOff, plan.grpCls
 	local clsK, nClsT = plan.clsK, plan.nCls
 	local TP1, T = plan.TP1, plan.T
 	local sx, sl, sleaf, sdep, skey = sc.sx, sc.sl, sc.sleaf, sc.sdep, sc.skey
-	local slotOf, h, ef, seb = sc.slot, sc.h, sc.ef, sc.seb
+	local slotOf, h, ef, seb = sc.slot, sc.hP, sc.efP, sc.sebP
 	local Qf, Qb = sc.Qf, sc.Qb
 	local fOff, fQ, fW, fThr = sc.fOff, sc.fQ, sc.fW, sc.fThr
 	local bOff, bQ, bW, bThr = sc.bOff, sc.bQ, sc.bW, sc.bThr
@@ -2105,50 +2189,53 @@ local function eventRow4(
 	local acc = sc.acc
 	local stats = sc.stats
 	local hasA = M >= 4
-	local F = 2 ^ L
+	local F = pow2(L)
 	local GL = L * K
 	local JW = JMAX + 1
 	local nEval, nFill, nFillPx, nProbe, nSeg, nPiece = 0, 0, 0, 0, 0, 0
 
 	-- 0. per-content constants
 	local cacheOn = ensureCache(plan, tree, sc)
-	local Bt, Zt, MGt, COLt
+	local PFt, PBt, Zt, MGt, COLt
 	if cacheOn then
-		Bt, Zt, MGt, COLt = sc.keyB, sc.keyZ, sc.keyMg, sc.keyCol
+		PFt, PBt, Zt, MGt, COLt = sc.keyPF, sc.keyPB, sc.keyZ, sc.keyMg, sc.keyCol
 		local ok = sc.keyOk
 		for s = 1, nseg do
 			local key = skey[s]
 			if not ok[key + 1] then
-				fillSlot(plan, tree, sc, sleaf[s], key, Bt, Zt, MGt, COLt)
+				fillSlot(plan, tree, sc, sleaf[s], key, PFt, PBt, Zt, MGt, COLt)
 				ok[key + 1] = true
 			end
 			slotOf[s] = key
 		end
 	else
-		Bt, Zt, MGt, COLt = sc.rowB, sc.rowZ, sc.rowMg, sc.rowCol
+		PFt, PBt, Zt, MGt, COLt = sc.rowPF, sc.rowPB, sc.rowZ, sc.rowMg, sc.rowCol
 		for s = 1, nseg do
-			fillSlot(plan, tree, sc, sleaf[s], s - 1, Bt, Zt, MGt, COLt)
+			fillSlot(plan, tree, sc, sleaf[s], s - 1, PFt, PBt, Zt, MGt, COLt)
 			slotOf[s] = s - 1
 		end
 	end
 
-	-- 1. backward sweep over tracked neurons (closed-form jumps), at rest at the right end
+	-- 1. backward sweep over the projected group states (closed-form jumps), at rest at the
+	-- right end: h = projected target PB, e = h - PB, h = PB + e a^len
 	do
-		local bo = slotOf[nseg] * nt
-		for j = 1, nt do
-			h[j] = Bt[bo + j]
+		local bo = slotOf[nseg] * GW
+		for q = 1, GW do
+			h[q] = PBt[bo + q]
 		end
 	end
 	for s = nseg, 1, -1 do
-		local bo = slotOf[s] * nt
-		local to = sdep[s] * nt
+		local bo = slotOf[s] * GW
+		local go = sdep[s] * NG
 		local len = sl[s]
-		local eo = (s - 1) * nt
-		for j = 1, nt do
-			local b = Bt[bo + j]
-			local e = h[j] - b
-			seb[eo + j] = e
-			h[j] = b + e * pw[trkOff[to + j] + len]
+		local eo = (s - 1) * GW
+		for g = 1, NG do
+			local p = pw[grpOff[go + g] + len]
+			local q0 = (g - 1) * 4
+			local b1, b2, b3, b4 = PBt[bo + q0 + 1], PBt[bo + q0 + 2], PBt[bo + q0 + 3], PBt[bo + q0 + 4]
+			local e1, e2, e3, e4 = h[q0 + 1] - b1, h[q0 + 2] - b2, h[q0 + 3] - b3, h[q0 + 4] - b4
+			seb[eo + q0 + 1], seb[eo + q0 + 2], seb[eo + q0 + 3], seb[eo + q0 + 4] = e1, e2, e3, e4
+			h[q0 + 1], h[q0 + 2], h[q0 + 3], h[q0 + 4] = b1 + e1 * p, b2 + e2 * p, b3 + e3 * p, b4 + e4 * p
 		end
 	end
 
@@ -2230,12 +2317,14 @@ local function eventRow4(
 	-- terms are trimmed for good (powers only shrink along the walk). The other list (oOff,
 	-- oQ; no terms) is fixed. nl and nOther are the two step indices at Xs; nl grows by F
 	-- per pixel and nOther shrinks by F.
+	local nTerms = 0 -- terms looked at by the walks (T4 statistics)
 	local function walk(Xs: number, cnt: number, dX: number, na: number, nl: number, no: number, nOther: number, zi0: number, zi1: number, zi2: number, zi3: number)
 		local X = Xs
 		for _ = 1, cnt do
 			while na > 0 and pw[aOff[na] + nl] <= aThr[na] do
 				na -= 1
 			end
+			nTerms += na + no
 			local z0, z1, z2, z3 = zi0, zi1, zi2, zi3
 			for j = 1, na do
 				local p = pw[aOff[j] + nl]
@@ -2299,9 +2388,9 @@ local function eventRow4(
 
 	-- 2. forward sweep and output
 	do
-		local bo = slotOf[1] * nt
-		for j = 1, nt do
-			h[j] = Bt[bo + j]
+		local bo = slotOf[1] * GW
+		for q = 1, GW do
+			h[q] = PFt[bo + q]
 		end
 	end
 	local pendX, pendCnt = NONE, 0
@@ -2315,12 +2404,12 @@ local function eventRow4(
 		local len = sl[s]
 		local x1 = x0 + len
 		local slot = slotOf[s]
-		local bo = slot * nt
+		local bo = slot * GW
 		local dep = sdep[s]
-		local to = dep * nt
-		local eo = (s - 1) * nt
-		for j = 1, nt do
-			ef[j] = h[j] - Bt[bo + j]
+		local go = dep * NG
+		local eo = (s - 1) * GW
+		for q = 1, GW do
+			ef[q] = h[q] - PFt[bo + q]
 		end
 		if x1 > xFirst then
 			nSeg += 1
@@ -2343,16 +2432,16 @@ local function eventRow4(
 					local nf = X - x0 + 1
 					local nb = x1 - X
 					local z0, z1, z2, z3 = zi0, zi1, zi2, zi3
-					for j = 1, nt do
-						if trkCls[to + j] > 0 then
-							local off = trkOff[to + j]
-							local pf = ef[j] * pw[off + nf]
-							local pb = seb[eo + j] * pw[off + nb]
-							local co = (j - 1) * 4
-							z0 += CfT4[co + 1] * pf + CbT4[co + 1] * pb
-							z1 += CfT4[co + 2] * pf + CbT4[co + 2] * pb
-							z2 += CfT4[co + 3] * pf + CbT4[co + 3] * pb
-							z3 += CfT4[co + 4] * pf + CbT4[co + 4] * pb
+					for g = 1, NG do
+						if grpCls[go + g] > 0 then
+							local off = grpOff[go + g]
+							local pf = pw[off + nf]
+							local pb = pw[off + nb]
+							local q0 = (g - 1) * 4
+							z0 += ef[q0 + 1] * pf + seb[eo + q0 + 1] * pb
+							z1 += ef[q0 + 2] * pf + seb[eo + q0 + 2] * pb
+							z2 += ef[q0 + 3] * pf + seb[eo + q0 + 3] * pb
+							z3 += ef[q0 + 4] * pf + seb[eo + q0 + 4] * pb
 						end
 					end
 					if mode == 0 then
@@ -2403,20 +2492,19 @@ local function eventRow4(
 					Qf[q] = 0
 					Qb[q] = 0
 				end
-				for j = 1, nt do
-					local c = trkCls[to + j]
+				for g = 1, NG do
+					local c = grpCls[go + g]
 					if c > 0 then
-						local e1, e2 = ef[j], seb[eo + j]
 						local qo = (c - 1) * 4
-						local co = (j - 1) * 4
-						Qf[qo + 1] += CfT4[co + 1] * e1
-						Qf[qo + 2] += CfT4[co + 2] * e1
-						Qf[qo + 3] += CfT4[co + 3] * e1
-						Qf[qo + 4] += CfT4[co + 4] * e1
-						Qb[qo + 1] += CbT4[co + 1] * e2
-						Qb[qo + 2] += CbT4[co + 2] * e2
-						Qb[qo + 3] += CbT4[co + 3] * e2
-						Qb[qo + 4] += CbT4[co + 4] * e2
+						local q0 = (g - 1) * 4
+						Qf[qo + 1] += ef[q0 + 1]
+						Qf[qo + 2] += ef[q0 + 2]
+						Qf[qo + 3] += ef[q0 + 3]
+						Qf[qo + 4] += ef[q0 + 4]
+						Qb[qo + 1] += seb[eo + q0 + 1]
+						Qb[qo + 2] += seb[eo + q0 + 2]
+						Qb[qo + 3] += seb[eo + q0 + 3]
+						Qb[qo + 4] += seb[eo + q0 + 4]
 					end
 				end
 
@@ -2784,8 +2872,13 @@ local function eventRow4(
 				end
 			end
 		end
-		for j = 1, nt do
-			h[j] = Bt[bo + j] + ef[j] * pw[trkOff[to + j] + len]
+		for g = 1, NG do
+			local p = pw[grpOff[go + g] + len]
+			local q0 = (g - 1) * 4
+			h[q0 + 1] = PFt[bo + q0 + 1] + ef[q0 + 1] * p
+			h[q0 + 2] = PFt[bo + q0 + 2] + ef[q0 + 2] * p
+			h[q0 + 3] = PFt[bo + q0 + 3] + ef[q0 + 3] * p
+			h[q0 + 4] = PFt[bo + q0 + 4] + ef[q0 + 4] * p
 		end
 	end
 	if pendX ~= NONE then
@@ -2797,6 +2890,7 @@ local function eventRow4(
 	stats.fillPixels += nFillPx
 	stats.searchProbes += nProbe
 	stats.pieces += nPiece
+	stats.terms += nTerms
 end
 
 ----------------------------------------------------------------------------------------
@@ -2816,11 +2910,12 @@ export type RenderOptions = {
 	out2: buffer?, -- channels 4..7 when M > 4
 	stats: Stats?,
 	endless: Endless?, -- X3: render the endless virtual canvas (region may be anywhere)
+	dedup: boolean?, -- reuse rows whose segment sequence repeats an earlier one (default true)
 }
 
 -- Output size at a level: width ceil(Wr / 2^L); height ceil(Hr / 2^L), or Hr for "rows".
 function Liquid.outputSize(plan: Plan, level: number?, vertical: string?): (number, number)
-	local F = 2 ^ (level or 0)
+	local F = pow2(level or 0)
 	local w = (plan.Wr + F - 1) // F
 	local h = if vertical == "rows" then plan.Hr else (plan.Hr + F - 1) // F
 	return w, h
@@ -2844,7 +2939,7 @@ function Liquid.render(plan: Plan, tree: Tree, out: buffer, outWidth: number, op
 	local vertical = o.vertical or "box"
 	assert(vertical == "box" or vertical == "point" or vertical == "rows", "vertical must be box, point or rows")
 	local endless = o.endless
-	local F = 2 ^ L
+	local F = pow2(L)
 	local Wl, Hl = Liquid.outputSize(plan, L, vertical)
 	local rx, ry = o.x or 0, o.y or 0
 	local rw, rh = o.w or (Wl - rx), o.h or (Hl - ry)
@@ -2874,11 +2969,40 @@ function Liquid.render(plan: Plan, tree: Tree, out: buffer, outWidth: number, op
 	local Wr, Hr = plan.Wr, plan.Hr
 	local fast = M <= 4
 	local AS = if fast then 4 else M -- accumulator stride
+	local dedup = o.dedup ~= false
 	local horizon = if endless then endless.horizon or 2 else 0
 	assert(horizon >= 1 or not endless, "endless horizon must be >= 1")
 	local sc = getScratch(plan, if endless then (2 * horizon + 1) * plan.Sr + 2 else Wr + 2)
+	-- (the endless window is at most 2 * horizon + 1 blocks wide)
 	sc.stats = stats
 	assert(buffer.len(out) >= ((dy + rh - 1) * outWidth + dx + rw) * 4, "output buffer too small")
+
+	-- Exact cross-band deduplication: rows whose segment sequences (length, content key,
+	-- depth) are equal render identically. A rolling hash over exact integers finds
+	-- candidates and the stored sequence is compared before a row is reused, so a hash
+	-- collision can only cost a render, never change a pixel.
+	local sigv = sc.sigv
+	local function rowSignature(n: number): number
+		local sl, skey, sdep = sc.sl, sc.skey, sc.sdep
+		local hsh = n
+		for s = 1, n do
+			local v = (skey[s] * 32 + sdep[s]) * 131072 + sl[s] -- < 2^42, exact
+			sigv[s] = v
+			hsh = (hsh * 1000003 + v) % 2147483647 -- < 2^53 before the modulo: exact
+		end
+		return hsh
+	end
+	local function sameRow(entry: { number }, n: number): boolean
+		if #entry ~= n then
+			return false
+		end
+		for s = 1, n do
+			if entry[s] ~= sigv[s] then
+				return false
+			end
+		end
+		return true
+	end
 
 	-- Renders output columns [cx0, cx1) of output rows [ry, ry + rh). seg(y) segments
 	-- rendered row y and returns (count, band end); xEnd clips the last footprint; rows at
@@ -2888,6 +3012,33 @@ function Liquid.render(plan: Plan, tree: Tree, out: buffer, outWidth: number, op
 		local cw = cx1 - cx0
 		local function rowAt(Y: number): number
 			return ((dy + Y - ry) * outWidth + dx + cx0 - rx) * 4
+		end
+		local seen: { [number]: { { number } } } = {} -- signature -> list of {Y, seq...}
+		local seenRow: { [{ number }]: number } = {}
+		-- returns the output row already holding this row's pixels, or nil (and records Y)
+		local function lookup(n: number, Y: number): number?
+			if not dedup then
+				return nil
+			end
+			local sig = rowSignature(n)
+			local bucket = seen[sig]
+			if bucket then
+				for _, entry in bucket do
+					if sameRow(entry, n) then
+						return seenRow[entry]
+					end
+				end
+			else
+				bucket = {}
+				seen[sig] = bucket
+			end
+			local entry = table.create(n, 0)
+			for s2 = 1, n do
+				entry[s2] = sigv[s2]
+			end
+			table.insert(bucket, entry)
+			seenRow[entry] = Y
+			return nil
 		end
 		local function row(n: number, mode: number, at: number, wgt: number)
 			if fast then
@@ -2902,8 +3053,14 @@ function Liquid.render(plan: Plan, tree: Tree, out: buffer, outWidth: number, op
 			while y < yEndAll do
 				local n, bandEnd = seg(y)
 				local yEnd = if bandEnd < yEndAll then bandEnd else yEndAll
-				row(n, 0, rowAt(y), 1)
-				stats.rendered += 1
+				local prev = lookup(n, y)
+				if prev then
+					copyRow(out, out2, M, rowAt(y), rowAt(prev), colBytes)
+					stats.deduped += 1
+				else
+					row(n, 0, rowAt(y), 1)
+					stats.rendered += 1
+				end
 				stats.rows += 1
 				local src = rowAt(y)
 				for yy = y + 1, yEnd - 1 do
@@ -2925,8 +3082,14 @@ function Liquid.render(plan: Plan, tree: Tree, out: buffer, outWidth: number, op
 					stats.copied += 1
 				else
 					local n, bandEnd = seg(ys)
-					row(n, 0, rowAt(Y), 1)
-					stats.rendered += 1
+					local prev = lookup(n, Y)
+					if prev then
+						copyRow(out, out2, M, rowAt(Y), rowAt(prev), colBytes)
+						stats.deduped += 1
+					else
+						row(n, 0, rowAt(Y), 1)
+						stats.rendered += 1
+					end
 					bandLo, bandHi = ys, bandEnd
 				end
 				stats.rows += 1
@@ -2946,8 +3109,14 @@ function Liquid.render(plan: Plan, tree: Tree, out: buffer, outWidth: number, op
 				end
 				local n, bandEnd = seg(ya)
 				if bandEnd >= yb then
-					row(n, 0, rowAt(Y), 1)
-					stats.rendered += 1
+					local prev = lookup(n, Y)
+					if prev then
+						copyRow(out, out2, M, rowAt(Y), rowAt(prev), colBytes)
+						stats.deduped += 1
+					else
+						row(n, 0, rowAt(Y), 1)
+						stats.rendered += 1
+					end
 					prevEnd = bandEnd
 				else
 					-- the footprint crosses band boundaries: exact weighted sum of the band rows
@@ -2986,21 +3155,37 @@ function Liquid.render(plan: Plan, tree: Tree, out: buffer, outWidth: number, op
 	end
 
 	if endless then
-		-- one column per block; its passes run over the canonical window of `horizon`
-		-- blocks on each side, so a pixel never depends on the requested region (X3)
+		-- One column per block. Its passes start at rest at the ends of a canonical window:
+		-- the block plus the first warm-up width w of the ladder Sr/16, Sr/4, Sr, 4 Sr, ...
+		-- (capped at `horizon` blocks) whose a-posteriori certificate is <= tolerance. The
+		-- choice depends only on the virtual content of the row, so a pixel never depends on
+		-- the requested region, and the seam between blocks is <= twice the tolerance (X3).
 		local seed = endless.seed
+		local tol = endless.tolerance or pow2(-24)
 		local Sr = plan.Sr
 		local colW = Sr // F
+		local rungs: { number } = {}
+		local maxW = horizon * Sr
+		local w = if Sr >= 16 then Sr // 16 else 1
+		while w < maxW do
+			table.insert(rungs, w)
+			w *= 4
+		end
+		table.insert(rungs, maxW)
 		for beta = rx // colW, (rx + rw - 1) // colW do
 			local cx0 = if beta * colW > rx then beta * colW else rx
 			local cx1 = if (beta + 1) * colW < rx + rw then (beta + 1) * colW else rx + rw
-			local wa, wb = (beta - horizon) * Sr, (beta + 1 + horizon) * Sr
+			local b0, b1 = beta * Sr, (beta + 1) * Sr
 			column(cx0, cx1, function(y: number): (number, number)
-				local n, bandEnd = segmentEndless(plan, tree, sc, y, wa, wb, seed)
-				if fast then
-					local cert = windowCert(plan, tree, sc, n, beta * Sr, (beta + 1) * Sr)
-					if cert > stats.seam then
-						stats.seam = cert
+				local n, bandEnd = 0, 0
+				for ri = 1, #rungs do
+					n, bandEnd = segmentEndless(plan, tree, sc, y, b0 - rungs[ri], b1 + rungs[ri], seed)
+					local cert = if fast then windowCert(plan, tree, sc, n, b0, b1) else 0
+					if cert <= tol or ri == #rungs or not fast then
+						if cert > stats.seam then
+							stats.seam = cert
+						end
+						break
 					end
 				end
 				return n, bandEnd
@@ -3018,7 +3203,7 @@ end
 -- dst[X * M + m + 1] for X in [0, ceil(Wr / 2^L)). Every value is within epsilon of the
 -- exact model's footprint average (T2 and T4 without the rounding term).
 function Liquid.renderRowValues(plan: Plan, tree: Tree, y: number, level: number, epsilon: number, dst: { number }, stats: Stats?): number
-	local F = 2 ^ level
+	local F = pow2(level)
 	local Wl = (plan.Wr + F - 1) // F
 	local sc = getScratch(plan, plan.Wr + 2)
 	sc.stats = stats or newStats()
@@ -3040,6 +3225,205 @@ function Liquid.renderRowValues(plan: Plan, tree: Tree, y: number, level: number
 		end
 	end
 	return Wl
+end
+
+----------------------------------------------------------------------------------------
+-- X2 Richardson LOD (horizontal, per row). The finer level L-1 is predicted from levels L
+-- and L+1 as  z_{L-1} = z_L + c (z_L - z_{L+1}).  On a single exponential with ratio rho
+-- per level-(L-1) pixel (T5: footprint averages of a geometric sequence are geometric),
+-- the four children of a level-(L+1) pixel need c = +mu_a, -mu_a, -mu_b, +mu_b with
+-- mu_a = 2 / (1 + rho)^2 and mu_b = 2 rho^2 / (1 + rho)^2 (forward decay; swapped for a
+-- backward one), and rho^2 is Aitken's ratio of consecutive level-L differences. rho = 1
+-- gives the affine coefficients c = +-1/2. Every child pair averages back to z_L exactly
+-- (c sums to 0 over a pair), so swapping the prediction for the exact level later never
+-- shifts the mean. Proofs and bounds in docs/LIQUID.md (X2).
+----------------------------------------------------------------------------------------
+
+-- One level-L pixel X of richardsonRow: writes its two predicted children at out[oa + m]
+-- and out[oa + M + m] (1-based m) and returns its discrepancy max_m |zL - zU|.
+local function richardsonPixel(zL: { number }, zU: { number }, nL: number, M: number, X: number, out: { number }, oa: number, geometric: boolean): number
+	local tau = X % 2
+	local up = (X // 2) * M
+	local dmax = 0
+	for m = 1, M do
+		local a = zL[X * M + m]
+		local e = a - zU[up + m]
+		local muA, muB, forward = 0.5, 0.5, true
+		if geometric and X > 0 and X < nL - 2 then
+			local dm = a - zL[(X - 1) * M + m]
+			local dp = zL[(X + 1) * M + m] - a
+			local dq = zL[(X + 2) * M + m] - zL[(X + 1) * M + m]
+			if dm ~= 0 and dp ~= 0 then
+				local q = dp / dm
+				local q2 = dq / dp
+				-- a single exponential has equal consecutive ratios; anything else (a
+				-- segment boundary, two classes of different speed) keeps the affine c
+				local dq2 = q - q2
+				if dq2 < 0 then
+					dq2 = -dq2
+				end
+				if q >= 0 and q < math.huge and dq2 <= RATIO_TOL * (if q > q2 then q else q2) then
+					local rho
+					if q <= 1 then
+						rho = math.sqrt(q)
+					else
+						rho = math.sqrt(1 / q)
+						forward = false
+					end
+					local s1 = 1 + rho
+					muA = 2 / (s1 * s1)
+					muB = muA * rho * rho
+				end
+			end
+		end
+		local c0
+		if tau == 0 then
+			c0 = if forward then muA else muB
+		else
+			c0 = -(if forward then muB else muA)
+		end
+		out[oa + m] = a + c0 * e
+		out[oa + M + m] = a - c0 * e
+		local ae = if e < 0 then -e else e
+		if ae > dmax then
+			dmax = ae
+		end
+	end
+	return dmax
+end
+
+-- zL: level-L values of one row (nL pixels times M channels, flat, 1-based); zU: the level
+-- L+1 values of the same row. Writes the predicted level-(L-1) values (2 nL pixels) into
+-- out and the discrepancy max_m |zL - zU| of each level-L pixel into disc[X + 1].
+-- geometric = false uses the affine coefficients.
+function Liquid.richardsonRow(zL: { number }, zU: { number }, nL: number, M: number, out: { number }, disc: { number }, geometric: boolean)
+	for X = 0, nL - 1 do
+		disc[X + 1] = richardsonPixel(zL, zU, nL, M, X, out, 2 * X * M, geometric)
+	end
+end
+
+-- X2 for a whole frame in "rows" layout: renders levels L and L+1 (real values, eps) and
+-- writes the predicted level L-1 into out (RGBA8, stride outWidth). Returns the rows
+-- ordered by decreasing discrepancy (the refinement order) and each row's largest
+-- discrepancy. Event-aware: where the discrepancy is 0 the children equal the coarse value
+-- exactly (any c), so runs of such pixels with equal values become fill spans; rows of a
+-- band are predicted once and copied.
+function Liquid.predictFiner(plan: Plan, tree: Tree, level: number, eps: number, out: buffer, outWidth: number, geometric: boolean?): ({ number }, { number })
+	assert(level >= 1 and level + 1 <= plan.P + plan.R, "predictFiner needs 1 <= level < P + R")
+	local M = plan.M
+	local geo = geometric ~= false
+	local Fm = pow2(level - 1)
+	local nFine = (plan.Wr + Fm - 1) // Fm
+	local zL, zU = {}, {}
+	local two = table.create(2 * M, 0)
+	local rowDisc = table.create(plan.Hr, 0)
+	local z = table.create(M, 0)
+	local sc = getScratch(plan, plan.Wr + 2)
+	local y = 0
+	while y < plan.Hr do
+		local _, bandEnd = segmentStored(plan, tree, sc, y, 0, plan.Wr, 0)
+		local nL = Liquid.renderRowValues(plan, tree, y, level, eps, zL)
+		Liquid.renderRowValues(plan, tree, y, level + 1, eps, zU)
+		local at = y * outWidth * 4
+		local dmax = 0
+		local X = 0
+		while X < nL do
+			-- run of zero discrepancy and equal values
+			local flat = true
+			local up = (X // 2) * M
+			for m = 1, M do
+				if zL[X * M + m] ~= zU[up + m] then
+					flat = false
+					break
+				end
+			end
+			if flat then
+				local X2 = X + 1
+				while X2 < nL do
+					local same = true
+					local u2 = (X2 // 2) * M
+					for m = 1, M do
+						local v = zL[X2 * M + m]
+						if v ~= zL[X * M + m] or v ~= zU[u2 + m] then
+							same = false
+							break
+						end
+					end
+					if not same then
+						break
+					end
+					X2 += 1
+				end
+				for m = 1, M do
+					z[m] = zL[X * M + m]
+				end
+				local lo = 2 * X
+				local hi = 2 * X2
+				if hi > nFine then
+					hi = nFine
+				end
+				if hi > lo then
+					fillSpan(out, at + lo * 4, hi - lo, packZ(z, M, 0))
+				end
+				X = X2
+			else
+				local d = richardsonPixel(zL, zU, nL, M, X, two, 0, geo)
+				if d > dmax then
+					dmax = d
+				end
+				for c = 0, 1 do
+					local Xf = 2 * X + c
+					if Xf < nFine then
+						for m = 1, M do
+							z[m] = two[c * M + m]
+						end
+						buffer.writeu32(out, at + Xf * 4, packZ(z, M, 0))
+					end
+				end
+				X += 1
+			end
+		end
+		for yy = y, bandEnd - 1 do
+			rowDisc[yy + 1] = dmax
+			if yy > y then
+				buffer.copy(out, yy * outWidth * 4, out, at, nFine * 4)
+			end
+		end
+		y = bandEnd
+	end
+	local order = table.create(plan.Hr, 0)
+	for j = 1, plan.Hr do
+		order[j] = j - 1
+	end
+	table.sort(order, function(a: number, b: number): boolean
+		local da, db = rowDisc[a + 1], rowDisc[b + 1]
+		if da ~= db then
+			return da > db
+		end
+		return a < b
+	end)
+	return order, rowDisc
+end
+
+-- Renders rendered rows `rows` (a list) exactly at a level in "rows" layout: the refinement
+-- step of X2 (and any partial re-render). Returns the statistics.
+function Liquid.renderRows(plan: Plan, tree: Tree, rows: { number }, level: number, eps: number, out: buffer, outWidth: number, stats: Stats?): Stats
+	local st = stats or newStats()
+	for _, y in rows do
+		Liquid.render(plan, tree, out, outWidth, { epsilon = eps, level = level, vertical = "rows", y = y, h = 1, dy = y, stats = st })
+	end
+	return st
+end
+
+-- T7 lockstep checksum: MyMath.hash32 folded over the buffer's u32 words (length must be a
+-- multiple of 4). Equal model bytes, tree bytes and options give equal hashes on every
+-- device and in both runtimes, so instances can compare frames by exchanging 4 bytes.
+function Liquid.hashBuffer(b: buffer): number
+	local h = 0x811C9DC5
+	for i = 0, buffer.len(b) // 4 - 1 do
+		h = hash32(bit32.bxor(h, buffer.readu32(b, i * 4)))
+	end
+	return h
 end
 
 -- Renders into a Canvas (src/Canvas.luau) and marks exactly the written rows dirty.

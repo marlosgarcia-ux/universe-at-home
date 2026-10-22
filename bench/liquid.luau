@@ -16,9 +16,9 @@
 local Liquid = require("../src/Liquid")
 local MyMath = require("../src/MyMath")
 
-local args = { ... }
+local args: { string } = { ... }
 local RUNS = tonumber(args[1]) or 3
-local FILTER = args[2]
+local FILTER: string? = args[2]
 local SIZE = 1024
 
 local clock = os.clock
@@ -461,20 +461,37 @@ end
 ----------------------------------------------------------------------------------------
 
 local runtime = if args[3] then args[3] else "?"
-print(string.format("# ALLAN renderer benchmark (%s), %dx%d, min of %d runs", runtime, SIZE, SIZE, RUNS))
+print(string.format("# ALLAN renderer benchmark (%s), %dx%d, minimum of %d runs per timing", runtime, SIZE, SIZE, RUNS))
 
-local scenes = {
+type Scene = { name: string, make: () -> buffer, theta: number }
+type Res = { name: string, scales: { number } }
+type Cfg = { eps: number, L: number, vert: string }
+
+local scenes: { Scene } = {
 	{ name = "flat UI", make = uiScene, theta = 8 },
 	{ name = "SDF logo", make = logoScene, theta = 8 },
 	{ name = "noise", make = noiseScene, theta = 8 },
 }
-local reservoirs = {
+local reservoirs: { Res } = {
 	{ name = "walsh[inst,0,-2]", scales = { INSTANT, 0, -2 } },
 	{ name = "walsh[inst,-2,-4]", scales = { INSTANT, -2, -4 } },
 }
+local configs: { Cfg } = {
+	{ eps = 0.5, L = 0, vert = "box" },
+	{ eps = 0, L = 0, vert = "box" },
+	{ eps = 0.25, L = 0, vert = "box" },
+	{ eps = 1, L = 0, vert = "box" },
+	{ eps = 0.5, L = 1, vert = "box" },
+	{ eps = 0.5, L = 2, vert = "box" },
+	{ eps = 0.5, L = 2, vert = "point" },
+}
+
+local function byteAt(b: buffer, j: number, c: number): number
+	return buffer.readu8(b, j * 4 + c)
+end
 
 for _, sc in scenes do
-	if FILTER and not string.find(sc.name, FILTER, 1, true) then
+	if FILTER and FILTER ~= "" and not string.find(sc.name, FILTER, 1, true) then
 		continue
 	end
 	local t0 = clock()
@@ -483,7 +500,15 @@ for _, sc in scenes do
 	t0 = clock()
 	local tree = buildTree(img, SIZE, SIZE, sc.theta, 1)
 	local tTree = clock() - t0
-	print(string.format("\n## %s: image %.1f s, tree %.1f s, %d leaves, %d nodes", sc.name, tImg, tTree, tree.leafCount, tree.nodeCount))
+	print(string.format(
+		"\n## %s: image %.1f s, tree %.1f s, %d leaves, %d nodes, %d distinct leaf contents",
+		sc.name,
+		tImg,
+		tTree,
+		tree.leafCount,
+		tree.nodeCount,
+		tree.keyCount
+	))
 	for _, rv in reservoirs do
 		local res = walsh(8, 3, 16, rv.scales)
 		t0 = clock()
@@ -491,53 +516,191 @@ for _, sc in scenes do
 		local tFit = clock() - t0
 		local plan = Liquid.prepare(model, tree)
 		local ref = buffer.create(SIZE * SIZE * 4)
-		local tRef = minTime(math.min(RUNS, 2), function()
+		local tRef = minTime(RUNS, function()
 			Liquid.reference(plan, tree, ref, SIZE, true)
 		end)
 		local refB = buffer.create(SIZE * SIZE * 4)
-		local tRefB = minTime(math.min(RUNS, 2), function()
+		local tRefB = minTime(RUNS, function()
 			Liquid.reference(plan, tree, refB, SIZE, true, nil, true)
 		end)
-		assert(buffer.tostring(refB) == buffer.tostring(ref), "band-deduplicated reference must equal the reference")
+		assert(buffer.tostring(refB) == buffer.tostring(ref), "band-copied reference must equal the reference")
 		local p, mx = psnr(ref, img, SIZE * SIZE)
 		print(string.format(
-			"reservoir %s: fit %.1f s; model PSNR %.2f dB (max err %d); reference %.1f ms, reference with band copies %.1f ms",
-			rv.name, tFit, p, mx, tRef, tRefB
+			"\n### reservoir %s (N 8, K 16, %d tracked groups): fit %.1f s; model vs source PSNR %.2f dB (max err %d)",
+			rv.name,
+			plan.NG,
+			tFit,
+			p,
+			mx
 		))
-		print("| epsilon | level | vertical | ms | speedup vs reference | vs reference with band copies | rendered rows | events/row | evals/row | fill % of rendered px | max diff vs ref |")
-		print("|---|---|---|---|---|---|---|---|---|---|---|")
-		for _, cfg in {
-			{ 0.5, 0, "box" },
-			{ 0, 0, "box" },
-			{ 0.25, 0, "box" },
-			{ 1, 0, "box" },
-			{ 0.5, 1, "box" },
-			{ 0.5, 2, "box" },
-			{ 0.5, 2, "point" },
-		} do
-			local eps, L, vert = cfg[1], cfg[2], cfg[3]
-			local F = 2 ^ L
+		print(string.format("reference (every pixel stepped) %.1f ms; reference with band copies %.1f ms", tRef, tRefB))
+		print("")
+		print("| epsilon | level | vertical | ms | vs reference | vs band-copied reference | rows evaluated | rows deduplicated | events (segments)/evaluated row | closed-form evals/evaluated row | fill % of evaluated px | max diff vs reference |")
+		print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+		local outs: { [string]: buffer } = {}
+		for _, cfg in configs do
+			local F = 2 ^ cfg.L
 			local Wl = SIZE // F
 			local out = buffer.create(Wl * Wl * 4)
 			local st = Liquid.newStats()
 			local ms = minTime(RUNS, function()
 				st = Liquid.newStats()
-				Liquid.render(plan, tree, out, Wl, { epsilon = eps, level = L, vertical = vert, stats = st })
+				Liquid.render(plan, tree, out, Wl, { epsilon = cfg.eps, level = cfg.L, vertical = cfg.vert, stats = st })
 			end)
-			local md = if L == 0 then string.format("%d", maxDiff(out, ref, SIZE * SIZE)) else "-"
+			outs[cfg.vert .. cfg.L .. "_" .. cfg.eps] = out
+			local md = if cfg.L == 0 then string.format("%d", maxDiff(out, ref, SIZE * SIZE)) else "-"
 			print(string.format(
-				"| %g | %d | %s | %.2f | %.1fx | %s | %d | %.1f | %.1f | %.1f | %s |",
-				eps,
-				L,
-				vert,
+				"| %g | %d | %s | %.2f | %.1fx | %s | %d | %d | %.1f | %.1f | %.1f | %s |",
+				cfg.eps,
+				cfg.L,
+				cfg.vert,
 				ms,
 				tRef / ms,
-				if L == 0 then string.format("%.1fx", tRefB / ms) else "-",
+				if cfg.L == 0 then string.format("%.1fx", tRefB / ms) else "-",
 				st.rendered,
+				st.deduped,
 				st.segments / math.max(st.rendered, 1),
 				st.evals / math.max(st.rendered, 1),
 				100 * st.fillPixels / math.max(st.rendered * Wl, 1),
 				md
+			))
+		end
+
+		-- vertical strategy at level 2: exact 2D box of the reference vs "box" and "point"
+		local W2 = SIZE // 4
+		local z = {}
+		local acc = table.create(W2 * 3, 0)
+		local box, point = outs["box2_0.5"], outs["point2_0.5"]
+		local eBoxMax, eBoxSum, ePtMax, ePtSum = 0, 0, 0, 0
+		for Y = 0, W2 - 1 do
+			table.clear(acc)
+			for j = 1, W2 * 3 do
+				acc[j] = 0
+			end
+			for y = 4 * Y, 4 * Y + 3 do
+				Liquid.referenceRow(plan, tree, y, z)
+				for X = 0, W2 - 1 do
+					for c = 0, 2 do
+						local s2 = 0
+						for x = 4 * X, 4 * X + 3 do
+							s2 += z[x * 3 + c + 1]
+						end
+						acc[X * 3 + c + 1] += s2 / 16
+					end
+				end
+			end
+			for X = 0, W2 - 1 do
+				for c = 0, 2 do
+					local exact = math.clamp(acc[X * 3 + c + 1], 0, 255)
+					local eb = math.abs(byteAt(box, Y * W2 + X, c) - exact)
+					local ep = math.abs(byteAt(point, Y * W2 + X, c) - exact)
+					eBoxSum += eb
+					ePtSum += ep
+					if eb > eBoxMax then
+						eBoxMax = eb
+					end
+					if ep > ePtMax then
+						ePtMax = ep
+					end
+				end
+			end
+		end
+		local nv = W2 * W2 * 3
+		print(string.format(
+			"\nvertical strategy at level 2 against the exact 2D box average of the reference: box max %.2f mean %.3f; point max %.2f mean %.3f (output units)",
+			eBoxMax,
+			eBoxSum / nv,
+			ePtMax,
+			ePtSum / nv
+		))
+
+		-- X2: predict level 0 from levels 1 and 2 (rows layout), then refine by discrepancy
+		local exact0 = outs["box0_0.5"]
+		local pred = buffer.create(SIZE * SIZE * 4)
+		local order: { number } = {}
+		local tPred = minTime(RUNS, function()
+			order = Liquid.predictFiner(plan, tree, 1, 0.5, pred, SIZE)
+		end)
+		-- the part of that time spent rendering the two coarse levels (real values)
+		local zc1, zc2 = {}, {}
+		local tCoarse = minTime(RUNS, function()
+			local y = 0
+			while y < SIZE do
+				local segs, bandEnd = Liquid.rowSegments(plan, tree, y)
+				local _ = segs
+				Liquid.renderRowValues(plan, tree, y, 1, 0.5, zc1)
+				Liquid.renderRowValues(plan, tree, y, 2, 0.5, zc2)
+				y = bandEnd
+			end
+		end)
+		local rowErr = table.create(SIZE, 0)
+		local rowSum = table.create(SIZE, 0)
+		local same, sumErr, maxErr = 0, 0, 0
+		for y = 0, SIZE - 1 do
+			for x = 0, SIZE - 1 do
+				local j = y * SIZE + x
+				if buffer.readu32(pred, j * 4) == buffer.readu32(exact0, j * 4) then
+					same += 1
+				end
+				for c = 0, 2 do
+					local e = math.abs(byteAt(pred, j, c) - byteAt(exact0, j, c))
+					sumErr += e
+					rowSum[y + 1] += e
+					if e > rowErr[y + 1] then
+						rowErr[y + 1] = e
+					end
+					if e > maxErr then
+						maxErr = e
+					end
+				end
+			end
+		end
+		-- share of the total absolute error removed by refining the first 10% / 25% of rows
+		-- in discrepancy order, against the same number of rows spread uniformly
+		local function removed(frac: number): (number, number)
+			local k = math.floor(SIZE * frac)
+			local byOrder, uniform = 0, 0
+			for i = 1, k do
+				byOrder += rowSum[order[i] + 1]
+			end
+			local step = SIZE / k
+			for i = 0, k - 1 do
+				uniform += rowSum[math.floor(i * step) + 1]
+			end
+			return byOrder / math.max(sumErr, 1e-12), uniform / math.max(sumErr, 1e-12)
+		end
+		local r10, u10 = removed(0.1)
+		local r25, u25 = removed(0.25)
+		print(string.format(
+			"X2 (level 0 predicted from levels 1 and 2): %.2f ms in all, of which %.2f ms render the two coarse levels (prediction pass %.2f ms); %.1f%% of pixels exact, mean abs err %.3f, max err %d. Refining 10%% of rows in discrepancy order removes %.0f%% of the error (uniform rows: %.0f%%); 25%%: %.0f%% (uniform %.0f%%)",
+			tPred,
+			tCoarse,
+			math.max(tPred - tCoarse, 0),
+			100 * same / (SIZE * SIZE),
+			sumErr / (SIZE * SIZE * 3),
+			maxErr,
+			100 * r10,
+			100 * u10,
+			100 * r25,
+			100 * u25
+		))
+
+		-- X3: one virtual block and one straddling the stored edge
+		local tile = buffer.create(SIZE * SIZE * 4)
+		for _, at in { { 1024, 0 }, { 512, 512 } } do
+			local st = Liquid.newStats()
+			local ms = minTime(RUNS, function()
+				st = Liquid.newStats()
+				Liquid.render(plan, tree, tile, SIZE, { epsilon = 0.5, x = at[1], y = at[2], w = SIZE, h = SIZE, endless = { seed = 7, horizon = 2 }, stats = st })
+			end)
+			print(string.format(
+				"X3 endless tile at (%d, %d): %.2f ms, rows evaluated %d (deduplicated %d), largest certificate %.3g output units",
+				at[1],
+				at[2],
+				ms,
+				st.rendered,
+				st.deduped,
+				st.seam
 			))
 		end
 	end

@@ -487,9 +487,10 @@ def int_to_float(v):
     return float(int(v))
 
 
-def cholesky_solve_exact(G, P, N, lam_rel):
+def cholesky_solve_exact(G, P, N, lam_rel, mult=None):
     """Scalar replica of LiquidLearn.solve: same operations in the same order, so the
-    readout bytes are bit-identical to the Luau result."""
+    readout bytes are bit-identical to the Luau result. `mult` (length D - 1) scales
+    the ridge per feature (slow_ridge builds the event-aware one)."""
     D = len(G)
     M = len(P[0])
     A = [[int_to_float(G[min(i, j)][max(i, j)]) for j in range(D)] for i in range(D)]
@@ -498,7 +499,7 @@ def cholesky_solve_exact(G, P, N, lam_rel):
         tr = tr + A[i][i]
     lam = lam_rel * (tr / (D - 1))
     for i in range(D - 1):
-        A[i][i] = A[i][i] + lam
+        A[i][i] = A[i][i] + (lam * mult[i] if mult is not None else lam)
     L = [[0.0] * D for _ in range(D)]
     for j in range(D):
         s = A[j][j]
@@ -534,8 +535,18 @@ def cholesky_solve_exact(G, P, N, lam_rel):
     return Readout(M, N, Cf, Cb, d)
 
 
-def ridge_exact(stats, N, lam_rel):
-    return cholesky_solve_exact(stats.G.tolist(), stats.P.tolist(), N, lam_rel)
+def ridge_exact(stats, N, lam_rel, mult=None):
+    return cholesky_solve_exact(stats.G.tolist(), stats.P.tolist(), N, lam_rel, mult)
+
+
+def slow_ridge(res, slow_mult):
+    """LiquidLearn.slowRidge: slow_mult on both features of every neuron with kBase > -K."""
+    m = [1.0] * (2 * res.N)
+    for i in range(res.N):
+        if res.kbase[i] > -res.K:
+            m[i] = float(slow_mult)
+            m[res.N + i] = float(slow_mult)
+    return m
 
 
 DEFAULT_LAMBDA = 1e-7
@@ -796,6 +807,7 @@ def golden_case(name, size, seed, theta, N, r=0, lam=DEFAULT_LAMBDA):
     ro_np = ridge_numpy(acc["Gf"], acc["Pf"], N, lam)
     ro_x = ridge_exact(acc["stats"], N, lam)
     ro_x4 = ridge_exact(acc4["stats"], N, lam)
+    ro_slow = ridge_exact(acc["stats"], N, lam, slow_ridge(res, 1e4))
     dz = float(np.max(np.abs(z_values(res, ro_x, tree, r) - z_values(res, ro_np, tree, r))))
     blob = encode(res, ro_x, tree)
     t0 = time.time()
@@ -809,7 +821,7 @@ def golden_case(name, size, seed, theta, N, r=0, lam=DEFAULT_LAMBDA):
         "name": name, "size": size, "seed": seed, "theta": theta, "N": N, "M": M, "K": res.K, "r": r,
         "lambda": lam, "scales": DEFAULT_SCALES, "src": src, "full": full, "tree": encode_tree(tree),
         "e1": e1, "e4": e4, "ro_x": readout_bytes(ro_x), "ro_x4": readout_bytes(ro_x4),
-        "ro_np": readout_bytes(ro_np), "dz": dz, "blob": blob, "pix": pix, "fp": fingerprint(res, M),
+        "ro_np": readout_bytes(ro_np), "ro_slow": readout_bytes(ro_slow), "dz": dz, "blob": blob, "pix": pix, "fp": fingerprint(res, M),
         "psnr": psnr(np.frombuffer(pix, np.uint8).reshape(full.shape), full), "t_ref": t_ref,
         "leaves": tree.leaves,
     }
@@ -845,6 +857,7 @@ def write_golden_module(path, cases):
             '\t\treadoutExact = "%s",' % c["ro_x"].hex(),
             '\t\treadoutExact4 = "%s",' % c["ro_x4"].hex(),
             '\t\treadoutNumpy = "%s",' % c["ro_np"].hex(),
+            '\t\treadoutSlow = "%s", -- slowRidge(res, 1e4)' % c["ro_slow"].hex(),
             "\t\tnumpyMaxDz = %s," % lua_num(c["dz"]),
             '\t\tmodel = "%s",' % c["blob"].hex(),
             '\t\tpixels = "%s",' % c["pix"].hex(),

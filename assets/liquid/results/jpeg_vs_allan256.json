@@ -1,0 +1,167 @@
+[
+{
+"target": "ui_flat",
+"theta": 4,
+"allan_psnr": 66.413,
+"allan_max_err": 4,
+"allan_zlib": 8583,
+"jpeg_quality": null,
+"jpeg_bytes": null,
+"jpeg_psnr": null,
+"jpeg_max_err": null
+},
+{
+"target": "ui_flat",
+"theta": 8,
+"allan_psnr": 53.627,
+"allan_max_err": 8,
+"allan_zlib": 8590,
+"jpeg_quality": 100,
+"jpeg_bytes": 45950,
+"jpeg_psnr": 54.73,
+"jpeg_max_err": 4
+},
+{
+"target": "ui_flat",
+"theta": 16,
+"allan_psnr": 35.91,
+"allan_max_err": 52,
+"allan_zlib": 8289,
+"jpeg_quality": 84,
+"jpeg_bytes": 16747,
+"jpeg_psnr": 36.09,
+"jpeg_max_err": 57
+},
+{
+"target": "sdf_logo",
+"theta": 4,
+"allan_psnr": 45.637,
+"allan_max_err": 6,
+"allan_zlib": 11272,
+"jpeg_quality": 97,
+"jpeg_bytes": 25864,
+"jpeg_psnr": 46.92,
+"jpeg_max_err": 13
+},
+{
+"target": "sdf_logo",
+"theta": 8,
+"allan_psnr": 43.013,
+"allan_max_err": 12,
+"allan_zlib": 9194,
+"jpeg_quality": 95,
+"jpeg_bytes": 21025,
+"jpeg_psnr": 43.81,
+"jpeg_max_err": 26
+},
+{
+"target": "sdf_logo",
+"theta": 16,
+"allan_psnr": 40.771,
+"allan_max_err": 23,
+"allan_zlib": 8431,
+"jpeg_quality": 92,
+"jpeg_bytes": 16450,
+"jpeg_psnr": 41.08,
+"jpeg_max_err": 34
+},
+{
+"target": "marble",
+"theta": 4,
+"allan_psnr": 47.242,
+"allan_max_err": 6,
+"allan_zlib": 56726,
+"jpeg_quality": 92,
+"jpeg_bytes": 16315,
+"jpeg_psnr": 47.43,
+"jpeg_max_err": 7
+},
+{
+"target": "marble",
+"theta": 8,
+"allan_psnr": 41.253,
+"allan_max_err": 10,
+"allan_zlib": 42039,
+"jpeg_quality": 64,
+"jpeg_bytes": 7884,
+"jpeg_psnr": 41.51,
+"jpeg_max_err": 14
+},
+{
+"target": "marble",
+"theta": 16,
+"allan_psnr": 35.195,
+"allan_max_err": 21,
+"allan_zlib": 23249,
+"jpeg_quality": 22,
+"jpeg_bytes": 4443,
+"jpeg_psnr": 35.21,
+"jpeg_max_err": 30
+},
+{
+"target": "wood",
+"theta": 4,
+"allan_psnr": 47.312,
+"allan_max_err": 9,
+"allan_zlib": 57482,
+"jpeg_quality": 97,
+"jpeg_bytes": 32343,
+"jpeg_psnr": 47.82,
+"jpeg_max_err": 7
+},
+{
+"target": "wood",
+"theta": 8,
+"allan_psnr": 39.192,
+"allan_max_err": 10,
+"allan_zlib": 35761,
+"jpeg_quality": 68,
+"jpeg_bytes": 10501,
+"jpeg_psnr": 39.3,
+"jpeg_max_err": 20
+},
+{
+"target": "wood",
+"theta": 16,
+"allan_psnr": 35.432,
+"allan_max_err": 18,
+"allan_zlib": 25977,
+"jpeg_quality": 34,
+"jpeg_bytes": 6304,
+"jpeg_psnr": 35.44,
+"jpeg_max_err": 32
+},
+{
+"target": "caustics",
+"theta": 4,
+"allan_psnr": 45.665,
+"allan_max_err": 7,
+"allan_zlib": 55163,
+"jpeg_quality": 93,
+"jpeg_bytes": 15858,
+"jpeg_psnr": 45.7,
+"jpeg_max_err": 14
+},
+{
+"target": "caustics",
+"theta": 8,
+"allan_psnr": 39.598,
+"allan_max_err": 12,
+"allan_zlib": 34100,
+"jpeg_quality": 52,
+"jpeg_bytes": 6196,
+"jpeg_psnr": 39.66,
+"jpeg_max_err": 36
+},
+{
+"target": "caustics",
+"theta": 16,
+"allan_psnr": 34.535,
+"allan_max_err": 20,
+"allan_zlib": 16669,
+"jpeg_quality": 18,
+"jpeg_bytes": 3465,
+"jpeg_psnr": 34.68,
+"jpeg_max_err": 55
+}
+]

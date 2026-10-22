@@ -221,6 +221,22 @@ for _, c in G do
 	assert(same(LL.encodeReadout(ro), hexToBuffer(c.readoutExact)), c.name .. ": readout bytes differ from Python")
 	local ro4 = LL.solve(st4, N, c.lambda)
 	assert(same(LL.encodeReadout(ro4), hexToBuffer(c.readoutExact4)), c.name .. ": stride-4 readout bytes differ")
+	-- event-aware ridge (larger ridge on slow neurons): bit-identical to Python, and it
+	-- shrinks the slow neurons' weights
+	local roSlow = LL.solve(st1, N, c.lambda, LL.slowRidge(res, 1e4))
+	assert(same(LL.encodeReadout(roSlow), hexToBuffer(c.readoutSlow)), c.name .. ": event-aware readout bytes differ")
+	local function slowWeight(r: LL.Readout): number
+		local sum = 0
+		for m = 1, M do
+			for i = 1, N do
+				if res.kBase[i] > -res.K then
+					sum += math.abs(r.Cf[(m - 1) * N + i]) + math.abs(r.Cb[(m - 1) * N + i])
+				end
+			end
+		end
+		return sum
+	end
+	assert(slowWeight(roSlow) < slowWeight(ro), c.name .. ": the event-aware ridge must shrink slow weights")
 
 	-- 5. numpy float readout: predictions within the stated tolerance
 	local npb = hexToBuffer(c.readoutNumpy)

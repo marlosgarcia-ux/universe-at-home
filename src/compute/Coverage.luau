@@ -13,18 +13,31 @@
 --                           (SDF value d at the centre, unit gradient (nx, ny)).
 --                           Exact for straight edges (C4); on a curve of radius R
 --                           it overestimates by at most (sqrt(2)/2)^3 / (3 R),
---                           i.e. 30/R in 1/255 units (C5).
+--                           i.e. 30/R in 1/255 units (C5). = MyMath.coverageHalfPlane
 --   halfPlaneCurved(...)    half-plane minus the first-order curvature term over
---                           the chord: O(1/R^2), flawless for R >= 8 px (C5).
+--                           the chord. The residual is O(1/R) where the chord
+--                           leaves the pixel at a shallow angle (measured 0.36/255
+--                           at R = 8, 0.036 at R = 48, 0.002 at R = 300): an
+--                           estimator, not flawless. = MyMath.coverageCurved
 --   corner, edgePair        exact areas where two edges enter the pixel (C6).
 --   discRectArea, roundCorner, dasin   exact disc pieces with a deterministic
 --                           arcsine: usable for texture content.
 --   supersample(...)        n x n point samples (NOT a reference: 1/(2n) error).
 --
+-- Exact areas used by the flawless pipeline (F1, F2; deterministic, allocation-free):
+--   datan2(s, c)            deterministic atan2 from dasin (arguments <= sqrt(2)/2)
+--   discBoxArea(...)        disc and axis-aligned rectangle, by quadrant integration
+--   discPolyArea(...)       disc and convex polygon, by signed disc-triangle areas
+--   polygonBoxCoverage(...) simple polygon and pixel box, by per-edge integrals
+--   clipInto, polyArea      Sutherland-Hodgman half-plane clip and shoelace on
+--                           caller-owned scratch arrays
+--
 -- References for tests and benchmarks:
 --   circleArea(...)         exact area of circle and pixel (closed form; uses
 --                           math.asin, so REFERENCE ONLY, never texture content)
 --   polygonArea(...)        exact area of polygon and pixel (clip + shoelace)
+
+local MyMath = require("../MyMath")
 
 local Coverage = {}
 
@@ -36,89 +49,21 @@ function Coverage.linear(d: number, w: number): number
 	return if a < 0 then 0 elseif a > 1 then 1 else a
 end
 
--- Exact area of {q in pixel : d + n . (q - centre) <= 0} for |n| = 1.
+-- Exact area of {q in pixel : d + n . (q - centre) <= 0} for |n| = 1 (C4).
 -- The projection of the unit square on n has a trapezoid density: ramps of width
 -- b = min(|nx|, |ny|) and a plateau of width a - b, a = max(|nx|, |ny|).
-local function halfPlane(d: number, nx: number, ny: number): number
-	local a, b = abs(nx), abs(ny)
-	if a < b then
-		a, b = b, a
-	end
-	local u = (a + b) * 0.5 - d
-	if u <= 0 then
-		return 0
-	end
-	if u >= a + b then
-		return 1
-	end
-	if u < b then
-		return u * u / (2 * a * b)
-	end
-	if u <= a then
-		return (2 * u - b) / (2 * a)
-	end
-	local v = a + b - u
-	return 1 - v * v / (2 * a * b)
-end
+-- The axiom lives in MyMath; this is the same function (bit-identical).
+local halfPlane = MyMath.coverageHalfPlane
 Coverage.halfPlane = halfPlane
 
 -- The largest |d| at which halfPlane can be strictly between 0 and 1: (a + b) / 2
 -- <= sqrt(2) / 2. Tile culling for exact coverage uses this instead of w / 2.
-Coverage.HALF_PLANE_REACH = 0.70710678118654757
+Coverage.HALF_PLANE_REACH = MyMath.COVERAGE_REACH
 
--- Curvature-corrected coverage (docs/COMPUTE.md C5). The boundary near the pixel is
--- a curve of signed curvature k (k > 0: the shape is convex there, e.g. 1 / R for a
--- disc) tangent to the half-plane line. Along the line, at tangential offset t from
--- the foot point, the curve lies k t^2 / 2 inside the line, so to first order in k
--- the pixel loses the area integral of k t^2 / 2 over the chord the line cuts from
--- the pixel: k (t1^3 - t0^3) / 6. With the chord from the clipped line, the
--- remaining error is O(k^2). Deterministic: + - * / abs and comparisons only.
-local function halfPlaneCurved(d: number, nx: number, ny: number, k: number): number
-	local base = halfPlane(d, nx, ny)
-	if k == 0 then
-		return base
-	end
-	-- the line is {q : n . (q - c) = -d}; parametrise q = c - d n + t (-ny, nx)
-	-- and clip t to the unit square |qx - cx| <= 1/2, |qy - cy| <= 1/2
-	local t0, t1 = -1e300, 1e300
-	local tx, ty = -ny, nx
-	local ox, oy = -d * nx, -d * ny
-	if tx ~= 0 then
-		local a0 = (-0.5 - ox) / tx
-		local a1 = (0.5 - ox) / tx
-		if a0 > a1 then
-			a0, a1 = a1, a0
-		end
-		if a0 > t0 then
-			t0 = a0
-		end
-		if a1 < t1 then
-			t1 = a1
-		end
-	elseif ox < -0.5 or ox > 0.5 then
-		t1 = t0
-	end
-	if ty ~= 0 then
-		local a0 = (-0.5 - oy) / ty
-		local a1 = (0.5 - oy) / ty
-		if a0 > a1 then
-			a0, a1 = a1, a0
-		end
-		if a0 > t0 then
-			t0 = a0
-		end
-		if a1 < t1 then
-			t1 = a1
-		end
-	elseif oy < -0.5 or oy > 0.5 then
-		t1 = t0
-	end
-	local c = base
-	if t1 > t0 then
-		c = base - k * (t1 * t1 * t1 - t0 * t0 * t0) / 6
-	end
-	return if c < 0 then 0 elseif c > 1 then 1 else c
-end
+-- Curvature-corrected coverage (docs/COMPUTE.md C5): half-plane area minus the
+-- first-order term k (t1^3 - t0^3) / 6 over the chord the tangent line cuts from
+-- the pixel. The axiom lives in MyMath; this is the same function (bit-identical).
+local halfPlaneCurved = MyMath.coverageCurved
 Coverage.halfPlaneCurved = halfPlaneCurved
 
 -- Exact area of the unit pixel square centred at the origin intersected with up to
@@ -132,6 +77,10 @@ local SY: { number } = table.create(16, 0)
 local TX: { number } = table.create(16, 0)
 local TY: { number } = table.create(16, 0)
 
+-- Sutherland-Hodgman: clips polygon (ax, ay)[1..n] to {q : nx qx + ny qy <= c},
+-- writing the result into (bx, by) and returning its vertex count. For a convex
+-- input the output is the convex intersection; for any input its signed area is
+-- the area of the clipped region (bridges along the clip line cancel).
 local function clipInto(ax: { number }, ay: { number }, n: number, bx: { number }, by: { number }, nx: number, ny: number, c: number): number
 	local m = 0
 	if n == 0 then
@@ -162,6 +111,24 @@ local function clipInto(ax: { number }, ay: { number }, n: number, bx: { number 
 	end
 	return m
 end
+Coverage.clipInto = clipInto
+
+-- Signed shoelace area of (x, y)[1..n] (positive for counter-clockwise order in a
+-- right-handed frame, i.e. when every edge has the interior on its left).
+local function polyArea(x: { number }, y: { number }, n: number): number
+	if n < 3 then
+		return 0
+	end
+	local s = 0
+	local px, py = x[n], y[n]
+	for i = 1, n do
+		local qx, qy = x[i], y[i]
+		s += px * qy - qx * py
+		px, py = qx, qy
+	end
+	return s * 0.5
+end
+Coverage.polyArea = polyArea
 
 local function squareClip2(n1x: number, n1y: number, c1: number, n2x: number, n2y: number, c2: number): number
 	SX[1], SY[1] = -0.5, -0.5
@@ -210,14 +177,18 @@ function Coverage.corner(px: number, py: number, ux: number, uy: number, vx: num
 	return if a < 0 then 0 elseif a > 1 then 1 else a
 end
 
--- Deterministic arcsine: Taylor series on |x| <= 1/2 (18 terms, truncation below
--- 1e-13), and asin(x) = pi/2 - 2 asin(sqrt((1 - x) / 2)) above. Only + - * / sqrt,
--- so it is bit-identical on every platform, unlike math.asin.
+-- Deterministic arcsine: Taylor series on |x| <= 1/2 (28 terms: the first omitted
+-- term is below 2e-20 at |x| = 1/2, so the result is within a few double rounding
+-- units), and asin(x) = pi/2 - 2 asin(sqrt((1 - x) / 2)) above. Only + - * / sqrt,
+-- so it is bit-identical on every platform, unlike math.asin. (An 18-term version
+-- truncated at 7e-14, which became visible in sector areas of discs with radii
+-- in the thousands; docs/COMPUTE.md "Flawless pipeline".)
+local ASIN_TERMS = 28
 local ASIN_C: { number } = {}
 do
 	-- c_n = (2n)! / (4^n (n!)^2 (2n + 1))
 	local c = 1
-	for n = 0, 17 do
+	for n = 0, ASIN_TERMS - 1 do
 		ASIN_C[n + 1] = c / (2 * n + 1)
 		c = c * (2 * n + 1) / (2 * n + 2)
 	end
@@ -226,8 +197,8 @@ local HALF_PI = 1.5707963267948966
 
 local function asinSmall(x: number): number
 	local x2 = x * x
-	local s = ASIN_C[18]
-	for i = 17, 1, -1 do
+	local s = ASIN_C[ASIN_TERMS]
+	for i = ASIN_TERMS - 1, 1, -1 do
 		s = s * x2 + ASIN_C[i]
 	end
 	return x * s
@@ -321,6 +292,248 @@ local function discRectArea(cx: number, cy: number, r: number, x0: number, y0: n
 	return area
 end
 Coverage.discRectArea = discRectArea
+
+----------------------------------------------------------------------------------
+-- Exact areas for the flawless pipeline (docs/COMPUTE.md "Flawless pipeline")
+----------------------------------------------------------------------------------
+
+local PI = 3.141592653589793
+
+-- Deterministic atan2: the angle of the vector (c, s) in (-pi, pi]. Each branch
+-- calls dasin with an argument of magnitude at most sqrt(2)/2, where the arcsine
+-- is well conditioned (derivative <= sqrt(2)), so the absolute error stays near
+-- the double rounding unit for every angle, including angles near 0 and pi.
+local function datan2(s: number, c: number): number
+	local m = sqrt(s * s + c * c)
+	if m == 0 then
+		return 0
+	end
+	local as = abs(s) / m
+	local ac = c / m
+	local t
+	if ac >= as then
+		t = dasin(as) -- |angle| <= 45 degrees
+	elseif ac >= -as then
+		t = HALF_PI - dasin(ac) -- 45 to 135 degrees
+	else
+		t = PI - dasin(as) -- 135 to 180 degrees
+	end
+	return if s < 0 then -t else t
+end
+Coverage.datan2 = datan2
+
+-- Area of disc(0, r) inside [a, b] x [c, d] with 0 <= a < b and 0 <= c < d (the
+-- first quadrant, where the upper circle y = sqrt(r^2 - x^2) decreases). For x <=
+-- xd the circle is at height >= d (full column), for x >= xc it is below c (empty
+-- column), in between the column height is sqrt(r^2 - x^2) - c, integrated in
+-- closed form with one arcsine: asin(q/r) - asin(p/r) = asin((q sp - p sq) / r^2)
+-- for 0 <= p <= q <= r, where sp, sq are the circle heights at p and q. The caller
+-- orients the piece so the integration runs along the axis on which the circle is
+-- flatter (heights stay large, no cancellation in r^2 - x^2).
+local function quadrantArea(a: number, b: number, c: number, d: number, r: number, r2: number): number
+	if a * a + c * c >= r2 then
+		return 0
+	end
+	if b * b + d * d <= r2 then
+		return (b - a) * (d - c)
+	end
+	local p, sp
+	if d < r then
+		p, sp = sqrt(r2 - d * d), d
+	else
+		p, sp = 0, r
+	end
+	if p < a then
+		p, sp = a, sqrt(r2 - a * a)
+	elseif p > b then
+		p, sp = b, sqrt(r2 - b * b)
+	end
+	local q, sq = sqrt(r2 - c * c), c
+	if q > b then
+		q, sq = b, sqrt(r2 - b * b)
+	elseif q < a then
+		q, sq = a, sqrt(r2 - a * a)
+	end
+	local area = (d - c) * (p - a)
+	if q > p then
+		area += 0.5 * (q * sq - p * sp) + 0.5 * r2 * dasin((q * sp - p * sq) / r2) - c * (q - p)
+	end
+	return area
+end
+
+-- One quadrant piece [a, b] x [c, d] (already reflected into the first quadrant),
+-- integrated along the axis where the piece lies closer to the circle's centre line.
+local function quadrantPiece(a: number, b: number, c: number, d: number, r: number, r2: number): number
+	if b <= a or d <= c then
+		return 0
+	end
+	if a + b > c + d then
+		return quadrantArea(c, d, a, b, r, r2)
+	end
+	return quadrantArea(a, b, c, d, r, r2)
+end
+
+-- Exact area of the disc (cx, cy, r) inside the rectangle [x0, x1] x [y0, y1].
+-- The rectangle is split by the disc's centre lines into at most four pieces, each
+-- reflected into the first quadrant and integrated in closed form (quadrantArea).
+-- No topology (no walking of intersection points), so tangencies and corners on
+-- the circle cannot flip a branch: the result is continuous in every input.
+-- Deterministic (+ - * / sqrt and dasin), allocation-free.
+local function discBoxArea(cx: number, cy: number, r: number, x0: number, y0: number, x1: number, y1: number): number
+	if r <= 0 or x1 <= x0 or y1 <= y0 then
+		return 0
+	end
+	local X0, X1, Y0, Y1 = x0 - cx, x1 - cx, y0 - cy, y1 - cy
+	if X0 >= r or X1 <= -r or Y0 >= r or Y1 <= -r then
+		return 0
+	end
+	local r2 = r * r
+	-- x pieces: right [ra, rb] (x >= 0) and left mirrored [la, lb] (x <= 0)
+	local ra = if X0 > 0 then X0 else 0
+	local rb = X1
+	local la = if X1 < 0 then -X1 else 0
+	local lb = -X0
+	local ta = if Y0 > 0 then Y0 else 0
+	local tb = Y1
+	local ba = if Y1 < 0 then -Y1 else 0
+	local bb = -Y0
+	local area = 0
+	if rb > ra then
+		area += quadrantPiece(ra, rb, ta, tb, r, r2) + quadrantPiece(ra, rb, ba, bb, r, r2)
+	end
+	if lb > la then
+		area += quadrantPiece(la, lb, ta, tb, r, r2) + quadrantPiece(la, lb, ba, bb, r, r2)
+	end
+	return area
+end
+Coverage.discBoxArea = discBoxArea
+
+-- Signed area of disc(0, r) intersected with the triangle (0, A, B): the part of
+-- the segment A-B inside the circle contributes its triangle with the centre, the
+-- parts outside contribute circular sectors r^2/2 * angle. Each edge's term is
+-- computed independently (no pairing of intersection points), so the sum over a
+-- polygon's edges is robust to tangencies and vertices on the circle.
+local function triDisc(ax: number, ay: number, bx: number, by: number, r2: number): number
+	local aa = ax * ax + ay * ay
+	local bb = bx * bx + by * by
+	if aa <= r2 and bb <= r2 then
+		return 0.5 * (ax * by - ay * bx)
+	end
+	local half = 0.5 * r2
+	local dx, dy = bx - ax, by - ay
+	local A = dx * dx + dy * dy
+	if A == 0 then
+		return 0
+	end
+	local B = ax * dx + ay * dy
+	local C = aa - r2
+	local disc = B * B - A * C
+	if disc <= 0 then
+		return half * datan2(ax * by - ay * bx, ax * bx + ay * by)
+	end
+	local sd = sqrt(disc)
+	-- roots of A t^2 + 2 B t + C = 0, the stable way (no cancellation)
+	local t1, t2
+	if B >= 0 then
+		local q = -(B + sd)
+		t1, t2 = q / A, C / q
+	else
+		local q = sd - B
+		t1, t2 = C / q, q / A
+	end
+	local u1 = if t1 > 0 then t1 else 0
+	local u2 = if t2 < 1 then t2 else 1
+	if u1 >= u2 then
+		return half * datan2(ax * by - ay * bx, ax * bx + ay * by)
+	end
+	local p1x, p1y = ax + u1 * dx, ay + u1 * dy
+	local p2x, p2y = ax + u2 * dx, ay + u2 * dy
+	local area = 0.5 * (p1x * p2y - p1y * p2x)
+	if u1 > 0 then
+		area += half * datan2(ax * p1y - ay * p1x, ax * p1x + ay * p1y)
+	end
+	if u2 < 1 then
+		area += half * datan2(p2x * by - p2y * bx, p2x * bx + p2y * by)
+	end
+	return area
+end
+
+-- Exact signed area of the disc (cx, cy, r) intersected with the polygon
+-- (px, py)[1..n] (positive for counter-clockwise polygons). Exact for any simple
+-- polygon (the disc-triangle terms add up by Green's theorem); the flawless
+-- pipeline calls it with small convex polygons in pixel-local coordinates.
+local function discPolyArea(px: { number }, py: { number }, n: number, cx: number, cy: number, r: number): number
+	if n < 3 or r <= 0 then
+		return 0
+	end
+	local r2 = r * r
+	local s = 0
+	local ax, ay = px[n] - cx, py[n] - cy
+	for i = 1, n do
+		local bx, by = px[i] - cx, py[i] - cy
+		s += triDisc(ax, ay, bx, by, r2)
+		ax, ay = bx, by
+	end
+	return s
+end
+Coverage.discPolyArea = discPolyArea
+
+-- Mean of clamp(t, 0, 1) for t running linearly from a to b.
+local function avgClamp01(a: number, b: number): number
+	if a > b then
+		a, b = b, a
+	end
+	if b <= 0 then
+		return 0
+	end
+	if a >= 1 then
+		return 1
+	end
+	if a >= 0 and b <= 1 then
+		return (a + b) * 0.5
+	end
+	-- G(t) = integral of clamp(s, 0, 1) ds from 0 to t
+	local ga = if a <= 0 then 0 else a * a * 0.5
+	local gb = if b >= 1 then b - 0.5 else b * b * 0.5
+	return (gb - ga) / (b - a)
+end
+
+-- Signed coverage of the w x w box with lower corner (x0, y0) by the polygon
+-- v[first], v[first + 1], ... (count vertices, flat x, y pairs), in units of the
+-- box area. By Green's theorem the area of polygon and box is the sum over edges
+-- of dir * integral over the edge's y-span inside the box of (x1 - clamp(x, x0,
+-- x1)) dy: the part of the box row to the right of the edge, signed by the edge's
+-- vertical direction. Each edge is a linear x(y), so the clamped integral has a
+-- closed form (avgClamp01). Exact for simple polygons of either orientation (the
+-- sign of the result is the orientation); edges whose y-span misses the box cost
+-- two comparisons. Deterministic, allocation-free.
+local function polygonBoxCoverage(v: { number }, first: number, count: number, x0: number, y0: number, w: number): number
+	local iw = 1 / w
+	local y1 = y0 + w
+	local s = 0
+	local last = first + 2 * count - 2
+	local ax, ay = v[last], v[last + 1]
+	for i = first, last, 2 do
+		local bx, by = v[i], v[i + 1]
+		if ay ~= by then
+			local lx, ly, hx, hy, dir = ax, ay, bx, by, 1
+			if ay > by then
+				lx, ly, hx, hy, dir = bx, by, ax, ay, -1
+			end
+			if hy > y0 and ly < y1 then
+				local lo = if ly > y0 then ly else y0
+				local hi = if hy < y1 then hy else y1
+				local slope = (hx - lx) / (hy - ly)
+				local ul = (lx + (lo - ly) * slope - x0) * iw
+				local uh = (lx + (hi - ly) * slope - x0) * iw
+				s += dir * (hi - lo) * iw * (1 - avgClamp01(ul, uh))
+			end
+		end
+		ax, ay = bx, by
+	end
+	return s
+end
+Coverage.polygonBoxCoverage = polygonBoxCoverage
 
 -- Nearest point of the segment a + t e (0 <= t <= 1) to (px, py), relative to (px, py).
 local function nearestLocal(px: number, py: number, ax: number, ay: number, ex: number, ey: number): (number, number)

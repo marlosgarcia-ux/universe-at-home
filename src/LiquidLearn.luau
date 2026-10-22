@@ -1457,14 +1457,14 @@ end
 -- A: dense D x D rows (overwritten), Pm: D x M. lambda = lamRel * mean diagonal of the
 -- non-constant features, added to every diagonal entry but the constant's. Same
 -- operations in the same order as cholesky_solve_exact in tools/liquid_train.py.
-local function choleskySolve(A: { { number } }, Pm: { { number } }, D: number, M: number, lamRel: number): { { number } }?
+local function choleskySolve(A: { { number } }, Pm: { { number } }, D: number, M: number, lamRel: number, mult: { number }?): { { number } }?
 	local tr = 0
 	for i = 1, D - 1 do
 		tr = tr + A[i][i]
 	end
 	local lam = lamRel * (tr / (D - 1))
 	for i = 1, D - 1 do
-		A[i][i] = A[i][i] + lam
+		A[i][i] = A[i][i] + (if mult then lam * mult[i] else lam)
 	end
 	local L: { { number } } = {}
 	for i = 1, D do
@@ -1568,13 +1568,30 @@ local function readoutFromW(Wm: { { number } }, N: number, M: number): Readout
 end
 
 -- Ridge readout from exact statistics: identical bytes in the interpreter, in native
--- code and in tools/liquid_train.py (cholesky_solve_exact).
-function LiquidLearn.solve(st: Stats, N: number, lamRel: number?): Readout
+-- code and in tools/liquid_train.py (cholesky_solve_exact). `mult` (length D - 1)
+-- scales the ridge per feature; slowRidge builds the event-aware one.
+function LiquidLearn.solve(st: Stats, N: number, lamRel: number?, mult: { number }?): Readout
 	assert(st.D == 2 * N + 1, "statistics do not match N")
 	local A, Pm = LiquidLearn.statsMatrices(st)
-	local Wm = choleskySolve(A, Pm, st.D, st.M, lamRel or LiquidLearn.DEFAULT_LAMBDA)
+	local Wm = choleskySolve(A, Pm, st.D, st.M, lamRel or LiquidLearn.DEFAULT_LAMBDA, mult)
 	assert(Wm, "ridge system not positive definite")
 	return readoutFromW(Wm :: { { number } }, N, st.M)
+end
+
+-- Event-aware ridge: slowMult on the forward and backward features of every slow
+-- neuron (kBase > -K), 1 on instant neurons. Large slowMult shrinks the weights that
+-- keep pixels active under the T2 skip rule: 1 is the plain ridge, about 1e6 gives the
+-- plain quadtree (events = segments); docs/LIQUID_TRAINING.md 3.3 measures the dial.
+function LiquidLearn.slowRidge(res: Reservoir, slowMult: number): { number }
+	local N = res.N
+	local m = table.create(2 * N, 1)
+	for i = 1, N do
+		if res.kBase[i] > -res.K then
+			m[i] = slowMult
+			m[N + i] = slowMult
+		end
+	end
+	return m
 end
 
 -- SSE of weights Wm on statistics: YY_m - 2 w.P_m + w^T G w, summed over channels.

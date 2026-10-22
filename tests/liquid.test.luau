@@ -309,6 +309,55 @@ do
 end
 
 ----------------------------------------------------------------------------------------
+-- "point" vertical strategy: output row Y is the horizontal level-L row of rendered row
+-- Y * 2^L + 2^(L-1) (clamped to the image)
+----------------------------------------------------------------------------------------
+do
+	local W, H = 120, 90
+	local tree = makeTree(81, W, H, 3)
+	local model = makeModel(81, 8, 3, 4, 9, tree.P)
+	local plan = Liquid.prepare(model, tree)
+	for L = 1, 3 do
+		local F = 2 ^ L
+		local Wl, Hl = (W + F - 1) // F, (H + F - 1) // F
+		local pt = buffer.create(Wl * Hl * 4)
+		Liquid.render(plan, tree, pt, Wl, { epsilon = 0.5, level = L, vertical = "point" })
+		local rows = buffer.create(Wl * H * 4)
+		Liquid.render(plan, tree, rows, Wl, { epsilon = 0.5, level = L, vertical = "rows" })
+		for Y = 0, Hl - 1 do
+			local ys = math.min(Y * F + F // 2, H - 1)
+			assert(buffer.readstring(pt, Y * Wl * 4, Wl * 4) == buffer.readstring(rows, ys * Wl * 4, Wl * 4), "point row")
+		end
+	end
+end
+
+----------------------------------------------------------------------------------------
+-- cross-band deduplication only ever copies identical rows
+----------------------------------------------------------------------------------------
+do
+	-- a tree with stacked equal leaves: many bands repeat earlier segment sequences
+	local W, H = 128, 128
+	local tree = Liquid.buildTree(W, H, 5, 3, function(x0: number, y0: number, _side: number, depth: number): boolean
+		return depth < 3 or (x0 // 4 + y0 // 16) % 5 == 0
+	end, function(x0: number, _y0: number, _side: number, _depth: number, out: buffer, at: number)
+		for t = 0, 2 do
+			buffer.writeu8(out, at + t, (x0 * 37 + t * 91) % 256)
+		end
+	end)
+	local model = makeModel(71, 8, 3, 3, 8, tree.P)
+	local plan = Liquid.prepare(model, tree)
+	for _, L in { 0, 1 } do
+		local F = 2 ^ L
+		local a, b = buffer.create((W // F) * (H // F) * 4), buffer.create((W // F) * (H // F) * 4)
+		local st = Liquid.newStats()
+		Liquid.render(plan, tree, a, W // F, { epsilon = 0.5, level = L, stats = st })
+		Liquid.render(plan, tree, b, W // F, { epsilon = 0.5, level = L, dedup = false })
+		assert(buffer.tostring(a) == buffer.tostring(b), "dedup must not change pixels")
+		assert(st.deduped > 0, "dedup exercised")
+	end
+end
+
+----------------------------------------------------------------------------------------
 -- Canvas: only the rendered rows are marked dirty
 ----------------------------------------------------------------------------------------
 do
@@ -437,6 +486,166 @@ do
 	local tile = buffer.create(64 * 64 * 4)
 	Liquid.render(plan, tree, tile, 64, { epsilon = 0.5, x = 64, y = 0, w = 64, h = 64, endless = endless, stats = st })
 	assert(st.seam > 0 and st.seam < math.huge, "render reports its X3 certificate")
+end
+
+----------------------------------------------------------------------------------------
+-- X2 Richardson LOD
+----------------------------------------------------------------------------------------
+do
+	-- (a) exact on single exponentials: one tracked neuron, two segments per row, so each
+	-- segment carries one exponential (forward in the right one, backward in the left one)
+	local W = 256
+	local tree = Liquid.buildTree(W, 4, 8, 1, function(_x0: number, _y0: number, _side: number, depth: number): boolean
+		return depth < 1
+	end, function(x0: number, _y0: number, _side: number, _depth: number, out: buffer, at: number)
+		buffer.writeu8(out, at, if x0 < 128 then 20 else 230)
+	end)
+	local model = Liquid.newModel({ N = 2, I = 1, M = 1, K = 12, beta = { 0, 0 }, B = { 1, 1 }, kBase = { -64, -3 }, Cf = { 100, 80 }, Cb = { 100, 60 }, d = { 10 } })
+	local plan = Liquid.prepare(model, tree)
+	for L = 1, 4 do
+		local zL, zU, zF, zE, disc, zLin, discLin = {}, {}, {}, {}, {}, {}, {}
+		local nL = Liquid.renderRowValues(plan, tree, 0, L, 0, zL)
+		Liquid.renderRowValues(plan, tree, 0, L + 1, 0, zU)
+		local nF = Liquid.renderRowValues(plan, tree, 0, L - 1, 0, zE)
+		Liquid.richardsonRow(zL, zU, nL, 1, zF, disc, true)
+		Liquid.richardsonRow(zL, zU, nL, 1, zLin, discLin, false)
+		local Fl = 2 ^ L
+		local exactCount = 0
+		for X = 0, nF - 1 do
+			local XL = X // 2
+			local sib = (XL // 2) * 2
+			local lo = math.min(XL - 1, sib) * Fl
+			local hi = math.max(XL + 3, sib + 2) * Fl
+			local single = XL >= 1 and XL <= nL - 3 and ((lo >= 0 and hi <= 128) or (lo >= 128 and hi <= 256))
+			local errGeo = math.abs(zF[X + 1] - zE[X + 1])
+			local errLin = math.abs(zLin[X + 1] - zE[X + 1])
+			if single then
+				exactCount += 1
+				assert(errGeo <= 1e-9, `X2 geometric prediction must be exact on single exponentials ({errGeo})`)
+				-- the discrepancy bounds the affine error on single exponentials: |err| <= 1.5 e
+				assert(errLin <= 1.5 * discLin[XL + 1] + 1e-9, "X2 discrepancy bound")
+			end
+			assert(errGeo <= errLin + 1e-9 or not single, "X2")
+		end
+		assert(exactCount > 10, "X2 exact case must be exercised")
+		-- (c) mean preservation: each predicted pair averages back to the coarse value
+		for X = 0, nL - 1 do
+			assert(math.abs((zF[2 * X + 1] + zF[2 * X + 2]) / 2 - zL[X + 1]) <= 1e-9, "X2 mean preservation")
+		end
+	end
+	-- (b) affine coefficients on arbitrary data: |err| <= (3|d2a| + |d2b|) / 8 <= max|d2| / 2
+	for trial = 1, 50 do
+		local n = 16
+		local w = {}
+		for j = 1, 4 * n do
+			w[j] = rnd(j, trial, 77) * 255
+		end
+		local zL, zU = {}, {}
+		for X = 0, 2 * n - 1 do
+			zL[X + 1] = (w[2 * X + 1] + w[2 * X + 2]) / 2
+		end
+		for X = 0, n - 1 do
+			zU[X + 1] = (w[4 * X + 1] + w[4 * X + 2] + w[4 * X + 3] + w[4 * X + 4]) / 4
+		end
+		local zF, disc = {}, {}
+		Liquid.richardsonRow(zL, zU, 2 * n, 1, zF, disc, false)
+		for P = 0, n - 1 do
+			local w0, w1, w2, w3 = w[4 * P + 1], w[4 * P + 2], w[4 * P + 3], w[4 * P + 4]
+			local d2a, d2b = w0 - 2 * w1 + w2, w1 - 2 * w2 + w3
+			for p = 0, 3 do
+				local err = math.abs(zF[4 * P + p + 1] - w[4 * P + p + 1])
+				local bound = if p < 2 then (3 * math.abs(d2a) + math.abs(d2b)) / 8 else (math.abs(d2a) + 3 * math.abs(d2b)) / 8
+				assert(err <= bound + 1e-9, "X2 affine error identity")
+			end
+		end
+	end
+	-- (d) predict, then refine rows in discrepancy order: after every row is refined the
+	-- frame equals the exact render, and rows with zero discrepancy were already exact
+	local W2, H2 = 128, 96
+	local tree2 = makeTree(51, W2, H2, 3)
+	local model2 = makeModel(51, 8, 3, 3, 9, tree2.P)
+	local plan2 = Liquid.prepare(model2, tree2)
+	local L = 2
+	local Fm = 2 ^ (L - 1)
+	local nF = W2 // Fm
+	local pred = buffer.create(nF * H2 * 4)
+	local order, rowDisc = Liquid.predictFiner(plan2, tree2, L, 0.25, pred, nF)
+	local exact = buffer.create(nF * H2 * 4)
+	Liquid.render(plan2, tree2, exact, nF, { epsilon = 0.25, level = L - 1, vertical = "rows" })
+	assert(#order == H2 and rowDisc[order[1] + 1] >= rowDisc[order[H2] + 1], "refinement order")
+	Liquid.renderRows(plan2, tree2, order, L - 1, 0.25, pred, nF)
+	assert(buffer.tostring(pred) == buffer.tostring(exact), "X2 refinement converges to the exact level")
+end
+
+----------------------------------------------------------------------------------------
+-- T7: bit-identical output in the interpreter and in native code. The constants were
+-- recorded from this file's renders; tests/run.sh runs it in both runtimes, so a
+-- difference in any op between them fails here. (Changing the renderer's arithmetic
+-- schedule changes the constants: update them deliberately, never to silence a mismatch
+-- between runtimes.)
+----------------------------------------------------------------------------------------
+do
+	local hashes: { number } = {}
+	local W, H = 200, 160
+	local tree = makeTree(61, W, H, 3)
+	local model = makeModel(61, 8, 3, 3, 12, tree.P)
+	local plan = Liquid.prepare(model, tree)
+	local out = buffer.create(W * H * 4)
+	Liquid.render(plan, tree, out, W, { epsilon = 0.5 })
+	table.insert(hashes, Liquid.hashBuffer(out))
+	Liquid.render(plan, tree, out, W, { epsilon = 0 })
+	table.insert(hashes, Liquid.hashBuffer(out))
+	local o2 = buffer.create(50 * 40 * 4)
+	Liquid.render(plan, tree, o2, 50, { epsilon = 0.25, level = 2 })
+	table.insert(hashes, Liquid.hashBuffer(o2))
+	local oe = buffer.create(90 * 70 * 4)
+	Liquid.render(plan, tree, oe, 90, { epsilon = 0.5, level = 1, x = -40, y = 100, w = 90, h = 70, endless = { seed = 99, horizon = 1 } })
+	table.insert(hashes, Liquid.hashBuffer(oe))
+	local tree4 = makeTree(62, 96, 96, 2)
+	local model7 = makeModel(62, 9, 2, 7, 9, tree4.P)
+	local plan7 = Liquid.prepare(model7, tree4)
+	local a7, b7 = buffer.create(96 * 96 * 4), buffer.create(96 * 96 * 4)
+	Liquid.render(plan7, tree4, a7, 96, { epsilon = 0.5, out2 = b7 })
+	table.insert(hashes, Liquid.hashBuffer(a7))
+	table.insert(hashes, Liquid.hashBuffer(b7))
+	local fine = buffer.create(100 * H * 4)
+	Liquid.predictFiner(plan, tree, 2, 0.25, fine, 100)
+	table.insert(hashes, Liquid.hashBuffer(fine))
+	-- raw f64 bits of real-valued rows (event renderer at levels 0 and 2, and the reference):
+	-- a single ulp of difference between the runtimes changes these hashes
+	local vals = {}
+	local bits = buffer.create(8 * W * 3 * 3)
+	local at = 0
+	for _, y in { 0, 37, 99 } do
+		local nL = Liquid.renderRowValues(plan, tree, y, 0, 0.5, vals)
+		for j = 1, nL * 3 do
+			buffer.writef64(bits, at, vals[j])
+			at += 8
+		end
+	end
+	table.insert(hashes, Liquid.hashBuffer(bits))
+	local bits2 = buffer.create(8 * 50 * 3)
+	local nL2 = Liquid.renderRowValues(plan, tree, 41, 2, 0.5, vals)
+	for j = 1, nL2 * 3 do
+		buffer.writef64(bits2, (j - 1) * 8, vals[j])
+	end
+	table.insert(hashes, Liquid.hashBuffer(bits2))
+	Liquid.referenceRow(plan, tree, 37, vals)
+	local bits3 = buffer.create(8 * W * 3)
+	for j = 1, W * 3 do
+		buffer.writef64(bits3, (j - 1) * 8, vals[j])
+	end
+	table.insert(hashes, Liquid.hashBuffer(bits3))
+	local RECORDED = { 1662153913, 2200940450, 207576219, 411133616, 3953465183, 3239534142, 4013711530, 3261783181, 1074859803, 1740988340 }
+	local same = true
+	for j = 1, #hashes do
+		if hashes[j] ~= RECORDED[j] then
+			same = false
+		end
+	end
+	if not same then
+		error("T7 hashes differ from the recorded constants: { " .. table.concat(hashes, ", ") .. " }")
+	end
 end
 
 print("liquid tests ok", valuesChecked)

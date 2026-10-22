@@ -8,6 +8,50 @@
 -- abs, min, max, // and % on integers, and bit32. No libm transcendental functions,
 -- no math.lerp (native code fuses it into an FMA), no math.noise or math.random.
 -- See docs/RUNTIME_AUDIT.md section 6.5 and docs/DESIGN.md axioms M1 to M9.
+--
+-- Pixel axioms (docs/COMPUTE.md sections 1, 3.3 and "Flawless pipeline"):
+--
+--   F1  A pixel is a box filter. The coverage of a shape at a pixel is the EXACT
+--       area of the pixel square inside the shape; a byte is flawless when
+--       |byte - 255 A| <= 0.5 + 0.01 (the correctly rounded exact area). Exact
+--       area, never supersampling, is the reference (n x n point samples err by up
+--       to about 1/(2n) per edge crossing).
+--   F2  A scene is a box filter of its source-over composite: each pixel is the sum
+--       over visible regions of colour times area. Coverage used as alpha is exact
+--       only where at most one shape's edge enters the pixel; elsewhere visibility
+--       must be computed exactly (compute/Visibility.luau).
+--   F3  Content bytes depend only on the deterministic ops listed above (plus the
+--       deterministic arcsine Coverage.dasin); interpreter and native code agree.
+--
+--   C3  Linear ramp error. coverage(d, w) = clamp(1/2 - d/w) is exact only for
+--       axis-aligned edges. On a straight 45 degree edge its worst error is
+--       (sqrt(2)/2 - 1/2)^2 = 0.04289, i.e. 10.94/255 (closed form). Measured on
+--       shapes: 11/255 on circles of any radius, 38/255 at sharp box corners, 26 to
+--       57/255 at polygon corners. It is the PREVIEW ramp (Raster MODE_LINEAR).
+--   C4  Half-plane exactness. For a straight edge with unit normal (nx, ny) and
+--       signed distance d from the pixel centre, coverageHalfPlane is the exact
+--       area: the pixel's projection on n has a trapezoid density with ramps of
+--       width b = min(|nx|, |ny|) and a plateau of width a - b, a = max(|nx|, |ny|).
+--       It is exactly 0 for d >= (a + b)/2 and exactly 1 for d <= -(a + b)/2.
+--   C5  Curvature. A boundary of curvature k tangent to the half-plane line lies
+--       k t^2 / 2 inside it at tangential offset t, so the half-plane overestimates
+--       by at most k (sqrt(2)/2)^3 / 3 = 0.1179 k (30/R in 1/255 units).
+--       coverageCurved subtracts the exact first-order term k (t1^3 - t0^3) / 6
+--       over the chord [t0, t1] the tangent line cuts from the pixel. Where the
+--       line leaves the pixel at a shallow angle, the pixel side cuts the sliver
+--       between line and curve obliquely, so the residual is O(k), not O(k^2):
+--       measured worst 0.36/255 at R = 8, 0.09 at R = 16, 0.036 at R = 48, 0.004
+--       at R = 128, 0.002 at R = 300 (1/255 units, random placements). That is
+--       far better than the ramp but NOT flawless (F1 needs < 0.01) below about
+--       R = 300, so flawless rendering uses exact disc areas instead
+--       (Coverage.discBoxArea, Coverage.discPolyArea).
+--   Reach. The reach R_cov of a coverage function is the largest |d| at which it
+--       can be strictly between 0 and 1: w/2 for the ramp, COVERAGE_REACH * w =
+--       w sqrt(2)/2 for any exact area coverage (every point of a w x w pixel lies
+--       within w sqrt(2)/2 of its centre). Culling must drop a shape only when
+--       d - L rho >= R_cov (L the Lipschitz constant, rho the node radius) and
+--       bounding boxes must grow by R_cov; culling at w/2 silently cuts real
+--       coverage on diagonal edges.
 
 local MyMath = {}
 
@@ -221,13 +265,115 @@ function MyMath.smin(a: number, b: number, k: number): number
 	return b + (a - b) * h - k * h * (1 - h)
 end
 
--- Pixel coverage of a shape from its signed distance in pixels, for an
--- anti-aliasing width w (1 = one pixel). Exactly 0 when d >= w/2, exactly 1 when
--- d <= -w/2; the rasterizer's tile culling relies on those two exact values.
+-- The LINEAR PREVIEW RAMP: clamp(0.5 - d / w, 0, 1) from the signed distance d in
+-- pixels and an anti-aliasing width w (1 = one pixel). Exactly 0 when d >= w/2 and
+-- exactly 1 when d <= -w/2 (its reach is w/2), which ramp-based culling relies on.
+-- As an estimate of pixel area it is exact only for axis-aligned edges: up to
+-- 10.94/255 on a straight 45 degree edge (C3, closed form), 11/255 on circles of
+-- any radius, 38/255 at sharp box corners and 26 to 57/255 at polygon corners
+-- (measured, docs/COMPUTE.md 3.3). Use it for previews (Raster MODE_LINEAR); use
+-- coverageHalfPlane, coverageCurved or exact areas for content (F1).
 function MyMath.coverage(d: number, w: number): number
 	local a = 0.5 - d / w
 	return if a < 0 then 0 elseif a > 1 then 1 else a
 end
+
+----------------------------------------------------------------------------------
+-- M8. Exact-area coverage axioms (C4, C5; header). Moved verbatim from
+-- compute/Coverage.luau (halfPlane, halfPlaneCurved), so results are bit-identical;
+-- the optional w scales the box filter (a w x w pixel, default 1): d is divided by
+-- w and the curvature k multiplied by w, which is exact when w is 1 or omitted.
+----------------------------------------------------------------------------------
+
+local abs = math.abs
+
+-- sqrt(2)/2: the reach of every exact-area coverage function in pixel widths.
+MyMath.COVERAGE_REACH = 0.70710678118654757
+
+-- C4. Exact area of {q in pixel : d + n . (q - centre) <= 0} for |n| = 1, i.e. the
+-- part of the pixel on the inner side of a straight edge at signed distance d
+-- (negative inside) with unit normal (nx, ny). Only |nx| and |ny| matter.
+local function coverageHalfPlane(d: number, nx: number, ny: number, w: number?): number
+	if w then
+		d = d / w
+	end
+	local a, b = abs(nx), abs(ny)
+	if a < b then
+		a, b = b, a
+	end
+	local u = (a + b) * 0.5 - d
+	if u <= 0 then
+		return 0
+	end
+	if u >= a + b then
+		return 1
+	end
+	if u < b then
+		return u * u / (2 * a * b)
+	end
+	if u <= a then
+		return (2 * u - b) / (2 * a)
+	end
+	local v = a + b - u
+	return 1 - v * v / (2 * a * b)
+end
+MyMath.coverageHalfPlane = coverageHalfPlane
+
+-- C5. Half-plane area minus the first-order curvature term k (t1^3 - t0^3) / 6
+-- over the chord the tangent line cuts from the pixel. k > 0 where the shape is
+-- convex (1 / R for a disc of radius R), k < 0 where it is concave. Error O(k) at
+-- shallow chord exits (header), so it is an estimator, not an exact area.
+local function coverageCurved(d: number, nx: number, ny: number, k: number, w: number?): number
+	if w then
+		d = d / w
+		k = k * w
+	end
+	local base = coverageHalfPlane(d, nx, ny)
+	if k == 0 then
+		return base
+	end
+	-- the line is {q : n . (q - c) = -d}; parametrise q = c - d n + t (-ny, nx)
+	-- and clip t to the unit square |qx - cx| <= 1/2, |qy - cy| <= 1/2
+	local t0, t1 = -1e300, 1e300
+	local tx, ty = -ny, nx
+	local ox, oy = -d * nx, -d * ny
+	if tx ~= 0 then
+		local a0 = (-0.5 - ox) / tx
+		local a1 = (0.5 - ox) / tx
+		if a0 > a1 then
+			a0, a1 = a1, a0
+		end
+		if a0 > t0 then
+			t0 = a0
+		end
+		if a1 < t1 then
+			t1 = a1
+		end
+	elseif ox < -0.5 or ox > 0.5 then
+		t1 = t0
+	end
+	if ty ~= 0 then
+		local a0 = (-0.5 - oy) / ty
+		local a1 = (0.5 - oy) / ty
+		if a0 > a1 then
+			a0, a1 = a1, a0
+		end
+		if a0 > t0 then
+			t0 = a0
+		end
+		if a1 < t1 then
+			t1 = a1
+		end
+	elseif oy < -0.5 or oy > 0.5 then
+		t1 = t0
+	end
+	local c = base
+	if t1 > t0 then
+		c = base - k * (t1 * t1 * t1 - t0 * t0 * t0) / 6
+	end
+	return if c < 0 then 0 elseif c > 1 then 1 else c
+end
+MyMath.coverageCurved = coverageCurved
 
 ----------------------------------------------------------------------------------
 -- M6. Exact 8-bit colour arithmetic

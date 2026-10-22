@@ -116,10 +116,6 @@ def smoothstep(e0, e1, x):
     return t * t * (3.0 - 2.0 * t)
 
 
-def mix(a, b, t):
-    return a + (b - a) * t
-
-
 def to_u8(v):
     return np.clip(np.floor(np.asarray(v) * 255.0 + 0.5), 0, 255).astype(np.uint8)
 
@@ -164,7 +160,6 @@ def sd_segment(x, y, ax, ay, bx, by, r):
 
 
 def sd_polygon(x, y, pts):
-    n = len(pts)
     d = np.full_like(x, np.inf)
     s = np.ones_like(x)
     jx, jy = pts[-1]
@@ -181,7 +176,6 @@ def sd_polygon(x, y, pts):
         flip = (c1 & c2 & c3) | (~c1 & ~c2 & ~c3)
         s = np.where(flip, -s, s)
         jx, jy = vx, vy
-    del n
     return s * np.sqrt(d)
 
 
@@ -220,6 +214,8 @@ def ui_flat(size=256, seed=1):
     for i, col in enumerate(("FF5F57", "FEBC2E", "28C840")):
         fill(sd_circle(x, y, 0.11 + 0.035 * i, 0.14, 0.011), col)
     # pixel-font text: glyphs are 3x5 cells drawn from hashed bit patterns
+    n = x.shape[0]
+
     def text_line(x0, y0, x1, cell, col, line_id):
         nonlocal img
         gx = 3 * cell
@@ -237,7 +233,15 @@ def ui_flat(size=256, seed=1):
                         if bits >> (cy * 3 + cx) & 1:
                             ax = pos + cx * cell
                             ay = y0 + cy * cell
-                            mask |= (x >= ax) & (x < ax + cell) & (y >= ay) & (y < ay + cell)
+                            # the same comparisons, evaluated only on a window that
+                            # contains every sample the cell can cover (exact)
+                            i0 = max(0, int(np.floor(ay * n)) - 2)
+                            i1 = min(n, int(np.ceil((ay + cell) * n)) + 2)
+                            j0 = max(0, int(np.floor(ax * n)) - 2)
+                            j1 = min(n, int(np.ceil((ax + cell) * n)) + 2)
+                            xs = x[i0:i1, j0:j1]
+                            ys = y[i0:i1, j0:j1]
+                            mask[i0:i1, j0:j1] |= (xs >= ax) & (xs < ax + cell) & (ys >= ay) & (ys < ay + cell)
                 pos += gx + cell
             pos += 3 * cell
             word += 1
